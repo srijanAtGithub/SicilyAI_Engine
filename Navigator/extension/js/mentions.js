@@ -351,6 +351,16 @@ function isMissingHostPermissionError(err) {
  * overwhelmingly common case without the user needing to know why.
  */
 async function extractFullPageTextWithRetry(tab) {
+    // Tabs in a collapsed group (or just backgrounded long enough) get
+    // discarded by Chrome — their renderer doesn't exist, so injection
+    // either throws or runs against an empty document. Reload to force
+    // Chrome to re-hydrate it, same self-heal as the permissions case.
+    if (tab.discarded) {
+        NotificationService.show(`Waking up "${tab.title || tab.url}"…`);
+        await chrome.tabs.reload(tab.id);
+        await waitForTabComplete(tab.id);
+    }
+
     try {
         return await extractFullPageText(tab.id);
     } catch (err) {
@@ -360,8 +370,6 @@ async function extractFullPageTextWithRetry(tab) {
         await chrome.tabs.reload(tab.id);
         await waitForTabComplete(tab.id);
 
-        // One retry only — if it still fails after a reload, surface the
-        // real error rather than looping.
         return await extractFullPageText(tab.id);
     }
 }

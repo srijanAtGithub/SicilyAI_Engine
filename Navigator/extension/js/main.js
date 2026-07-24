@@ -67,6 +67,10 @@ async function sendMessage() {
 
   addMessage(text, "user");
   inputEl.value = "";
+
+  inputEl.style.height = 'auto';
+  inputEl.style.overflowY = 'hidden';
+
   setSending(true);
 
   // Send the FULL content to the backend
@@ -129,10 +133,6 @@ inputEl.addEventListener("keydown", (e) => {
     if (!e.shiftKey) {
       e.preventDefault();
       sendMessage();
-
-      // Reset the box back to default after sending
-      inputEl.style.height = 'auto';
-      inputEl.style.overflowY = 'hidden';
     }
   }
 });
