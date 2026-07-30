@@ -96,7 +96,7 @@ body {
 }
 
 
-#clear-btn {
+#new-chat-btn {
     padding: 5px 10px;
     border-radius: 8px;
     border: 1px solid rgba(255, 255, 255, 0.08);
@@ -113,16 +113,16 @@ body {
     gap: 5px;
 }
 
-#clear-btn svg {
+#new-chat-btn svg {
     flex-shrink: 0;
     opacity: 0.9;
 }
 
-#clear-btn:hover {
+#new-chat-btn:hover {
     background: rgba(255, 255, 255, 0.28);
 }
 
-#clear-btn:active {
+#new-chat-btn:active {
     transform: scale(0.96);
 }
 

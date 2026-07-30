@@ -9,7 +9,7 @@ import {
 } from "./mentions.js";
 
 const inputEl = document.getElementById("input-box");
-const clearBtn = document.getElementById("clear-btn");
+const clearBtn = document.getElementById("new-chat-btn");
 let currentTab = { id: null, url: "", title: "" };
 let currentSessionKey = null;
 
