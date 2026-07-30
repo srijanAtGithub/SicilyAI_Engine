@@ -1,6 +1,6 @@
 import { NotificationService } from "./notifications.js";
-import { addMessage, clearMessagesUI, addContextTrail, setSending, sendBtn, appWrap } from "./ui.js";
-import { socket, getActiveTabInfo, loadHistory, clearHistoryOnBackend, connectSocket, getSessionKey, BACKEND_HOST } from "./api.js";
+import { addMessage, clearMessagesUI, addContextTrail, setSending, sendBtn, appWrap, showEmptyState } from "./ui.js";
+import { socket, getActiveTabInfo, loadHistory, clearHistoryOnBackend, connectSocket, closeSocket, getSessionKey, fetchAllSessions, BACKEND_HOST } from "./api.js";
 import { attachedContexts, clearAttachedContexts } from "./features.js";
 import {
   getMentionedTabSnippets, hasMentionedTab, clearMentionedTab, isMentionDropdownOpen,
@@ -96,6 +96,129 @@ async function handleClear() {
     NotificationService.show("Conversation cleared.");
   }
 }
+
+// ── Chats Panel ───────────────────────────────────────────────────────
+const chatsBtn = document.getElementById("chats-btn");
+const chatsOverlay = document.getElementById("chats-overlay");
+const chatsPanelList = document.getElementById("chats-panel-list");
+const chatsPanelEmpty = document.getElementById("chats-panel-empty");
+const chatsPanelClose = document.getElementById("chats-panel-close");
+
+function openChatsPanel() {
+  chatsOverlay.classList.add("active");
+  populateChatsPanel();
+}
+
+function closeChatsPanel() {
+  chatsOverlay.classList.remove("active");
+}
+
+function formatTimeAgo(isoStr) {
+  if (!isoStr) return "";
+  const then = new Date(isoStr);
+  const now = new Date();
+  const diffMs = now - then;
+  const diffMins = Math.floor(diffMs / 60000);
+  if (diffMins < 1) return "Just now";
+  if (diffMins < 60) return `${diffMins}m ago`;
+  const diffHours = Math.floor(diffMins / 60);
+  if (diffHours < 24) return `${diffHours}h ago`;
+  const diffDays = Math.floor(diffHours / 24);
+  if (diffDays < 7) return `${diffDays}d ago`;
+  return then.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+async function populateChatsPanel() {
+  chatsPanelList.innerHTML = "";
+  chatsPanelEmpty.classList.remove("visible");
+
+  const sessions = await fetchAllSessions();
+
+  if (sessions.length === 0) {
+    chatsPanelEmpty.classList.add("visible");
+    return;
+  }
+
+  sessions.forEach((s, i) => {
+    const item = document.createElement("div");
+    item.className = "chats-item";
+    if (s.session_key === currentSessionKey) {
+      item.classList.add("current");
+    }
+    item.style.animationDelay = `${i * 0.04}s`;
+
+    const preview = document.createElement("div");
+    preview.className = "chats-item-preview";
+    preview.textContent = s.preview || "(empty conversation)";
+
+    const meta = document.createElement("div");
+    meta.className = "chats-item-meta";
+
+    const timeSpan = document.createElement("span");
+    timeSpan.textContent = formatTimeAgo(s.last_active);
+
+    const dot = document.createElement("span");
+    dot.className = "chats-item-meta-dot";
+
+    const countSpan = document.createElement("span");
+    const msgCount = Math.floor(s.message_count / 2);
+    countSpan.textContent = `${msgCount} ${msgCount === 1 ? "turn" : "turns"}`;
+
+    meta.appendChild(timeSpan);
+    meta.appendChild(dot);
+    meta.appendChild(countSpan);
+
+    item.appendChild(preview);
+    item.appendChild(meta);
+
+    item.addEventListener("click", () => {
+      switchToSession(s.session_key);
+    });
+
+    chatsPanelList.appendChild(item);
+  });
+}
+
+async function switchToSession(sessionKey) {
+  closeChatsPanel();
+
+  if (sessionKey === currentSessionKey) return;
+
+  // Tear down old session
+  closeSocket();
+  clearMessagesUI();
+
+  // Set new session
+  currentSessionKey = sessionKey;
+
+  // Load history for the new session
+  const history = await loadHistory(sessionKey);
+
+  if (history.length === 0) {
+    showEmptyState();
+  }
+
+  for (const m of history) {
+    if (m.role === "user" && Array.isArray(m.context_snippets) && m.context_snippets.length) {
+      addContextTrail(m.context_snippets);
+    }
+    addMessage(m.text, m.role === "user" ? "user" : "ai");
+  }
+
+  // Reconnect socket to the new session
+  connectSocket(sessionKey);
+  inputEl.focus();
+
+  NotificationService.show("Switched conversation.");
+}
+
+chatsBtn.addEventListener("click", openChatsPanel);
+chatsPanelClose.addEventListener("click", closeChatsPanel);
+
+// Close on clicking the backdrop (not the panel itself)
+chatsOverlay.addEventListener("click", (e) => {
+  if (e.target === chatsOverlay) closeChatsPanel();
+});
 
 sendBtn.addEventListener("click", sendMessage);
 clearBtn.addEventListener("click", handleClear);

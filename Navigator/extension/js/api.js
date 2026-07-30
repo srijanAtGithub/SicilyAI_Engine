@@ -62,6 +62,13 @@ export async function clearHistoryOnBackend(sessionKey) {
   }
 }
 
+export function closeSocket() {
+  if (socket && socket.readyState !== WebSocket.CLOSED) {
+    socket.close();
+  }
+  socket = null;
+}
+
 export function connectSocket(sessionKey) {
   setStatus("connecting");
   socket = new WebSocket(`ws://${BACKEND_HOST}/ws/${sessionKey}`);
@@ -88,4 +95,16 @@ export function connectSocket(sessionKey) {
   socket.onerror = () => {
     setStatus("disconnected");
   };
+}
+
+export async function fetchAllSessions() {
+  try {
+    const res = await fetch(`http://${BACKEND_HOST}/sessions`);
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const data = await res.json();
+    return data.sessions || [];
+  } catch (err) {
+    console.error("Couldn't fetch sessions list:", err);
+    return [];
+  }
 }

@@ -197,6 +197,12 @@ async def health():
     }
 
 
+@app.get("/sessions")
+async def list_sessions():
+    """Returns a summary of every conversation session for the Chats panel."""
+    return {"sessions": sessions.list_sessions()}
+
+
 @app.get("/session/{tab_id}")
 async def get_session(tab_id: str):
     """
