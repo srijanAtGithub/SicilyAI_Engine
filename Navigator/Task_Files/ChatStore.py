@@ -262,7 +262,6 @@ class ChatStore:
                 "session_key": str,
                 "preview":     str,   -- first user message (truncated)
                 "last_active": str,   -- ISO-8601 UTC of newest message
-                "message_count": int
             }
         """
         with self._cursor() as cur:
@@ -270,7 +269,6 @@ class ChatStore:
                 """
                 SELECT
                     tab_id,
-                    COUNT(*)            AS msg_count,
                     MAX(created_at)     AS last_active
                 FROM messages
                 GROUP BY tab_id
@@ -300,7 +298,6 @@ class ChatStore:
                 "session_key": tab_id,
                 "preview": preview,
                 "last_active": row["last_active"],
-                "message_count": row["msg_count"],
             })
 
         return sessions

@@ -1,6 +1,6 @@
 import { NotificationService } from "./notifications.js";
 import { addMessage, clearMessagesUI, addContextTrail, setSending, sendBtn, appWrap, showEmptyState } from "./ui.js";
-import { socket, getActiveTabInfo, loadHistory, clearHistoryOnBackend, connectSocket, closeSocket, getSessionKey, fetchAllSessions, BACKEND_HOST } from "./api.js";
+import { socket, getActiveTabInfo, loadHistory, deleteSessionOnBackend, connectSocket, closeSocket, getSessionKeyForTab, setSessionKeyForTab, makeFreshSessionKey, fetchAllSessions, BACKEND_HOST } from "./api.js";
 import { attachedContexts, clearAttachedContexts } from "./features.js";
 import {
   getMentionedTabSnippets, hasMentionedTab, clearMentionedTab, isMentionDropdownOpen,
@@ -88,13 +88,26 @@ async function sendMessage() {
   if (hasMentionedCollection()) clearMentionedCollection();
 }
 
+// "New Chat" starts a distinct backend session rather than wiping the
+// current one: it mints a fresh session key, points this tab at it (so
+// reopening the panel on this tab resumes the new, empty conversation
+// instead of snapping back to the old one), clears the visible UI, and
+// reconnects the socket. The old conversation is untouched and stays
+// reachable from the Chats panel.
 async function handleClear() {
-  if (currentSessionKey == null) return;
-  const ok = await clearHistoryOnBackend(currentSessionKey);
-  if (ok) {
-    clearMessagesUI();
-    NotificationService.show("Conversation cleared.");
-  }
+  closeSocket();
+  clearMessagesUI();
+  showEmptyState();
+
+  currentSessionKey = makeFreshSessionKey(currentTab.url);
+  await setSessionKeyForTab(currentTab.id, currentSessionKey);
+
+  autoMentionActiveTab(currentTab);
+
+  connectSocket(currentSessionKey);
+  inputEl.focus();
+
+  NotificationService.show("New conversation started.");
 }
 
 // ── Chats Panel ───────────────────────────────────────────────────────
@@ -157,19 +170,54 @@ async function populateChatsPanel() {
     const timeSpan = document.createElement("span");
     timeSpan.textContent = formatTimeAgo(s.last_active);
 
-    const dot = document.createElement("span");
-    dot.className = "chats-item-meta-dot";
-
-    const countSpan = document.createElement("span");
-    const msgCount = Math.floor(s.message_count / 2);
-    countSpan.textContent = `${msgCount} ${msgCount === 1 ? "turn" : "turns"}`;
-
     meta.appendChild(timeSpan);
-    meta.appendChild(dot);
-    meta.appendChild(countSpan);
 
     item.appendChild(preview);
     item.appendChild(meta);
+
+    // Hover-reveal delete icon — deletes this conversation from the
+    // backend (SQLite-backed ChatStore) permanently, not just from this
+    // list. Mirrors the .item-delete-btn pattern already used for
+    // Collections/Reading List rows elsewhere in this UI.
+    const deleteBtn = document.createElement("button");
+    deleteBtn.className = "item-delete-btn chats-item-delete-btn";
+    deleteBtn.title = "Delete conversation";
+    deleteBtn.innerHTML = `<svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" width="14" height="14">
+      <path d="M4 6h12M8 6V4.5A1.5 1.5 0 0 1 9.5 3h1A1.5 1.5 0 0 1 12 4.5V6M6 6v9a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>`;
+
+    deleteBtn.addEventListener("click", async (e) => {
+      // Stop this from bubbling up to the row's own click handler
+      // (which would otherwise switch to the session we're deleting).
+      e.stopPropagation();
+      deleteBtn.disabled = true;
+
+      const ok = await deleteSessionOnBackend(s.session_key);
+      if (!ok) {
+        deleteBtn.disabled = false;
+        return;
+      }
+
+      // If the conversation being deleted is the one currently loaded
+      // in the panel, clear the UI too — otherwise the user is left
+      // staring at a conversation that no longer exists on the backend.
+      if (s.session_key === currentSessionKey) {
+        closeSocket();
+        clearMessagesUI();
+        showEmptyState();
+        currentSessionKey = null;
+      }
+
+      item.remove();
+      NotificationService.show("Conversation deleted.");
+
+      // Refresh so the empty-state message shows if that was the last one.
+      if (chatsPanelList.children.length === 0) {
+        chatsPanelEmpty.classList.add("visible");
+      }
+    });
+
+    item.appendChild(deleteBtn);
 
     item.addEventListener("click", () => {
       switchToSession(s.session_key);
@@ -190,6 +238,11 @@ async function switchToSession(sessionKey) {
 
   // Set new session
   currentSessionKey = sessionKey;
+
+  // Remember that this tab is now on this session, so reopening the
+  // panel on this tab resumes here instead of falling back to
+  // hash(url) and losing track of the switch.
+  await setSessionKeyForTab(currentTab.id, sessionKey);
 
   // Load history for the new session
   const history = await loadHistory(sessionKey);
@@ -270,7 +323,11 @@ inputEl.addEventListener("keydown", (e) => {
     addMessage("Couldn't identify the active tab.", "system");
     return;
   }
-  currentSessionKey = getSessionKey(currentTab.url);
+
+  // Resolve via the per-tab override first (set by "New Chat" or by
+  // manually switching conversations), falling back to the
+  // deterministic hash(url) key for a tab opening a page fresh.
+  currentSessionKey = await getSessionKeyForTab(currentTab.id, currentTab.url);
 
   const history = await loadHistory(currentSessionKey);
 

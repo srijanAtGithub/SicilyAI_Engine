@@ -112,6 +112,14 @@ body {
     backdrop-filter: blur(20px);
     order: 2;
     /* Place before status dot */
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+#clear-btn svg {
+    flex-shrink: 0;
+    opacity: 0.9;
 }
 
 #clear-btn:hover {

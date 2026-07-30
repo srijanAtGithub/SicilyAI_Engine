@@ -1366,6 +1366,9 @@
     background: transparent;
     border: 1px solid transparent;
     cursor: pointer;
+    position: relative;
+    /* Anchors the hover-reveal delete button (.item-delete-btn uses
+       position: absolute against this) */
     transition:
         background 0.15s ease,
         border-color 0.15s ease,
@@ -1374,6 +1377,21 @@
     /* Staggered fade-in */
     opacity: 0;
     animation: chatsItemIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* Leave clearance on the right so the preview text/time row never runs
+   under the hover-reveal delete button. */
+.chats-item-preview,
+.chats-item-meta {
+    padding-right: 30px;
+}
+
+/* Reveal on row hover — same hover-only convention as Collections and
+   Reading List rows (.item-delete-btn base rule already handles the
+   default hidden/disabled state). */
+.chats-item:hover .item-delete-btn {
+    opacity: 1;
+    pointer-events: auto;
 }
 
 .chats-item:hover {
