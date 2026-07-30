@@ -33,7 +33,7 @@
       <div class="dc-title">Sicily is offline</div>
       <div class="dc-subtitle">
         The navigator bridge isn't running.<br>
-        Start it with <span class="dc-code">navigator_bridge.py</span>
+        Start it with <span class="dc-code">sicily navigator --start</span>
       </div>
     </div>
 
@@ -262,11 +262,37 @@
           </div>
         </div>
 
-        <button id="clear-btn" title="Clear this tab's conversation">
-          Clear
+        <button id="new-chat-btn" title="Start a new conversation">
+          <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" width="12" height="12">
+            <path d="M10 4v12M4 10h12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+          </svg>
+          <span>New Chat</span>
         </button>
 
-        <span id="status-dot"></span>
+        <button id="chats-btn" title="All Conversations">
+          <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" width="13" height="13">
+            <path d="M4 4h12a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H7l-3 3V5a1 1 0 0 1 1-1z" stroke="currentColor"
+              stroke-width="1.4" stroke-linejoin="round" />
+            <path d="M7.5 7.5h5M7.5 10h3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+          </svg>
+          <span>Chats</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- --- Chats Floating Panel --- -->
+    <div id="chats-overlay">
+      <div class="chats-panel">
+        <div class="chats-panel-header">
+          <span class="chats-panel-title">All Conversations</span>
+          <button class="chats-panel-close" id="chats-panel-close">&times;</button>
+        </div>
+        <div class="chats-panel-list" id="chats-panel-list">
+          <!-- Populated at runtime -->
+        </div>
+        <div class="chats-panel-empty" id="chats-panel-empty">
+          No conversations yet
+        </div>
       </div>
     </div>
 

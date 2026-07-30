@@ -3,7 +3,6 @@ import { makeContextLabel } from "./features.js";
 export const appWrap = document.getElementById("app-wrap");
 export const messagesEl = document.getElementById("messages");
 export const sendBtn = document.getElementById("send-btn");
-export const statusDot = document.getElementById("status-dot");
 export const disconnectedScreen = document.getElementById("disconnected-screen");
 
 export function hideEmptyState() {
@@ -18,33 +17,80 @@ export function showEmptyState() {
 
 export function addMessage(text, role) {
   // Once there's a real message (user, ai, or even a system notice),
-
-  // the "nothing here yet" placeholder no longer applies.
+  // the "nothing here yet" placeholder no longer applies.[cite: 2]
   hideEmptyState();
 
   const el = document.createElement("div");
   el.className = `msg ${role}`;
-  el.textContent = text;
 
-  // Create the copy button
+  // Check if it is a long user message (e.g., > 150 chars or multiple line breaks)
+  const isLong = text.length > 150 || text.split('\n').length > 3;
+
+  if (role === "user" && isLong) {
+    el.classList.add("collapsible");
+
+    // 1. Header (Preview + Caret)
+    const header = document.createElement("div");
+    header.className = "msg-collapse-head";
+
+    const preview = document.createElement("div");
+    preview.className = "msg-collapse-preview";
+    preview.textContent = text.substring(0, 60).replace(/\n/g, ' ') + "...";
+
+    const caret = document.createElement("div");
+    caret.className = "msg-collapse-caret";
+    caret.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="6 9 12 15 18 9"></polyline>
+    </svg>`;
+
+    header.appendChild(preview);
+    header.appendChild(caret);
+
+    // 2. Expandable Body (Full Text)
+    const body = document.createElement("div");
+    body.className = "msg-collapse-body";
+
+    const bodyInner = document.createElement("div");
+    bodyInner.className = "msg-collapse-body-inner";
+
+    const textEl = document.createElement("div");
+    textEl.className = "msg-collapse-text";
+    textEl.textContent = text;
+
+    bodyInner.appendChild(textEl);
+    body.appendChild(bodyInner);
+
+    el.appendChild(header);
+    el.appendChild(body);
+
+    // Toggle expansion on click
+    header.addEventListener("click", () => {
+      el.classList.toggle("expanded");
+    });
+  } else {
+    // Standard text fallback for short messages or AI messages
+    el.textContent = text;
+  }
+
+  // Create the copy button[cite: 2]
   const copyBtn = document.createElement("button");
   copyBtn.className = "copy-btn";
   copyBtn.title = "Copy text";
 
-  // Default Copy Icon
+  // Default Copy Icon[cite: 2]
   const copyIcon = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
     <path d="M8 4V16C8 17.1046 8.89543 18 10 18H20C21.1046 18 22 17.1046 22 16V4C22 2.89543 21.1046 2 20 2H10C8.89543 2 8 2.89543 8 4Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
     <path d="M16 18V20C16 21.1046 15.1046 22 14 22H4C2.89543 22 2 21.1046 2 20V8C2 6.89543 2.89543 6 4 6H6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
   </svg>`;
 
-  // Success Checkmark Icon
+  // Success Checkmark Icon[cite: 2]
   const checkIcon = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
     <path d="M20 6L9 17L4 12" stroke="#34c759" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
   </svg>`;
 
   copyBtn.innerHTML = copyIcon;
 
-  // Handle clipboard functionality
+  // Handle clipboard functionality[cite: 2]
   copyBtn.addEventListener("click", () => {
     navigator.clipboard.writeText(text).then(() => {
       copyBtn.innerHTML = checkIcon;
@@ -103,11 +149,6 @@ export function clearMessagesUI() {
 }
 
 export function setStatus(state) {
-  statusDot.className = state === "connected"
-    ? "connected"
-    : state === "disconnected"
-      ? "disconnected"
-      : "";
   if (state === "connected") {
     showOnline();
   } else if (state === "disconnected") {
