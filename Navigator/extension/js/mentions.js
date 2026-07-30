@@ -792,7 +792,11 @@ function renderManageDropdown() {
     el.classList.add("mention-dropdown--visible");
 }
 
-function removeMentionedTab(tabId) {
+// Exported so main.js can drop a tab's mention when that same tab
+// navigates elsewhere (its old content is now stale) before
+// auto-mentioning it again on the new page. Internal callers (the ×
+// button in the manage dropdown) keep using it exactly as before.
+export function removeMentionedTab(tabId) {
     const idx = mentionedTabs.findIndex(t => t.tabId === tabId);
     if (idx === -1) return;
     mentionedTabs.splice(idx, 1);

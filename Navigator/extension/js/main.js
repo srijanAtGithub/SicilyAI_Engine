@@ -5,7 +5,7 @@ import { attachedContexts, clearAttachedContexts } from "./features.js";
 import {
   getMentionedTabSnippets, hasMentionedTab, clearMentionedTab, isMentionDropdownOpen,
   hasMentionedCollection, getMentionedCollectionIds, clearMentionedCollection,
-  autoMentionActiveTab
+  autoMentionActiveTab, removeMentionedTab
 } from "./mentions.js";
 
 const inputEl = document.getElementById("input-box");
@@ -348,13 +348,28 @@ async function loadSessionForUrl(url) {
 // (carrySessionToUrl) rather than looking up whatever that URL already
 // resolves to. The visible conversation and socket are untouched —
 // nothing to reload, since it's the same session either way.
+//
+// The user just followed a link — the natural next question is almost
+// always about the page they landed on, so auto-mention it the same way
+// the very first page in a tab gets auto-mentioned on panel open. The
+// old page's mention (if any) is dropped first: it's still keyed to
+// this same tabId, so autoMentionActiveTab's "already mentioned"
+// dedupe would otherwise skip attaching the new page entirely.
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (tabId !== currentTab.id) return;
-  if (!changeInfo.url || changeInfo.url === currentTab.url) return;
+  // Chrome fires onUpdated repeatedly through a navigation (url change,
+  // then loading, then complete). Wait for "complete" so the new page
+  // actually exists in the DOM before extracting its text — otherwise
+  // this races a blank/loading document.
+  if (changeInfo.status !== "complete") return;
+  const newUrl = tab.url || "";
+  if (!newUrl || newUrl === currentTab.url) return;
 
-  const newUrl = changeInfo.url;
   await carrySessionToUrl(currentSessionKey, newUrl);
   currentTab = { id: tab.id, url: newUrl, title: tab.title || currentTab.title };
+
+  removeMentionedTab(tabId);
+  autoMentionActiveTab(currentTab);
 });
 
 (async () => {
