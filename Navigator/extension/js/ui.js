@@ -3,7 +3,6 @@ import { makeContextLabel } from "./features.js";
 export const appWrap = document.getElementById("app-wrap");
 export const messagesEl = document.getElementById("messages");
 export const sendBtn = document.getElementById("send-btn");
-export const statusDot = document.getElementById("status-dot");
 export const disconnectedScreen = document.getElementById("disconnected-screen");
 
 export function hideEmptyState() {
@@ -150,11 +149,6 @@ export function clearMessagesUI() {
 }
 
 export function setStatus(state) {
-  statusDot.className = state === "connected"
-    ? "connected"
-    : state === "disconnected"
-      ? "disconnected"
-      : "";
   if (state === "connected") {
     showOnline();
   } else if (state === "disconnected") {

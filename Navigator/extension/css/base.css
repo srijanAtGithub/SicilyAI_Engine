@@ -95,9 +95,6 @@ body {
     gap: 10px;
 }
 
-#status-dot {
-    margin-left: auto;
-}
 
 #clear-btn {
     padding: 5px 10px;
@@ -110,8 +107,7 @@ body {
     cursor: pointer;
     transition: background 0.15s, transform 0.1s;
     backdrop-filter: blur(20px);
-    order: 2;
-    /* Place before status dot */
+    margin-left: auto;
     display: flex;
     align-items: center;
     gap: 5px;
@@ -335,25 +331,6 @@ body {
     height: 1px;
     background: rgba(255, 255, 255, 0.08);
     margin: 4px 4px;
-}
-
-#status-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: #8e8e93;
-    display: inline-block;
-    transition: background-color 0.3s ease;
-}
-
-#status-dot.connected {
-    background: #34c759;
-    box-shadow: 0 0 8px rgba(52, 199, 89, 0.4);
-}
-
-#status-dot.disconnected {
-    background: #ff453a;
-    box-shadow: 0 0 8px rgba(255, 69, 58, 0.4);
 }
 
 /* Scanning scanline for busy state (Matches content_script.js) */
