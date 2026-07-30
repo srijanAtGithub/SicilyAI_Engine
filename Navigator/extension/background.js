@@ -83,11 +83,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true; // Important: keeps the channel open for async response
 });
 
-// NOTE: we deliberately do NOT delete the backend session when a tab
-// closes. Sessions are keyed by a hash of the page URL (see
-// api.js:getSessionKey), not by Chrome's tabId — tabId is reassigned by
-// Chrome on every browsing session, so it can't identify "the same tab"
-// across a close/reopen anyway. Deleting on close used to silently wipe
-// history the moment a tab was closed, including the extremely common
-// "accidentally closed it, Ctrl+Shift+T to bring it right back" case.
-// Clearing history is now only ever the user's explicit "Clear" button.
+// NOTE: we deliberately do NOT delete the backend ChatStore session
+// when a tab closes. Sessions are looked up by URL (see
+// api.js:resolveSessionKey), scoped to the current browser session —
+// not by Chrome's tabId, which is reassigned on every browsing session
+// anyway. Closing a tab isn't the user asking to delete anything: the
+// URL's mapping in chrome.storage.session is untouched by a tab
+// closing, so reopening the same page (same tab or a new one,
+// Ctrl+Shift+T or otherwise) resumes the same conversation for as long
+// as the browser stays open. Deleting ChatStore rows only ever happens
+// via the panel's explicit per-conversation delete in the Chats list,
+// or Collections/Reading List's own delete actions.

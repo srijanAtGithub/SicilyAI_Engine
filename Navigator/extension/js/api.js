@@ -9,35 +9,121 @@ export async function getActiveTabInfo() {
   return { id: tab.id, url: tab.url || "", title: tab.title || "" };
 }
 
-// ── Stable session identity ──────────────────────────────────────────
-// Chrome's tabId is NOT a persistent identity — it's an in-memory integer
-// that Chrome reassigns per browsing session. Closing a tab and reopening
-// it with Ctrl+Shift+T restores "the same tab" from the user's point of
-// view, but Chrome hands it a brand new tabId, so keying sessions by
-// tabId makes that history unreachable even though nothing was ever
-// meant to be cleared.
+// ── Session identity: per-URL, scoped to the browser session ─────────
 //
-// The URL is the only thing that's actually stable across that close/
-// reopen round-trip, so session identity (history load/clear, and the
-// websocket) is keyed off a hash of the URL instead. This also matches
-// the already-accepted behavior that navigating to a genuinely different
-// URL starts a fresh conversation (same as e.g. Gemini's side panel) —
-// it's the same key, just no longer thrown away by an incidental tab
-// close.
+// A conversation is looked up by URL, same as before — but the mapping
+// itself now lives in chrome.storage.session instead of being a pure
+// hash, which gives us two things a pure hash couldn't:
 //
-// Not cryptographic — just enough spread to use as a URL-safe path
-// segment key. Strips the fragment (#...) so in-page anchor jumps on the
-// same document don't fragment the session.
-export function getSessionKey(url) {
+//   1. It expires when the browser restarts (Chrome wipes
+//      chrome.storage.session automatically), so a page you chatted
+//      with last week doesn't silently resume — you get a fresh
+//      conversation, with the old one still reachable via Chats.
+//   2. A tab's conversation can follow it across navigation: when a tab
+//      moves from page1 to page2, page2 is pointed at page1's existing
+//      session key instead of getting a brand new one. A tab is a
+//      workflow, not a single page, so the conversation should carry
+//      forward with it.
+//
+// Concretely, this means:
+//   - Reload the page                     → same chat
+//   - Close the tab, Ctrl+Shift+T it back  → same chat (URL's mapping
+//                                            is untouched by closing)
+//   - Two tabs open on the same URL        → SAME chat (shared, like
+//                                            the original design)
+//   - Navigate to a different URL,
+//     same tab                             → SAME chat continues;
+//                                            the new URL is pointed at
+//                                            the tab's existing key
+//   - Restart the browser entirely         → NEW chat (storage wiped)
+//
+// Note the resulting quirk, which is a direct consequence of "URL is
+// just a lookup key, not an owner": if tab A talks about page1, then
+// navigates to page2 (conversation follows), and tab B *later* opens
+// page1 fresh, tab B resumes tab A's conversation too — now including
+// the page2 portion. The mapping isn't torn down when a tab leaves a
+// URL, so any tab that lands on that URL later (even after the
+// original tab closed) picks up wherever that key left off, until the
+// browser restarts.
+
+function urlStorageKey(url) {
+  const withoutFragment = (url || "").split("#")[0];
+  return `sicily-url-session:${withoutFragment}`;
+}
+
+// Not cryptographic — just a short, readable seed for a freshly minted
+// key. No longer the identity itself (the stored mapping is).
+function hashUrl(url) {
   if (!url) return "no-url";
   const withoutFragment = url.split("#")[0];
   let hash = 0;
   for (let i = 0; i < withoutFragment.length; i++) {
     hash = (Math.imul(31, hash) + withoutFragment.charCodeAt(i)) | 0;
   }
-  // Base36, unsigned — keeps it short and safe to drop straight into a
-  // REST path / ws URL segment.
   return (hash >>> 0).toString(36);
+}
+
+function mintSessionKey(url) {
+  const seed = hashUrl(url);
+  const suffix = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  return `${seed}-${suffix}`;
+}
+
+async function getUrlMapping(url) {
+  const key = urlStorageKey(url);
+  try {
+    const stored = await chrome.storage.session.get(key);
+    return stored[key] || null;
+  } catch (err) {
+    console.error("Couldn't read session mapping for URL:", err);
+    return null;
+  }
+}
+
+async function setUrlMapping(url, sessionKey) {
+  try {
+    await chrome.storage.session.set({ [urlStorageKey(url)]: sessionKey });
+  } catch (err) {
+    console.error("Couldn't persist session mapping for URL:", err);
+  }
+}
+
+// Resolves the session key for a URL: reuse it if this browser session
+// already has a mapping for it, otherwise mint and store a fresh one.
+export async function resolveSessionKey(url) {
+  const existing = await getUrlMapping(url);
+  if (existing) return existing;
+
+  const fresh = mintSessionKey(url);
+  await setUrlMapping(url, fresh);
+  return fresh;
+}
+
+// Called on same-tab navigation: points the new URL at the tab's
+// current (pre-navigation) session key, so the conversation continues
+// instead of restarting. If the new URL already has its own mapping
+// from some earlier, unrelated visit, that mapping is intentionally
+// overwritten — the active, continuing conversation takes precedence
+// over a stale one that happened to touch this URL before.
+export async function carrySessionToUrl(sessionKey, newUrl) {
+  await setUrlMapping(newUrl, sessionKey);
+}
+
+// Forces a brand-new session and points this URL at it — the "New
+// Chat" primitive. Only this URL's mapping is touched; any other URL
+// that was previously pointing at the old session key (e.g. via
+// carrySessionToUrl) is left alone and keeps resolving to the old one.
+export async function startNewSessionForUrl(url) {
+  const fresh = mintSessionKey(url);
+  await setUrlMapping(url, fresh);
+  return fresh;
+}
+
+// Points this URL's mapping at an existing session key — used when the
+// user manually switches conversations from the Chats panel, so this
+// page resumes that conversation from now on (until browser restart).
+export async function pinSessionKeyToUrl(url, sessionKey) {
+  await setUrlMapping(url, sessionKey);
 }
 
 export async function loadHistory(sessionKey) {
@@ -52,21 +138,9 @@ export async function loadHistory(sessionKey) {
   }
 }
 
-export async function clearHistoryOnBackend(sessionKey) {
-  try {
-    await fetch(`http://${BACKEND_HOST}/session/${sessionKey}`, { method: "DELETE" });
-    return true;
-  } catch (err) {
-    addMessage("Couldn't clear history — is navigator_bridge.py running?", "system");
-    return false;
-  }
-}
-
-// Same request as clearHistoryOnBackend — the backend only has one way
-// to wipe a session's rows out of ChatStore. Kept as a distinct export
-// so call sites read according to intent (permanently deleting a
-// conversation from the Chats list vs. clearing the active one) even
-// though today they hit the same DELETE route.
+// Deletes a conversation's rows from ChatStore permanently. Used by the
+// Chats panel's per-row delete, and nowhere else — "New Chat" no longer
+// clears anything server-side, it just stops using the old session key.
 export async function deleteSessionOnBackend(sessionKey) {
   try {
     const res = await fetch(`http://${BACKEND_HOST}/session/${sessionKey}`, { method: "DELETE" });
@@ -75,55 +149,6 @@ export async function deleteSessionOnBackend(sessionKey) {
     console.error("Couldn't delete session:", err);
     return false;
   }
-}
-
-// ── Per-tab "which session is this tab currently on" override ────────
-// Session identity is normally a deterministic hash of the page URL
-// (getSessionKey), so the same page always resumes the same history.
-// "New Chat" breaks that determinism on purpose — it mints a fresh key
-// so old history stays untouched and browsable from the Chats panel.
-// That override needs to be remembered somewhere keyed by the browser
-// tab itself (chrome.tabs id), NOT the URL, so that reopening the panel
-// on *that tab* picks up the new empty conversation, while a plain
-// hash(url) lookup (e.g. a different tab on the same URL, or this tab
-// after truly closing/reopening it) still falls back to the original,
-// deterministic per-page history.
-//
-// chrome.storage.session is used (not local) since this is scoped to
-// the current browser session by design — it's a "where was this tab
-// left" breadcrumb, not data worth persisting past a browser restart.
-function tabOverrideKey(tabId) {
-  return `sicily-session-override-${tabId}`;
-}
-
-export async function getSessionKeyForTab(tabId, url) {
-  const fallback = getSessionKey(url);
-  if (tabId == null) return fallback;
-  try {
-    const stored = await chrome.storage.session.get(tabOverrideKey(tabId));
-    return stored[tabOverrideKey(tabId)] || fallback;
-  } catch (err) {
-    return fallback;
-  }
-}
-
-export async function setSessionKeyForTab(tabId, sessionKey) {
-  if (tabId == null) return;
-  try {
-    await chrome.storage.session.set({ [tabOverrideKey(tabId)]: sessionKey });
-  } catch (err) {
-    console.error("Couldn't persist session override for tab:", err);
-  }
-}
-
-// A "New Chat" key: still URL-derived (so it's recognizable/stable in
-// shape) but suffixed with randomness so it's guaranteed distinct from
-// the page's default hash(url) key and from any prior New Chat key for
-// this same page.
-export function makeFreshSessionKey(url) {
-  const base = getSessionKey(url);
-  const suffix = Math.random().toString(36).slice(2, 8);
-  return `${base}-${suffix}`;
 }
 
 export function closeSocket() {

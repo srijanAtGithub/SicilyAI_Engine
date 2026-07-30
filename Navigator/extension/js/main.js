@@ -1,6 +1,6 @@
 import { NotificationService } from "./notifications.js";
 import { addMessage, clearMessagesUI, addContextTrail, setSending, sendBtn, appWrap, showEmptyState } from "./ui.js";
-import { socket, getActiveTabInfo, loadHistory, deleteSessionOnBackend, connectSocket, closeSocket, getSessionKeyForTab, setSessionKeyForTab, makeFreshSessionKey, fetchAllSessions, BACKEND_HOST } from "./api.js";
+import { socket, getActiveTabInfo, loadHistory, deleteSessionOnBackend, connectSocket, closeSocket, resolveSessionKey, carrySessionToUrl, startNewSessionForUrl, pinSessionKeyToUrl, fetchAllSessions, BACKEND_HOST } from "./api.js";
 import { attachedContexts, clearAttachedContexts } from "./features.js";
 import {
   getMentionedTabSnippets, hasMentionedTab, clearMentionedTab, isMentionDropdownOpen,
@@ -89,18 +89,18 @@ async function sendMessage() {
 }
 
 // "New Chat" starts a distinct backend session rather than wiping the
-// current one: it mints a fresh session key, points this tab at it (so
-// reopening the panel on this tab resumes the new, empty conversation
-// instead of snapping back to the old one), clears the visible UI, and
-// reconnects the socket. The old conversation is untouched and stays
-// reachable from the Chats panel.
+// current one: it mints a fresh session key and points this URL at it
+// (so this page resumes the new, empty conversation from now on,
+// instead of the old one), clears the visible UI, and reconnects the
+// socket. The old conversation is untouched and stays reachable from
+// the Chats panel — including from any other URL that had been carried
+// along with it via navigation.
 async function handleClear() {
   closeSocket();
   clearMessagesUI();
   showEmptyState();
 
-  currentSessionKey = makeFreshSessionKey(currentTab.url);
-  await setSessionKeyForTab(currentTab.id, currentSessionKey);
+  currentSessionKey = await startNewSessionForUrl(currentTab.url);
 
   autoMentionActiveTab(currentTab);
 
@@ -239,10 +239,9 @@ async function switchToSession(sessionKey) {
   // Set new session
   currentSessionKey = sessionKey;
 
-  // Remember that this tab is now on this session, so reopening the
-  // panel on this tab resumes here instead of falling back to
-  // hash(url) and losing track of the switch.
-  await setSessionKeyForTab(currentTab.id, sessionKey);
+  // Remember that this URL now resolves to this session, so it (and any
+  // tab that visits it) resumes here from now on, until browser restart.
+  await pinSessionKeyToUrl(currentTab.url, sessionKey);
 
   // Load history for the new session
   const history = await loadHistory(sessionKey);
@@ -313,31 +312,24 @@ inputEl.addEventListener("keydown", (e) => {
   }
 });
 
-(async () => {
-  requestAnimationFrame(() => {
-    if (appWrap) appWrap.classList.add("ready");
-  });
+// Loads whatever conversation this URL currently resolves to — used on
+// panel open, and when manually switching tabs/sessions. Does NOT carry
+// any prior conversation forward; it's a fresh lookup.
+async function loadSessionForUrl(url) {
+  currentSessionKey = await resolveSessionKey(url);
 
-  currentTab = await getActiveTabInfo();
-  if (currentTab.id == null) {
-    addMessage("Couldn't identify the active tab.", "system");
-    return;
-  }
-
-  // Resolve via the per-tab override first (set by "New Chat" or by
-  // manually switching conversations), falling back to the
-  // deterministic hash(url) key for a tab opening a page fresh.
-  currentSessionKey = await getSessionKeyForTab(currentTab.id, currentTab.url);
+  closeSocket();
+  clearMessagesUI();
 
   const history = await loadHistory(currentSessionKey);
 
   if (history.length === 0) {
-    // Fresh conversation for this page — default to "I want to ask about
+    // Fresh conversation for this URL — default to "I want to ask about
     // this page" instead of making the user @-mention it themselves.
-    // Skipped when history exists (session persists across tab close/
-    // reopen and backend restarts now) so reopening the panel on an
-    // ongoing conversation doesn't silently re-attach the full page text
-    // as a brand new mention on top of it.
+    // Skipped when history exists so reopening the panel on an ongoing
+    // conversation doesn't silently re-attach the full page text as a
+    // brand new mention on top of it.
+    showEmptyState();
     autoMentionActiveTab(currentTab);
   }
 
@@ -349,5 +341,38 @@ inputEl.addEventListener("keydown", (e) => {
   }
 
   connectSocket(currentSessionKey);
+}
+
+// Same-tab navigation is treated as a continuation of one workflow, not
+// a new one: the new URL is pointed at the tab's existing session key
+// (carrySessionToUrl) rather than looking up whatever that URL already
+// resolves to. The visible conversation and socket are untouched —
+// nothing to reload, since it's the same session either way.
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (tabId !== currentTab.id) return;
+  if (!changeInfo.url || changeInfo.url === currentTab.url) return;
+
+  const newUrl = changeInfo.url;
+  await carrySessionToUrl(currentSessionKey, newUrl);
+  currentTab = { id: tab.id, url: newUrl, title: tab.title || currentTab.title };
+});
+
+(async () => {
+  requestAnimationFrame(() => {
+    if (appWrap) appWrap.classList.add("ready");
+  });
+
+  currentTab = await getActiveTabInfo();
+  if (currentTab.id == null) {
+    addMessage("Couldn't identify the active tab.", "system");
+    return;
+  }
+
+  // Resolves to whatever conversation this URL currently maps to in this
+  // browser session (shared across any tab that's visited it, including
+  // one carried forward from navigation) — or mints a fresh one if
+  // there's no live mapping (first visit this browser session, or the
+  // browser has restarted since). See api.js for the full rules.
+  await loadSessionForUrl(currentTab.url);
   inputEl.focus();
 })();
