@@ -252,6 +252,56 @@ class ChatStore:
             (count,) = cur.fetchone()
         return count
 
+    def list_sessions(self) -> list[dict]:
+        """
+        Returns a summary of every distinct session (tab_id) that has
+        at least one message, ordered by most recently active first.
+
+        Each entry:
+            {
+                "session_key": str,
+                "preview":     str,   -- first user message (truncated)
+                "last_active": str,   -- ISO-8601 UTC of newest message
+            }
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    tab_id,
+                    MAX(created_at)     AS last_active
+                FROM messages
+                GROUP BY tab_id
+                ORDER BY last_active DESC
+                """
+            )
+            rows = cur.fetchall()
+
+        sessions: list[dict] = []
+        for row in rows:
+            tab_id = row["tab_id"]
+            # Grab the first user message as a preview
+            with self._cursor() as cur:
+                cur.execute(
+                    "SELECT text FROM messages "
+                    "WHERE tab_id = ? AND role = 'user' "
+                    "ORDER BY id ASC LIMIT 1",
+                    (tab_id,),
+                )
+                first = cur.fetchone()
+
+            preview = ""
+            if first:
+                preview = first["text"][:120]
+
+            sessions.append({
+                "session_key": tab_id,
+                "preview": preview,
+                "last_active": row["last_active"],
+            })
+
+        return sessions
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()

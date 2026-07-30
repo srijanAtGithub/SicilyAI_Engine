@@ -1,15 +1,15 @@
 import { NotificationService } from "./notifications.js";
-import { addMessage, clearMessagesUI, addContextTrail, setSending, sendBtn, appWrap } from "./ui.js";
-import { socket, getActiveTabInfo, loadHistory, clearHistoryOnBackend, connectSocket, getSessionKey, BACKEND_HOST } from "./api.js";
+import { addMessage, clearMessagesUI, addContextTrail, setSending, sendBtn, appWrap, showEmptyState } from "./ui.js";
+import { socket, getActiveTabInfo, loadHistory, deleteSessionOnBackend, connectSocket, closeSocket, resolveSessionKey, carrySessionToUrl, startNewSessionForUrl, pinSessionKeyToUrl, fetchAllSessions, BACKEND_HOST } from "./api.js";
 import { attachedContexts, clearAttachedContexts } from "./features.js";
 import {
   getMentionedTabSnippets, hasMentionedTab, clearMentionedTab, isMentionDropdownOpen,
   hasMentionedCollection, getMentionedCollectionIds, clearMentionedCollection,
-  autoMentionActiveTab
+  autoMentionActiveTab, removeMentionedTab
 } from "./mentions.js";
 
 const inputEl = document.getElementById("input-box");
-const clearBtn = document.getElementById("clear-btn");
+const clearBtn = document.getElementById("new-chat-btn");
 let currentTab = { id: null, url: "", title: "" };
 let currentSessionKey = null;
 
@@ -67,6 +67,10 @@ async function sendMessage() {
 
   addMessage(text, "user");
   inputEl.value = "";
+
+  inputEl.style.height = 'auto';
+  inputEl.style.overflowY = 'hidden';
+
   setSending(true);
 
   // Send the FULL content to the backend
@@ -84,14 +88,202 @@ async function sendMessage() {
   if (hasMentionedCollection()) clearMentionedCollection();
 }
 
+// "New Chat" starts a distinct backend session rather than wiping the
+// current one: it mints a fresh session key and points this URL at it
+// (so this page resumes the new, empty conversation from now on,
+// instead of the old one), clears the visible UI, and reconnects the
+// socket. The old conversation is untouched and stays reachable from
+// the Chats panel — including from any other URL that had been carried
+// along with it via navigation.
 async function handleClear() {
-  if (currentSessionKey == null) return;
-  const ok = await clearHistoryOnBackend(currentSessionKey);
-  if (ok) {
-    clearMessagesUI();
-    NotificationService.show("Conversation cleared.");
-  }
+  closeSocket();
+  clearMessagesUI();
+  showEmptyState();
+
+  currentSessionKey = await startNewSessionForUrl(currentTab.url);
+
+  autoMentionActiveTab(currentTab);
+
+  connectSocket(currentSessionKey);
+  inputEl.focus();
+
+  NotificationService.show("New conversation started.");
 }
+
+// ── Chats Panel ───────────────────────────────────────────────────────
+const chatsBtn = document.getElementById("chats-btn");
+const chatsOverlay = document.getElementById("chats-overlay");
+const chatsPanelList = document.getElementById("chats-panel-list");
+const chatsPanelEmpty = document.getElementById("chats-panel-empty");
+const chatsPanelClose = document.getElementById("chats-panel-close");
+
+function openChatsPanel() {
+  chatsOverlay.classList.add("active");
+  populateChatsPanel();
+}
+
+function closeChatsPanel() {
+  chatsOverlay.classList.remove("active");
+}
+
+function formatTimeAgo(isoStr) {
+  if (!isoStr) return "";
+  const then = new Date(isoStr);
+  const now = new Date();
+  const diffMs = now - then;
+  const diffMins = Math.floor(diffMs / 60000);
+  if (diffMins < 1) return "Just now";
+  if (diffMins < 60) return `${diffMins}m ago`;
+  const diffHours = Math.floor(diffMins / 60);
+  if (diffHours < 24) return `${diffHours}h ago`;
+  const diffDays = Math.floor(diffHours / 24);
+  if (diffDays < 7) return `${diffDays}d ago`;
+  return then.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+async function populateChatsPanel() {
+  chatsPanelList.innerHTML = "";
+  chatsPanelEmpty.classList.remove("visible");
+
+  const sessions = await fetchAllSessions();
+
+  if (sessions.length === 0) {
+    chatsPanelEmpty.classList.add("visible");
+    return;
+  }
+
+  sessions.forEach((s, i) => {
+    const item = document.createElement("div");
+    item.className = "chats-item";
+    if (s.session_key === currentSessionKey) {
+      item.classList.add("current");
+    }
+    item.style.animationDelay = `${i * 0.04}s`;
+
+    const preview = document.createElement("div");
+    preview.className = "chats-item-preview";
+    preview.textContent = s.preview || "(empty conversation)";
+
+    const meta = document.createElement("div");
+    meta.className = "chats-item-meta";
+
+    const timeSpan = document.createElement("span");
+    timeSpan.textContent = formatTimeAgo(s.last_active);
+
+    meta.appendChild(timeSpan);
+
+    item.appendChild(preview);
+    item.appendChild(meta);
+
+    // Hover-reveal delete icon — deletes this conversation from the
+    // backend (SQLite-backed ChatStore) permanently, not just from this
+    // list. Mirrors the .item-delete-btn pattern already used for
+    // Collections/Reading List rows elsewhere in this UI.
+    const deleteBtn = document.createElement("button");
+    deleteBtn.className = "item-delete-btn chats-item-delete-btn";
+    deleteBtn.title = "Delete conversation";
+    deleteBtn.innerHTML = `<svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" width="14" height="14">
+      <path d="M4 6h12M8 6V4.5A1.5 1.5 0 0 1 9.5 3h1A1.5 1.5 0 0 1 12 4.5V6M6 6v9a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>`;
+
+    deleteBtn.addEventListener("click", async (e) => {
+      // Stop this from bubbling up to the row's own click handler
+      // (which would otherwise switch to the session we're deleting).
+      e.stopPropagation();
+      deleteBtn.disabled = true;
+
+      // If deleting the active session, close our socket BEFORE the
+      // DELETE request hits the server. The server drops the WS
+      // connection on delete, so if we don't close first, socket.onclose
+      // fires mid-await and triggers showOffline() / the disconnect screen.
+      const isDeletingActive = s.session_key === currentSessionKey;
+      if (isDeletingActive) {
+        closeSocket();
+        clearMessagesUI();
+        showEmptyState();
+      }
+
+      const ok = await deleteSessionOnBackend(s.session_key);
+      if (!ok) {
+        deleteBtn.disabled = false;
+        // If we pre-emptively closed, reconnect to the old session.
+        if (isDeletingActive) {
+          connectSocket(currentSessionKey);
+        }
+        return;
+      }
+
+      if (isDeletingActive) {
+        // Mint a fresh session so the user lands on a clean slate,
+        // fully connected — not an offline/disconnected state.
+        currentSessionKey = await startNewSessionForUrl(currentTab.url);
+        autoMentionActiveTab(currentTab);
+        connectSocket(currentSessionKey);
+      }
+
+      item.remove();
+      NotificationService.show("Conversation deleted.");
+
+      // Refresh so the empty-state message shows if that was the last one.
+      if (chatsPanelList.children.length === 0) {
+        chatsPanelEmpty.classList.add("visible");
+      }
+    });
+
+    item.appendChild(deleteBtn);
+
+    item.addEventListener("click", () => {
+      switchToSession(s.session_key);
+    });
+
+    chatsPanelList.appendChild(item);
+  });
+}
+
+async function switchToSession(sessionKey) {
+  closeChatsPanel();
+
+  if (sessionKey === currentSessionKey) return;
+
+  // Tear down old session
+  closeSocket();
+  clearMessagesUI();
+
+  // Set new session
+  currentSessionKey = sessionKey;
+
+  // Remember that this URL now resolves to this session, so it (and any
+  // tab that visits it) resumes here from now on, until browser restart.
+  await pinSessionKeyToUrl(currentTab.url, sessionKey);
+
+  // Load history for the new session
+  const history = await loadHistory(sessionKey);
+
+  if (history.length === 0) {
+    showEmptyState();
+  }
+
+  for (const m of history) {
+    if (m.role === "user" && Array.isArray(m.context_snippets) && m.context_snippets.length) {
+      addContextTrail(m.context_snippets);
+    }
+    addMessage(m.text, m.role === "user" ? "user" : "ai");
+  }
+
+  // Reconnect socket to the new session
+  connectSocket(sessionKey);
+  inputEl.focus();
+
+  NotificationService.show("Switched conversation.");
+}
+
+chatsBtn.addEventListener("click", openChatsPanel);
+chatsPanelClose.addEventListener("click", closeChatsPanel);
+
+// Close on clicking the backdrop (not the panel itself)
+chatsOverlay.addEventListener("click", (e) => {
+  if (e.target === chatsOverlay) closeChatsPanel();
+});
 
 sendBtn.addEventListener("click", sendMessage);
 clearBtn.addEventListener("click", handleClear);
@@ -129,12 +321,68 @@ inputEl.addEventListener("keydown", (e) => {
     if (!e.shiftKey) {
       e.preventDefault();
       sendMessage();
-
-      // Reset the box back to default after sending
-      inputEl.style.height = 'auto';
-      inputEl.style.overflowY = 'hidden';
     }
   }
+});
+
+// Loads whatever conversation this URL currently resolves to — used on
+// panel open, and when manually switching tabs/sessions. Does NOT carry
+// any prior conversation forward; it's a fresh lookup.
+async function loadSessionForUrl(url) {
+  currentSessionKey = await resolveSessionKey(url);
+
+  closeSocket();
+  clearMessagesUI();
+
+  const history = await loadHistory(currentSessionKey);
+
+  if (history.length === 0) {
+    // Fresh conversation for this URL — default to "I want to ask about
+    // this page" instead of making the user @-mention it themselves.
+    // Skipped when history exists so reopening the panel on an ongoing
+    // conversation doesn't silently re-attach the full page text as a
+    // brand new mention on top of it.
+    showEmptyState();
+    autoMentionActiveTab(currentTab);
+  }
+
+  for (const m of history) {
+    if (m.role === "user" && Array.isArray(m.context_snippets) && m.context_snippets.length) {
+      addContextTrail(m.context_snippets);
+    }
+    addMessage(m.text, m.role === "user" ? "user" : "ai");
+  }
+
+  connectSocket(currentSessionKey);
+}
+
+// Same-tab navigation is treated as a continuation of one workflow, not
+// a new one: the new URL is pointed at the tab's existing session key
+// (carrySessionToUrl) rather than looking up whatever that URL already
+// resolves to. The visible conversation and socket are untouched —
+// nothing to reload, since it's the same session either way.
+//
+// The user just followed a link — the natural next question is almost
+// always about the page they landed on, so auto-mention it the same way
+// the very first page in a tab gets auto-mentioned on panel open. The
+// old page's mention (if any) is dropped first: it's still keyed to
+// this same tabId, so autoMentionActiveTab's "already mentioned"
+// dedupe would otherwise skip attaching the new page entirely.
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (tabId !== currentTab.id) return;
+  // Chrome fires onUpdated repeatedly through a navigation (url change,
+  // then loading, then complete). Wait for "complete" so the new page
+  // actually exists in the DOM before extracting its text — otherwise
+  // this races a blank/loading document.
+  if (changeInfo.status !== "complete") return;
+  const newUrl = tab.url || "";
+  if (!newUrl || newUrl === currentTab.url) return;
+
+  await carrySessionToUrl(currentSessionKey, newUrl);
+  currentTab = { id: tab.id, url: newUrl, title: tab.title || currentTab.title };
+
+  removeMentionedTab(tabId);
+  autoMentionActiveTab(currentTab);
 });
 
 (async () => {
@@ -147,27 +395,12 @@ inputEl.addEventListener("keydown", (e) => {
     addMessage("Couldn't identify the active tab.", "system");
     return;
   }
-  currentSessionKey = getSessionKey(currentTab.url);
 
-  const history = await loadHistory(currentSessionKey);
-
-  if (history.length === 0) {
-    // Fresh conversation for this page — default to "I want to ask about
-    // this page" instead of making the user @-mention it themselves.
-    // Skipped when history exists (session persists across tab close/
-    // reopen and backend restarts now) so reopening the panel on an
-    // ongoing conversation doesn't silently re-attach the full page text
-    // as a brand new mention on top of it.
-    autoMentionActiveTab(currentTab);
-  }
-
-  for (const m of history) {
-    if (m.role === "user" && Array.isArray(m.context_snippets) && m.context_snippets.length) {
-      addContextTrail(m.context_snippets);
-    }
-    addMessage(m.text, m.role === "user" ? "user" : "ai");
-  }
-
-  connectSocket(currentSessionKey);
+  // Resolves to whatever conversation this URL currently maps to in this
+  // browser session (shared across any tab that's visited it, including
+  // one carried forward from navigation) — or mints a fresh one if
+  // there's no live mapping (first visit this browser session, or the
+  // browser has restarted since). See api.js for the full rules.
+  await loadSessionForUrl(currentTab.url);
   inputEl.focus();
 })();

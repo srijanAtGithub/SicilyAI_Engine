@@ -290,7 +290,7 @@
     color: rgba(255, 255, 255, 0.38);
     line-height: 1.55;
     text-align: center;
-    max-width: 210px;
+    max-width: 300px;
     margin-bottom: 28px;
 }
 
@@ -1224,4 +1224,225 @@
 .reading-list-item-view .link-result-url,
 .reading-list-item-view .link-result-reason {
     padding-right: 66px;
+}
+
+/* --- Chats Floating Panel Overlay --- */
+#chats-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 120;
+    background: rgba(10, 10, 12, 0.55);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
+    padding: 50px 14px 20px 14px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+#chats-overlay.active {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.chats-panel {
+    width: 100%;
+    max-width: 380px;
+    max-height: 75vh;
+    border-radius: 18px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: rgba(25, 25, 28, 0.88);
+    backdrop-filter: blur(30px);
+    -webkit-backdrop-filter: blur(30px);
+    box-shadow:
+        0 16px 48px rgba(0, 0, 0, 0.5),
+        0 0 22px rgba(255, 255, 255, 0.06),
+        inset 0 0 1px rgba(255, 255, 255, 0.1);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    transform: translateY(-12px) scale(0.95);
+    transition: transform 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+#chats-overlay.active .chats-panel {
+    transform: translateY(0) scale(1);
+}
+
+.chats-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 16px 12px 16px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.chats-panel-title {
+    font-size: 14px;
+    font-weight: 650;
+    color: #f2f2f7;
+    letter-spacing: -0.1px;
+}
+
+.chats-panel-close {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(255, 255, 255, 0.08);
+    color: rgba(255, 255, 255, 0.55);
+    font-size: 16px;
+    font-weight: 600;
+    line-height: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s, color 0.15s, transform 0.12s;
+}
+
+.chats-panel-close:hover {
+    background: rgba(255, 255, 255, 0.18);
+    color: #f2f2f7;
+}
+
+.chats-panel-close:active {
+    transform: scale(0.9);
+}
+
+.chats-panel-list {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 6px;
+
+    /* Soft fade at edges */
+    -webkit-mask-image:
+        linear-gradient(to bottom,
+            transparent 0%,
+            black 8px,
+            black calc(100% - 8px),
+            transparent 100%);
+    mask-image:
+        linear-gradient(to bottom,
+            transparent 0%,
+            black 8px,
+            black calc(100% - 8px),
+            transparent 100%);
+}
+
+.chats-panel-list::-webkit-scrollbar {
+    width: 5px;
+}
+
+.chats-panel-list::-webkit-scrollbar-thumb {
+    background: rgba(120, 120, 128, 0.35);
+    border-radius: 4px;
+}
+
+.chats-panel-empty {
+    padding: 36px 16px;
+    text-align: center;
+    font-size: 12.5px;
+    color: #8e8e93;
+    display: none;
+}
+
+.chats-panel-empty.visible {
+    display: block;
+}
+
+/* Individual conversation item */
+.chats-item {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: transparent;
+    border: 1px solid transparent;
+    cursor: pointer;
+    position: relative;
+    /* Anchors the hover-reveal delete button (.item-delete-btn uses
+       position: absolute against this) */
+    transition:
+        background 0.15s ease,
+        border-color 0.15s ease,
+        transform 0.12s ease;
+
+    /* Staggered fade-in */
+    opacity: 0;
+    animation: chatsItemIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* Leave clearance on the right so the preview text/time row never runs
+   under the hover-reveal delete button. */
+.chats-item-preview,
+.chats-item-meta {
+    padding-right: 30px;
+}
+
+/* Reveal on row hover — same hover-only convention as Collections and
+   Reading List rows (.item-delete-btn base rule already handles the
+   default hidden/disabled state). */
+.chats-item:hover .item-delete-btn {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.chats-item:hover {
+    background: rgba(255, 255, 255, 0.07);
+    border-color: rgba(255, 255, 255, 0.1);
+}
+
+.chats-item:active {
+    transform: scale(0.98);
+    background: rgba(255, 255, 255, 0.12);
+}
+
+.chats-item.current {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: rgba(255, 255, 255, 0.14);
+}
+
+.chats-item-preview {
+    font-size: 12.5px;
+    font-weight: 550;
+    color: #f2f2f7;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    line-height: 1.4;
+}
+
+.chats-item-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 10.5px;
+    color: #8e8e93;
+}
+
+.chats-item-meta-dot {
+    width: 2px;
+    height: 2px;
+    border-radius: 50%;
+    background: rgba(142, 142, 147, 0.6);
+    flex-shrink: 0;
+}
+
+@keyframes chatsItemIn {
+    from {
+        opacity: 0;
+        transform: translateY(4px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
 }

@@ -285,6 +285,86 @@
 }
 
 
+/* --- Collapsible User Messages --- */
+.msg.user.collapsible {
+    cursor: pointer;
+}
+
+.msg-collapse-head {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 6px;
+}
+
+.msg-collapse-preview {
+    color: #a1a1aa;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 280px;
+    transition: color 0.2s ease;
+}
+
+.msg.user.collapsible:not(.expanded):hover .msg-collapse-preview {
+    color: #d8d8de;
+}
+
+.msg.user.collapsible.expanded .msg-collapse-preview {
+    display: none;
+    /* Hide the preview line when open */
+}
+
+/* Inherit the slick caret transition from context-chip logic */
+.msg-collapse-caret {
+    flex-shrink: 0;
+    width: 14px;
+    height: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: rgba(255, 255, 255, 0.45);
+    transition: transform 0.32s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.msg-collapse-caret svg {
+    width: 100%;
+    height: 100%;
+}
+
+.msg.user.collapsible.expanded .msg-collapse-caret {
+    transform: rotate(180deg);
+    margin-bottom: 6px;
+    /* Push full text down slightly when expanded */
+    color: #a1a1aa;
+}
+
+/* Expanding grid trick matching .context-chip-body */
+.msg-collapse-body {
+    display: grid;
+    grid-template-rows: 0fr;
+    opacity: 0;
+    transition:
+        grid-template-rows 0.32s cubic-bezier(0.16, 1, 0.3, 1),
+        opacity 0.22s ease;
+}
+
+.msg.user.collapsible.expanded .msg-collapse-body {
+    grid-template-rows: 1fr;
+    opacity: 1;
+}
+
+.msg-collapse-body-inner {
+    overflow: hidden;
+    min-height: 0;
+}
+
+.msg-collapse-text {
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
+
+
 /* --- Message Copy Button (Floating Below Text) --- */
 .copy-btn {
     position: absolute;
