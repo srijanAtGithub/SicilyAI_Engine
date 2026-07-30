@@ -192,20 +192,33 @@ async function populateChatsPanel() {
       e.stopPropagation();
       deleteBtn.disabled = true;
 
-      const ok = await deleteSessionOnBackend(s.session_key);
-      if (!ok) {
-        deleteBtn.disabled = false;
-        return;
-      }
-
-      // If the conversation being deleted is the one currently loaded
-      // in the panel, clear the UI too — otherwise the user is left
-      // staring at a conversation that no longer exists on the backend.
-      if (s.session_key === currentSessionKey) {
+      // If deleting the active session, close our socket BEFORE the
+      // DELETE request hits the server. The server drops the WS
+      // connection on delete, so if we don't close first, socket.onclose
+      // fires mid-await and triggers showOffline() / the disconnect screen.
+      const isDeletingActive = s.session_key === currentSessionKey;
+      if (isDeletingActive) {
         closeSocket();
         clearMessagesUI();
         showEmptyState();
-        currentSessionKey = null;
+      }
+
+      const ok = await deleteSessionOnBackend(s.session_key);
+      if (!ok) {
+        deleteBtn.disabled = false;
+        // If we pre-emptively closed, reconnect to the old session.
+        if (isDeletingActive) {
+          connectSocket(currentSessionKey);
+        }
+        return;
+      }
+
+      if (isDeletingActive) {
+        // Mint a fresh session so the user lands on a clean slate,
+        // fully connected — not an offline/disconnected state.
+        currentSessionKey = await startNewSessionForUrl(currentTab.url);
+        autoMentionActiveTab(currentTab);
+        connectSocket(currentSessionKey);
       }
 
       item.remove();
