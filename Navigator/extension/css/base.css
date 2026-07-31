@@ -360,3 +360,13 @@ body {
         transform: translateY(100%);
     }
 }
+
+/* Invisible overlay to prevent interactions while waiting for a response */
+.wrap.busy::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: 9999;
+    background: transparent;
+    pointer-events: auto;
+}
