@@ -77,6 +77,11 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_tab_id ON messages(tab_id, id);
+
+CREATE TABLE IF NOT EXISTS session_titles (
+    tab_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL
+);
 """
 
 
@@ -252,6 +257,14 @@ class ChatStore:
             (count,) = cur.fetchone()
         return count
 
+    def set_title(self, tab_id: str, title: str) -> None:
+        """Saves a short, relevant title for the session."""
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT OR REPLACE INTO session_titles (tab_id, title) VALUES (?, ?)",
+                (tab_id, title)
+            )
+
     def list_sessions(self) -> list[dict]:
         """
         Returns a summary of every distinct session (tab_id) that has
@@ -260,7 +273,7 @@ class ChatStore:
         Each entry:
             {
                 "session_key": str,
-                "preview":     str,   -- first user message (truncated)
+                "preview":     str,   -- LLM-generated title or first user message (truncated)
                 "last_active": str,   -- ISO-8601 UTC of newest message
             }
         """
@@ -268,10 +281,12 @@ class ChatStore:
             cur.execute(
                 """
                 SELECT
-                    tab_id,
-                    MAX(created_at)     AS last_active
-                FROM messages
-                GROUP BY tab_id
+                    m.tab_id,
+                    MAX(m.created_at) AS last_active,
+                    t.title
+                FROM messages m
+                LEFT JOIN session_titles t ON m.tab_id = t.tab_id
+                GROUP BY m.tab_id
                 ORDER BY last_active DESC
                 """
             )
@@ -280,19 +295,24 @@ class ChatStore:
         sessions: list[dict] = []
         for row in rows:
             tab_id = row["tab_id"]
-            # Grab the first user message as a preview
-            with self._cursor() as cur:
-                cur.execute(
-                    "SELECT text FROM messages "
-                    "WHERE tab_id = ? AND role = 'user' "
-                    "ORDER BY id ASC LIMIT 1",
-                    (tab_id,),
-                )
-                first = cur.fetchone()
-
-            preview = ""
-            if first:
-                preview = first["text"][:120]
+            title = row["title"]
+            
+            if title:
+                preview = title
+            else:
+                # Fallback to the first user message if no title generated yet
+                with self._cursor() as cur:
+                    cur.execute(
+                        "SELECT text FROM messages "
+                        "WHERE tab_id = ? AND role = 'user' "
+                        "ORDER BY id ASC LIMIT 1",
+                        (tab_id,),
+                    )
+                    first = cur.fetchone()
+                
+                preview = ""
+                if first:
+                    preview = first["text"][:120]
 
             sessions.append({
                 "session_key": tab_id,
