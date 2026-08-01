@@ -87,6 +87,14 @@ def get_main_llm(tools=None):
     return llm
 
 
+def get_cowork_llm(tools=None):
+    llm = ChatOpenAI(model="gpt-5.4-mini")
+
+    if tools:
+        return llm.bind_tools(tools, parallel_tool_calls=False)
+    return llm
+
+
 def get_safety_llm(schema):
     return ChatOpenAI(model="gpt-5.4-nano").with_structured_output(schema, include_raw=False)
 

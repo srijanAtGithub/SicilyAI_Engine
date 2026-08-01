@@ -86,7 +86,7 @@ def build_local_graph():
         main_node  →  (tool calls?)  →  tool_node  →  main_node
                    ↘  (no tool calls) → END
     """
-    main_llm = configuration.get_main_llm(tools=LOCAL_TOOLS)
+    main_llm = configuration.get_cowork_llm(tools=LOCAL_TOOLS)
 
     async def main_node(state: LocalState) -> LocalState:
 
@@ -363,7 +363,7 @@ async def run_local_session():
                 )
             )
             try:
-                no_tools_llm = configuration.get_main_llm(tools=[])
+                no_tools_llm = configuration.get_cowork_llm(tools=[])
                 trimmed = await maybe_summarize(
                     messages, summarizer_llm, token_threshold=LOCAL_TOKEN_THRESHOLD, show_log=False
                 )

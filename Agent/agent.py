@@ -97,26 +97,47 @@ async def initialize_agent():
         MAIN_LLM_SOUL = get_system_message("main_llm")
 
         # ── Two-stage tool retrieval ──────────────────────────────────────
-        # Stage 1: router LLM picks which servers are needed
-        # Stage 2: within-server embedding filter picks top tools per server
-        retrieval_context = " ".join(
-            m.content
-            for m in state["messages"][-8:]
-            if isinstance(m, (HumanMessage, AIMessage)) and isinstance(m.content, str)
+        # Stage 1: router LLM picks which servers are needed, AND rewrites
+        #          the current turn into a clean self-contained intent string
+        # Stage 2: within-server embedding filter, using that rewritten
+        #          intent (not raw message concatenation) as the query,
+        #          returns only tools clearing the similarity threshold
+        user_preferences = await get_relevant_preferences(
+            " ".join(
+                m.content
+                for m in state["messages"][-8:]
+                if isinstance(m, (HumanMessage, AIMessage)) and isinstance(m.content, str)
+            )
         )
 
-        user_preferences = await get_relevant_preferences(retrieval_context)
+        relevant_servers, rewritten_query = await tool_manager.route(state["messages"])
 
-        relevant_servers = await tool_manager.get_relevant_servers(state["messages"])
-        relevant_tools   = await tool_manager.get_tools_for_servers(
+        if relevant_servers is None:
+            # Router call itself FAILED (exception/bad output) — this is
+            # distinct from "correctly decided no tools are needed" and
+            # must never be treated as "give the model everything."
+            # Bounded fallback: whatever servers were actually used last
+            # turn, or nothing if this is turn one. Never all_tools —
+            # dumping every connected server's tools is the exact
+            # context-bloat failure mode this routing exists to prevent,
+            # and doing it silently on the one turn routing hiccups is
+            # the worst possible time for it.
+            relevant_servers = _last_used_servers(state["messages"], tool_manager)
+            log.warning(
+                "router_failed_using_bounded_fallback",
+                fallback_servers=relevant_servers,
+            )
+
+        relevant_tools = await tool_manager.get_tools_for_servers(
             servers=relevant_servers,
-            query=retrieval_context,
-            top_k_per_server=12,
+            query=rewritten_query,
+            top_k_per_server=6,
         )
-
-        # Fallback: conversational message or router returned nothing
-        if not relevant_tools:
-            relevant_tools = tool_manager.all_tools
+        # NOTE: no "if not relevant_tools: relevant_tools = tool_manager.all_tools"
+        # fallback here anymore, intentionally. Empty is a valid, correct
+        # outcome for pure-conversational turns and for router-failure
+        # turns where the bounded fallback above also comes up empty
+        # (e.g. very first message in a session).
 
         # ── Build system message — inject preferences only if something was retrieved ──
         if user_preferences:
@@ -149,8 +170,7 @@ async def initialize_agent():
         tool_call = response.tool_calls[0]
         tool_name  = tool_call["name"]
 
-        tool_map  = {e.tool.name: e.tool for e in tool_manager._registry}
-        tool_obj  = tool_map.get(tool_name)
+        tool_obj  = tool_manager.tool_map.get(tool_name)
         tool_desc = tool_obj.description if tool_obj else "No description available"
 
         # ── Safety fast-path ─────────────────────────────────────────────
@@ -293,8 +313,7 @@ async def initialize_agent():
         tool_call = last.tool_calls[0]
 
         # Look up the tool by name from the live registry
-        tool_map = {e.tool.name: e.tool for e in tool_manager._registry}
-        tool = tool_map.get(tool_call["name"])
+        tool = tool_manager.tool_map.get(tool_call["name"])
 
         if not tool:
             timestamp = datetime.utcnow().isoformat()
@@ -542,6 +561,30 @@ def message_to_text(m) -> str:
         return f"{msg_type}: {' '.join(tool_parts)}"
 
     return f"{msg_type}: {content}"
+
+
+def _last_used_servers(messages, tool_manager: ToolManager, lookback: int = 20) -> list[str]:
+    """
+    Bounded fallback for when the server router itself fails (exception,
+    not "correctly decided nothing's needed"). Scans recent AIMessage
+    tool_calls, maps each tool name back to its owning server via
+    tool_manager, and returns the deduped set — NOT the full catalog.
+
+    Deliberately conservative: on a fresh session with no tool-call
+    history yet, this returns [] and the turn proceeds with zero tools
+    rather than guessing. That's the correct failure mode — a turn with
+    no tools is recoverable (user can be asked to clarify or retry);
+    a turn silently given every connected server's tools is the exact
+    context-bloat / wrong-tool-selection problem routing exists to avoid.
+    """
+    servers: list[str] = []
+    for m in reversed(messages[-lookback:]):
+        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+            for tc in m.tool_calls:
+                server = tool_manager.server_for_tool(tc["name"])
+                if server and server not in servers:
+                    servers.append(server)
+    return servers
 
 
 def get_safe_fresh_messages(messages, keep_last=KEEP_LAST_MESSAGES):

@@ -122,7 +122,9 @@ async def chat_node(state: NavigatorState) -> dict:
                 if num_sources > 1 else ""
             )
             + "Provide helpful, concise, and insightful answers as plain text "
-            "(no markdown formatting)."
+            "(no markdown formatting). Keep answers fairly concise — avoid "
+            "unnecessarily long responses when a shorter one would fully "
+            "address the question."
         )
     )
 

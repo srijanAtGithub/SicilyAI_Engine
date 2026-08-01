@@ -14,7 +14,7 @@
     /* Distinct vertical separation between turns */
     position: relative;
     z-index: 2;
-    --chat-font-size: 14px;
+    --chat-font-size: 12px;
     /* Drives .msg's font-size below; adjusted live by the Quick Actions
          font size controller. Scoped here so it only ever touches chat
          bubbles, never any other UI text. */
