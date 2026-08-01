@@ -28,6 +28,7 @@ from configuration import TOOL_LABELS, get_transcriber
 from Agent.memory_and_context import run_evaluator
 from Recurring_Tasks.recurring_tasks import start_recurring_tasks, set_dispatch
 from Agent.session_store import init_db, load_all_sessions, load_session, save_session, delete_session
+from Agent.markdown_helper import markdown_to_html
 
 SICILY_HOME = Path.home() / ".sicily"
 
@@ -67,6 +68,32 @@ _sessions: dict[str, UserSession] = {}
 
 def format_time(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+async def send_markdown(bot, chat_id: int, text: str, **kwargs):
+    """
+    Send a message with Markdown rendered as Telegram HTML.
+
+    Falls back to plain text if the converted HTML is somehow rejected by
+    Telegram (e.g. an unbalanced tag from unusual model output), so a
+    formatting edge case never turns into a silently dropped message.
+    """
+    html_text = markdown_to_html(text)
+    try:
+        return await bot.send_message(chat_id=chat_id, text=html_text, parse_mode="HTML", **kwargs)
+    except Exception:
+        log.warning("Markdown->HTML send failed, falling back to plain text")
+        return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+
+
+async def edit_markdown(bot, chat_id: int, message_id: int, text: str, **kwargs):
+    """Same as send_markdown but for editing an existing message."""
+    html_text = markdown_to_html(text)
+    try:
+        return await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=html_text, parse_mode="HTML", **kwargs)
+    except Exception:
+        log.warning("Markdown->HTML edit failed, falling back to plain text")
+        return await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, **kwargs)
 
 
 async def expire_session_after_timeout(user_id: str, session_id: str, user_name: str, override_seconds: float | None = None):
@@ -338,14 +365,16 @@ async def on_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         #  we just silently drop it per spec.)
         if not session.cancel_requested:
             if result["interrupt"]:
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=result["interrupt"]
+                await send_markdown(
+                    context.bot,
+                    update.effective_chat.id,
+                    result["interrupt"]
                 )
             elif result["reply"]:
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=result["reply"]
+                await send_markdown(
+                    context.bot,
+                    update.effective_chat.id,
+                    result["reply"]
                 )
     except asyncio.CancelledError:
         # /stop fired — task was cancelled externally. Say nothing. Do nothing.
@@ -404,7 +433,7 @@ async def dispatch_recurring_task(task_id: str, task_text: str):
         return
 
     try:
-        await telegram_app.bot.send_message(chat_id=active_chat_id, text=reply)
+        await send_markdown(telegram_app.bot, active_chat_id, reply)
         log.info("Recurring task reply sent", task_id=task_id)
     except Exception as e:
         log.exception("Failed to send recurring task reply", task_id=task_id)
@@ -618,7 +647,7 @@ async def send_to_telegram(text: str):
     if active_chat_id is None:
         return {"error": "No active chat yet — send a message from Telegram first"}
 
-    await telegram_app.bot.send_message(chat_id=active_chat_id, text=text)
+    await send_markdown(telegram_app.bot, active_chat_id, text)
 
     log.info("Message sent to Telegram", text=text)
 
