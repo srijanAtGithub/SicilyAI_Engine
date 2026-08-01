@@ -290,6 +290,10 @@ body {
     animation-delay: 0.19s;
 }
 
+#quick-actions.open .qa-item:nth-child(8) {
+    animation-delay: 0.23s;
+}
+
 @keyframes qaItemIn {
     from {
         opacity: 0;
@@ -333,6 +337,67 @@ body {
     margin: 4px 4px;
 }
 
+/* --- Font Size Controller (6th quick action row) --- */
+.qa-item.qa-font-size {
+    cursor: default;
+}
+
+.qa-item.qa-font-size:hover {
+    background: transparent;
+    padding-left: 10px;
+}
+
+.qa-item.qa-font-size:active {
+    transform: none;
+    background: transparent;
+}
+
+.qa-font-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.06);
+    color: #f2f2f7;
+    cursor: pointer;
+    padding: 0;
+    flex-shrink: 0;
+    transition: background 0.15s ease, transform 0.1s ease;
+}
+
+.qa-font-btn svg {
+    width: 10px;
+    height: 10px;
+}
+
+.qa-font-btn:hover {
+    background: rgba(255, 255, 255, 0.22);
+}
+
+.qa-font-btn:active {
+    transform: scale(0.92);
+    background: rgba(255, 255, 255, 0.3);
+}
+
+.qa-font-btn:disabled {
+    opacity: 0.35;
+    cursor: default;
+    pointer-events: none;
+}
+
+.qa-font-value {
+    font-size: 11.5px;
+    font-weight: 600;
+    color: #f2f2f7;
+    min-width: 32px;
+    text-align: center;
+    flex-shrink: 0;
+    user-select: none;
+}
+
 /* Scanning scanline for busy state (Matches content_script.js) */
 .wrap::before {
     content: '';
@@ -359,4 +424,14 @@ body {
     100% {
         transform: translateY(100%);
     }
+}
+
+/* Invisible overlay to prevent interactions while waiting for a response */
+.wrap.busy::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: 9999;
+    background: transparent;
+    pointer-events: auto;
 }

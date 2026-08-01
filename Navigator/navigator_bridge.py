@@ -319,6 +319,45 @@ async def websocket_endpoint(websocket: WebSocket, tab_id: str):
                 ai_text=reply_text,
                 context_snippets=context_snippets,
             )
+            
+            # If this is the very first turn, generate a title in the background
+            if not history:
+                import asyncio
+                async def generate_and_save_title():
+                    try:
+                        llm = configuration.navigator_general_llm()
+                        prompt = (
+                            "Generate a very short, highly relevant chat title "
+                            "based on this first interaction. Do not use quotes or prefixes. Just the title.\n\n"
+                            f"User: {user_text}\n\nAI: {reply_text}"
+                        )
+                        title_msg = await llm.ainvoke(prompt)
+                        title = title_msg.content.strip(' "')
+                        sessions.set_title(tab_id, title)
+                        
+                        # Record token usage for title generation
+                        try:
+                            from usage_tracker import record_usage
+                            if hasattr(title_msg, "usage_metadata") and title_msg.usage_metadata:
+                                usage_meta = title_msg.usage_metadata
+                                model_name = title_msg.response_metadata.get("model_name", "unknown")
+                                msg_id = getattr(title_msg, "id", None)
+                                
+                                record_usage(
+                                    dimension="navigator",
+                                    session_id=tab_id,
+                                    model_name=model_name,
+                                    input_tokens=usage_meta.get("input_tokens", 0),
+                                    output_tokens=usage_meta.get("output_tokens", 0),
+                                    cached_input_tokens=usage_meta.get("input_token_details", {}).get("cache_read_tokens", 0),
+                                    message_id=msg_id
+                                )
+                        except Exception as rec_err:
+                            log.warning("record_usage failed for navigator title gen", error=str(rec_err))
+                    except Exception as e:
+                        log.warning("Failed to generate chat title", error=str(e))
+                
+                asyncio.create_task(generate_and_save_title())
 
             await websocket.send_json({"reply": reply_text})
 

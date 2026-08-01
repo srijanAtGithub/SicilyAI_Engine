@@ -640,18 +640,35 @@ function renderDropdown(filter) {
         if (mentionType === "@") {
             titleEl.textContent = item.title || "(untitled)";
             titleEl.title = item.url || "";
+            
+            if (!isScriptableTab(item)) {
+                row.style.opacity = "0.6";
+                const badge = document.createElement("span");
+                badge.textContent = "Unsupported URL";
+                badge.style.fontSize = "10px";
+                badge.style.color = "#ff6b6b";
+                badge.style.marginLeft = "8px";
+                badge.style.fontWeight = "normal";
+                titleEl.appendChild(badge);
+            }
+            textWrap.appendChild(titleEl);
         } else {
             titleEl.textContent = item.name;
+            textWrap.appendChild(titleEl);
         }
-
-        textWrap.appendChild(titleEl);
 
         row.appendChild(icon);
         row.appendChild(textWrap);
 
         row.addEventListener("mousedown", (e) => {
             e.preventDefault();
-            if (mentionType === "@") selectTabForMention(item);
+            if (mentionType === "@") {
+                if (!isScriptableTab(item)) {
+                    import("./notifications.js").then(m => m.NotificationService.show("Browser security prevents reading this type of page."));
+                    return;
+                }
+                selectTabForMention(item);
+            }
             else selectCollectionForMention(item);
         });
 
@@ -691,7 +708,7 @@ async function openDropdown() {
     if (mentionType === "@") {
         try {
             const tabs = await chrome.tabs.query({});
-            allTabsCache = tabs.filter(isScriptableTab);
+            allTabsCache = tabs;
         } catch (err) {
             console.error("Failed to query tabs:", err);
             allTabsCache = [];
@@ -894,7 +911,13 @@ inputEl.addEventListener("keydown", (e) => {
             e.preventDefault();
             e.stopImmediatePropagation();
             const item = filtered[highlightedIndex];
-            if (mentionType === "@") selectTabForMention(item);
+            if (mentionType === "@") {
+                if (!isScriptableTab(item)) {
+                    import("./notifications.js").then(m => m.NotificationService.show("Browser security prevents reading this type of page."));
+                    return;
+                }
+                selectTabForMention(item);
+            }
             else selectCollectionForMention(item);
         }
     } else if (e.key === "Escape") {

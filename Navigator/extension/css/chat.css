@@ -14,6 +14,10 @@
     /* Distinct vertical separation between turns */
     position: relative;
     z-index: 2;
+    --chat-font-size: 14px;
+    /* Drives .msg's font-size below; adjusted live by the Quick Actions
+         font size controller. Scoped here so it only ever touches chat
+         bubbles, never any other UI text. */
 }
 
 #messages::-webkit-scrollbar {
@@ -192,7 +196,7 @@
 /* --- Base Timeline Typography --- */
 .msg {
     max-width: 100%;
-    font-size: 12px;
+    font-size: var(--chat-font-size, 12px);
     line-height: 1.65;
     white-space: pre-wrap;
     word-wrap: break-word;

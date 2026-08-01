@@ -185,7 +185,77 @@ function handleQuickAction(action) {
 }
 
 qaItems.forEach((item) => {
+  // The font-size row isn't a real "action" — it hosts the -/+ buttons
+  // below, which have their own click handlers and must never fall
+  // through to handleQuickAction (that always closes the menu).
+  if (item.classList.contains("qa-font-size")) return;
   item.addEventListener("click", () => handleQuickAction(item.dataset.action));
+});
+
+// ── Chat Font Size Controller ───────────────────────────────────────
+// Scoped to chat bubbles ONLY: it just nudges the --chat-font-size CSS
+// variable on #messages, which .msg's font-size (in chat.css) reads
+// from. Nothing else in the UI references that variable.
+const CHAT_FONT_MIN = 11;
+const CHAT_FONT_MAX = 20;
+const CHAT_FONT_DEFAULT = 14;
+const CHAT_FONT_STEP = 1;
+const CHAT_FONT_STORAGE_KEY = "chatFontSize";
+
+const messagesElForFont = document.getElementById("messages");
+const qaFontMinusBtn = document.getElementById("qa-font-minus");
+const qaFontPlusBtn = document.getElementById("qa-font-plus");
+const qaFontValueEl = document.getElementById("qa-font-value");
+
+let chatFontSize = CHAT_FONT_DEFAULT;
+
+function applyChatFontSize(size) {
+  chatFontSize = Math.min(CHAT_FONT_MAX, Math.max(CHAT_FONT_MIN, size));
+  if (messagesElForFont) {
+    messagesElForFont.style.setProperty("--chat-font-size", `${chatFontSize}px`);
+  }
+  if (qaFontValueEl) {
+    qaFontValueEl.textContent = `${chatFontSize}px`;
+  }
+  if (qaFontMinusBtn) qaFontMinusBtn.disabled = chatFontSize <= CHAT_FONT_MIN;
+  if (qaFontPlusBtn) qaFontPlusBtn.disabled = chatFontSize >= CHAT_FONT_MAX;
+}
+
+function persistChatFontSize(size) {
+  try {
+    chrome.storage?.local?.set({ [CHAT_FONT_STORAGE_KEY]: size });
+  } catch (err) {
+    console.error("Failed to persist chat font size:", err);
+  }
+}
+
+// Restore the saved preference on load (falls back to default silently
+// if chrome.storage isn't available or nothing's been saved yet).
+try {
+  chrome.storage?.local?.get([CHAT_FONT_STORAGE_KEY], (result) => {
+    const saved = result?.[CHAT_FONT_STORAGE_KEY];
+    applyChatFontSize(typeof saved === "number" ? saved : CHAT_FONT_DEFAULT);
+  });
+} catch (err) {
+  applyChatFontSize(CHAT_FONT_DEFAULT);
+}
+
+// Critical: stopPropagation on these clicks. The document-level click
+// listener above closes Quick Actions on any click outside the menu,
+// and even inside the menu a bare click would otherwise be free to
+// bubble into logic that closes it. These buttons are meant to be
+// clicked repeatedly while the menu stays open, so every interaction
+// here is fully contained.
+qaFontMinusBtn?.addEventListener("click", (e) => {
+  e.stopPropagation();
+  applyChatFontSize(chatFontSize - CHAT_FONT_STEP);
+  persistChatFontSize(chatFontSize);
+});
+
+qaFontPlusBtn?.addEventListener("click", (e) => {
+  e.stopPropagation();
+  applyChatFontSize(chatFontSize + CHAT_FONT_STEP);
+  persistChatFontSize(chatFontSize);
 });
 
 function setDragHoverState(targetZone) {
