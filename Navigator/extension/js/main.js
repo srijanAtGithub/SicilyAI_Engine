@@ -190,6 +190,10 @@ async function populateChatsPanel() {
       // Stop this from bubbling up to the row's own click handler
       // (which would otherwise switch to the session we're deleting).
       e.stopPropagation();
+
+      const confirmed = window.confirm("Delete this conversation? This can't be undone.");
+      if (!confirmed) return;
+
       deleteBtn.disabled = true;
 
       // If deleting the active session, close our socket BEFORE the

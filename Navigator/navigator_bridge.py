@@ -327,8 +327,9 @@ async def websocket_endpoint(websocket: WebSocket, tab_id: str):
                     try:
                         llm = configuration.navigator_general_llm()
                         prompt = (
-                            "Generate a very short, highly relevant chat title "
-                            "based on this first interaction. Do not use quotes or prefixes. Just the title.\n\n"
+                            "Generate a chat title based on this first interaction. "
+                            "Keep the name very short and concise. Just a few words. "
+                            "Do not use quotes or prefixes. Just the title.\n\n"
                             f"User: {user_text}\n\nAI: {reply_text}"
                         )
                         title_msg = await llm.ainvoke(prompt)
