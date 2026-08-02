@@ -95,7 +95,12 @@ async function sendMessage() {
 // socket. The old conversation is untouched and stays reachable from
 // the Chats panel — including from any other URL that had been carried
 // along with it via navigation.
-async function handleClear() {
+async function handleClear(showNotification = true) {
+  if (typeof isTempMode !== 'undefined' && isTempMode) {
+    isTempMode = false;
+    document.getElementById("incognito-btn").classList.remove("active");
+  }
+
   closeSocket();
   clearMessagesUI();
   showEmptyState();
@@ -107,7 +112,9 @@ async function handleClear() {
   connectSocket(currentSessionKey);
   inputEl.focus();
 
-  NotificationService.show("New conversation started.");
+  if (showNotification) {
+    NotificationService.show("New conversation started.");
+  }
 }
 
 // ── Chats Panel ───────────────────────────────────────────────────────
@@ -248,6 +255,11 @@ async function switchToSession(sessionKey) {
   closeChatsPanel();
 
   if (sessionKey === currentSessionKey) return;
+
+  if (typeof isTempMode !== 'undefined' && isTempMode) {
+    isTempMode = false;
+    document.getElementById("incognito-btn").classList.remove("active");
+  }
 
   // Tear down old session
   closeSocket();
@@ -408,3 +420,36 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   await loadSessionForUrl(currentTab.url);
   inputEl.focus();
 })();
+
+const incognitoBtn = document.getElementById("incognito-btn");
+let isTempMode = false;
+
+incognitoBtn.addEventListener("click", async () => {
+  isTempMode = !isTempMode;
+
+  if (isTempMode) {
+    incognitoBtn.classList.add("active");
+
+    // Tear down the current persistent session UI
+    closeSocket();
+    clearMessagesUI();
+    showEmptyState();
+
+    // Mint a temporary session key that the backend will recognize
+    currentSessionKey = "temp_" + Math.random().toString(36).slice(2);
+
+    // Notice we do NOT call pinSessionKeyToUrl here. 
+    // This ensures reloading the panel immediately forgets this session.
+    connectSocket(currentSessionKey);
+    inputEl.focus();
+
+    NotificationService.show("Temporary mode: Messages won't be saved.");
+  } else {
+    incognitoBtn.classList.remove("active");
+
+    // Calling handleClear() automatically handles destroying the current 
+    // UI, minting a new standard session, pinning it, and reconnecting.
+    await handleClear(false);
+    NotificationService.show("Exited temporary mode.");
+  }
+});
