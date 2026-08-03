@@ -435,3 +435,56 @@ body {
     background: transparent;
     pointer-events: auto;
 }
+
+#incognito-btn {
+    padding: 5px 10px;
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.06);
+    color: #f2f2f7;
+    font-size: 11.5px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s, transform 0.1s, border-color 0.15s, color 0.15s;
+    backdrop-filter: blur(20px);
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+#incognito-btn:hover {
+    background: rgba(255, 255, 255, 0.28);
+}
+
+#incognito-btn:active {
+    transform: scale(0.96);
+}
+
+/* Distinct visual state for when Temp Mode is active */
+#incognito-btn.active {
+    background: rgba(255, 69, 58, 0.15);
+    border-color: rgba(255, 69, 58, 0.4);
+    color: #ff453a;
+}
+
+/* --- Temporary Chat Mode notice (shown in empty state) --- */
+.es-temp-notice {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    margin: 0 auto 14px;
+    padding: 6px 12px;
+    border-radius: 20px;
+    background: rgba(255, 69, 58, 0.12);
+    border: 1px solid rgba(255, 69, 58, 0.3);
+    color: #ff8a80;
+    font-size: 13px;
+    font-weight: 600;
+    text-align: center;
+    width: fit-content;
+}
+
+#empty-state.temp-mode .es-temp-notice {
+    display: flex;
+}
