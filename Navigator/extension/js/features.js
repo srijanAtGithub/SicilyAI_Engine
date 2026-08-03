@@ -1,6 +1,7 @@
 import { NotificationService } from "./notifications.js";
 import { appWrap } from "./ui.js";
 import { BACKEND_HOST } from "./api.js";
+import { isScriptableTab } from "./mentions.js";
 
 const quickActionsWrap = document.getElementById("quick-actions");
 const quickActionsBtn = document.getElementById("quick-actions-btn");
@@ -487,6 +488,17 @@ async function startSummarisePage() {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab) throw new Error("No active tab found.");
 
+    // 1b. Bail early with a clear message for pages Chrome will never let
+    // us script into (chrome://, chrome-extension://, the Web Store, etc.)
+    // — same check @-mention uses, so behaviour stays consistent across
+    // the extension rather than falling through to a generic network-style
+    // error that wrongly implies the backend is down.
+    if (!isScriptableTab(tab)) {
+      NotificationService.show("This page can't be summarised — browser security blocks reading it.");
+      appWrap.classList.remove("busy");
+      return;
+    }
+
     // 2. Pre-LLM Extraction Layer (Domestic Chores)
     const injectionResult = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
@@ -636,6 +648,15 @@ async function startFindMoreLikeThis({ append = false } = {}) {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab) throw new Error("No active tab found.");
+
+    // Same "can we even read this page" guard as Summarise Page — bail
+    // early with a clear message instead of letting executeScript throw
+    // and having that read as a backend/network failure.
+    if (!isScriptableTab(tab)) {
+      NotificationService.show("This page can't be analysed — browser security blocks reading it.");
+      appWrap.classList.remove("busy");
+      return;
+    }
 
     // Same extraction step as Summarise Page — strip boilerplate tags,
     // cap length so the fingerprinting call stays cheap.

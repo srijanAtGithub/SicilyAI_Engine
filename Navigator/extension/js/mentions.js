@@ -237,7 +237,7 @@ const UNSCRIPTABLE_URL_PREFIXES = [
     "https://chrome.google.com/webstore",
 ];
 
-function isScriptableTab(tab) {
+export function isScriptableTab(tab) {
     const url = tab.url || "";
     if (!url) return false;
     return !UNSCRIPTABLE_URL_PREFIXES.some(prefix => url.startsWith(prefix) || url.includes(prefix));
