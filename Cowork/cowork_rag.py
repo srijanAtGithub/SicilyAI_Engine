@@ -46,6 +46,8 @@ import time
 from pathlib import Path
 from typing import Optional, Callable
 
+from Cowork.cowork_query_rewriter import rewrite_query
+
 import structlog
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
@@ -747,44 +749,29 @@ class SicilyRAG:
         return sorted(rrf_scores, key=lambda cid: rrf_scores[cid], reverse=True)
 
 
-    def search(self, query: str, top_k: int = TOP_K) -> list[dict]:
+    def search(self, query: str, top_k: int = TOP_K, enable_rewrite: bool = True) -> list[dict]:
         """
-        Hybrid search: TF-IDF keyword pass  +  semantic pass  →  RRF merge.
-        Both passes are pre-filtered to the current sandbox, so results
-        are always scoped to the active session directory.
-
-        Parameters
-        ----------
-        query   Natural-language user query.
-        top_k   Max number of chunks to return.
-
-        Returns
-        -------
-        List of result dicts, best match first:
-        {
-            "file_path":    "reports/Q3.pdf",   ← relative to current sandbox
-            "abs_path":     "/home/.../Q3.pdf", ← absolute, for tool calls
-            "file_name":    "Q3.pdf",
-            "chunk_index":  3,
-            "total_chunks": 12,
-            "last_modified":"2024-01-15T10:30:00",
-            "start_line":   84,
-            "end_line":     99,
-            "text":         "...the actual chunk content...",
-        }
+        Hybrid search with single-pass Pre-RAG Query Rewriting:
+        1. Rewrite user prompt into a single keyword-dense query (if enable_rewrite=True).
+        2. Run single TF-IDF pass + single Semantic pass.
+        3. Merge hits using Reciprocal Rank Fusion (RRF).
+        4. Fetch top_k chunks from ChromaDB.
         """
-        # Stage 1 — run both searches (both already sandbox-filtered)
-        tfidf_hits    = self._tfidf_search(query,    k=TFIDF_CANDIDATES)
-        semantic_hits = self._semantic_search(query, k=SEMANTIC_CANDIDATES)
+        # Step 1 — Rewrite query into a single contextual search string
+        search_query = rewrite_query(query) if enable_rewrite else query
 
-        # Stage 2 — merge
+        # Step 2 — Single execution across TF-IDF and Semantic search
+        tfidf_hits = self._tfidf_search(search_query, k=TFIDF_CANDIDATES)
+        semantic_hits = self._semantic_search(search_query, k=SEMANTIC_CANDIDATES)
+
+        # Step 3 — RRF Merge
         merged_ids = self._rrf_merge(tfidf_hits, semantic_hits)
         top_ids    = merged_ids[:top_k]
 
         if not top_ids:
             return []
 
-        # Stage 3 — fetch full chunk data from ChromaDB
+        # Step 4 — Fetch chunk metadata
         raw = self._vectorstore.get(
             ids=top_ids,
             include=["documents", "metadatas"],
