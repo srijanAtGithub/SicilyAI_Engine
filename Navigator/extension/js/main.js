@@ -429,11 +429,13 @@ incognitoBtn.addEventListener("click", async () => {
 
   if (isTempMode) {
     incognitoBtn.classList.add("active");
+    incognitoBtn.title = "Exit Temporary Chat Mode";
 
     // Tear down the current persistent session UI
     closeSocket();
     clearMessagesUI();
     showEmptyState();
+    document.getElementById("empty-state")?.classList.add("temp-mode");
 
     // Mint a temporary session key that the backend will recognize
     currentSessionKey = "temp_" + Math.random().toString(36).slice(2);
@@ -446,6 +448,8 @@ incognitoBtn.addEventListener("click", async () => {
     NotificationService.show("Temporary mode: Messages won't be saved.");
   } else {
     incognitoBtn.classList.remove("active");
+    incognitoBtn.title = "Temporary Chat Mode";
+    document.getElementById("empty-state")?.classList.remove("temp-mode");
 
     // Calling handleClear() automatically handles destroying the current 
     // UI, minting a new standard session, pinning it, and reconnecting.
