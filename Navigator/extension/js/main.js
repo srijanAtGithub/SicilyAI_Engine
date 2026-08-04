@@ -99,6 +99,11 @@ async function handleClear(showNotification = true) {
   if (typeof isTempMode !== 'undefined' && isTempMode) {
     isTempMode = false;
     document.getElementById("incognito-btn").classList.remove("active");
+    document.getElementById("empty-state")?.classList.remove("temp-mode");
+
+    if (currentTab && currentTab.id) {
+      chrome.storage.session.remove(`temp_${currentTab.id}`);
+    }
   }
 
   closeSocket();
@@ -259,6 +264,11 @@ async function switchToSession(sessionKey) {
   if (typeof isTempMode !== 'undefined' && isTempMode) {
     isTempMode = false;
     document.getElementById("incognito-btn").classList.remove("active");
+    document.getElementById("empty-state")?.classList.remove("temp-mode");
+
+    if (currentTab && currentTab.id) {
+      chrome.storage.session.remove(`temp_${currentTab.id}`);
+    }
   }
 
   // Tear down old session
@@ -412,12 +422,42 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     return;
   }
 
-  // Resolves to whatever conversation this URL currently maps to in this
-  // browser session (shared across any tab that's visited it, including
-  // one carried forward from navigation) — or mints a fresh one if
-  // there's no live mapping (first visit this browser session, or the
-  // browser has restarted since). See api.js for the full rules.
-  await loadSessionForUrl(currentTab.url);
+  // Check if this specific tab was already toggled into temp mode
+  const storageKey = `temp_${currentTab.id}`;
+  const tempState = await chrome.storage.session.get(storageKey);
+
+  if (tempState[storageKey]) {
+    isTempMode = true;
+    incognitoBtn.classList.add("active");
+    incognitoBtn.title = "Exit Temporary Chat Mode";
+    document.getElementById("empty-state")?.classList.add("temp-mode");
+
+    currentSessionKey = storageKey;
+
+    closeSocket();
+    clearMessagesUI();
+
+    const history = await loadHistory(currentSessionKey);
+
+    if (history.length === 0) {
+      showEmptyState();
+      autoMentionActiveTab(currentTab);
+    }
+
+    for (const m of history) {
+      if (m.role === "user" && Array.isArray(m.context_snippets) && m.context_snippets.length) {
+        addContextTrail(m.context_snippets);
+      }
+      addMessage(m.text, m.role === "user" ? "user" : "ai");
+    }
+
+    connectSocket(currentSessionKey);
+  } else {
+    // Resolves to whatever conversation this URL currently maps to in this
+    // browser session...
+    await loadSessionForUrl(currentTab.url);
+  }
+
   inputEl.focus();
 })();
 
@@ -426,33 +466,36 @@ let isTempMode = false;
 
 incognitoBtn.addEventListener("click", async () => {
   isTempMode = !isTempMode;
+  const storageKey = `temp_${currentTab.id}`;
 
   if (isTempMode) {
+    // Flag this tab as being in temp mode across panel closes
+    await chrome.storage.session.set({ [storageKey]: true });
+
     incognitoBtn.classList.add("active");
     incognitoBtn.title = "Exit Temporary Chat Mode";
 
-    // Tear down the current persistent session UI
     closeSocket();
     clearMessagesUI();
     showEmptyState();
     document.getElementById("empty-state")?.classList.add("temp-mode");
 
-    // Mint a temporary session key that the backend will recognize
-    currentSessionKey = "temp_" + Math.random().toString(36).slice(2);
+    // Tie the temporary session strictly to this Tab ID
+    currentSessionKey = storageKey;
 
-    // Notice we do NOT call pinSessionKeyToUrl here. 
-    // This ensures reloading the panel immediately forgets this session.
     connectSocket(currentSessionKey);
     inputEl.focus();
 
     NotificationService.show("Temporary mode: Messages won't be saved.");
   } else {
+    // Remove the temp flag for this tab
+    await chrome.storage.session.remove(storageKey);
+
     incognitoBtn.classList.remove("active");
     incognitoBtn.title = "Temporary Chat Mode";
     document.getElementById("empty-state")?.classList.remove("temp-mode");
 
-    // Calling handleClear() automatically handles destroying the current 
-    // UI, minting a new standard session, pinning it, and reconnecting.
+    // Revert to a clean standard session
     await handleClear(false);
     NotificationService.show("Exited temporary mode.");
   }

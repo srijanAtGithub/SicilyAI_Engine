@@ -232,7 +232,18 @@ async def get_session(tab_id: str):
 
     # incognito chats
     if tab_id.startswith("temp_"):
-        return {"messages": []}
+        if tab_id not in temp_sessions:
+            return {"messages": []}
+        
+        formatted_messages = []
+        for msg in temp_sessions[tab_id]:
+            if isinstance(msg, HumanMessage):
+                snippets = msg.additional_kwargs.get("context_snippets", [])
+                formatted_messages.append({"role": "user", "text": str(msg.content), "context_snippets": snippets})
+            elif isinstance(msg, AIMessage):
+                formatted_messages.append({"role": "ai", "text": str(msg.content), "context_snippets": []})
+                
+        return {"messages": formatted_messages}
 
     return {"messages": sessions.get_full(tab_id)}
 
@@ -248,6 +259,14 @@ async def delete_session(tab_id: str):
     """
     existed = sessions.clear(tab_id)
     return {"status": "cleared", "existed": existed}
+
+
+@app.delete("/temp_session/{tab_id}")
+async def delete_temp_session(tab_id: str):
+    """Called explicitly by the background script when a browser tab closes."""
+    if tab_id in temp_sessions:
+        del temp_sessions[tab_id]
+    return {"status": "cleared"}
 
 
 @app.websocket("/ws/{tab_id}")
@@ -322,7 +341,11 @@ async def websocket_endpoint(websocket: WebSocket, tab_id: str):
 
             # Save to memory OR database depending on the session type
             if is_temp:
-                temp_sessions[tab_id].append(HumanMessage(content=user_text))
+                # We store context_snippets in additional_kwargs so the GET /session endpoint can restore them
+                temp_sessions[tab_id].append(HumanMessage(
+                    content=user_text, 
+                    additional_kwargs={"context_snippets": context_snippets}
+                ))
                 temp_sessions[tab_id].append(AIMessage(content=reply_text))
             else:
                 sessions.append_turn(
@@ -375,17 +398,12 @@ async def websocket_endpoint(websocket: WebSocket, tab_id: str):
             await websocket.send_json({"reply": reply_text})
 
     except WebSocketDisconnect:
-        # Clean up the ephemeral memory immediately on close
-        if is_temp and tab_id in temp_sessions:
-            del temp_sessions[tab_id]
-
         # The popup closing disconnects this socket, but the tab itself is
         # very likely still open — so we deliberately do NOT clear the
-        # session here. Only DELETE /session/{tab_id} clears it, and only
-        # in response to the user's explicit "Clear chat" action —
-        # background.js no longer clears on tab close (see note on
-        # delete_session above).
+        # session here (even for temp sessions, which are now wiped by 
+        # background.js tracking the actual browser tab closure).
         log.info("Extension disconnected", tab_id=tab_id)
+
     except Exception as e:
         log.exception("Bridge error", tab_id=tab_id)
         try:
