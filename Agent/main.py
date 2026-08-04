@@ -29,6 +29,7 @@ from Agent.memory_and_context import run_evaluator
 from Recurring_Tasks.recurring_tasks import start_recurring_tasks, set_dispatch
 from Agent.session_store import init_db, load_all_sessions, load_session, save_session, delete_session
 from Agent.markdown_helper import markdown_to_html
+from Agent.connectors import restore_connected_connectors
 
 SICILY_HOME = Path.home() / ".sicily"
 
@@ -526,6 +527,13 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(initialize_agent())
     asyncio.create_task(start_recurring_tasks())
 
+    # Reconnect whatever MCP connectors the user had turned on before the
+    # last restart (swiggy, gmail, telegram, tavily, github, ...). This
+    # must run AFTER initialize_agent has at least started, since it needs
+    # agent_module.tool_manager to exist. It's fire-and-forget + best-effort
+    # per connector, so one bad token doesn't block startup or the others.
+    asyncio.create_task(restore_connectors_after_agent_ready())
+
     yield
 
     # ── Graceful drain on shutdown ────────────────────────────────────────────
@@ -590,6 +598,23 @@ async def lifespan(app: FastAPI):
     await telegram_app.updater.stop()
     await telegram_app.stop()
     await telegram_app.shutdown()
+
+
+async def restore_connectors_after_agent_ready():
+    """
+    Waits for agent_module.tool_manager to exist (initialize_agent runs
+    concurrently and creates it), then reconnects every connector the
+    user had previously turned on.
+    """
+    for _ in range(100):  # ~10s max wait, in 0.1s steps
+        if getattr(agent_module, "tool_manager", None) is not None:
+            break
+        await asyncio.sleep(0.1)
+    else:
+        log.warning("tool_manager_never_ready, skipping connector restore")
+        return
+
+    await restore_connected_connectors(agent_module.tool_manager)
 
 
 async def on_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
