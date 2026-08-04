@@ -13,6 +13,16 @@ const clearBtn = document.getElementById("new-chat-btn");
 let currentTab = { id: null, url: "", title: "" };
 let currentSessionKey = null;
 
+// Purges the in-memory temporary session on the backend
+async function clearTempSessionOnBackend(tempKey) {
+  if (!tempKey) return;
+  try {
+    await fetch(`http://${BACKEND_HOST}/temp_session/${tempKey}`, { method: "DELETE" });
+  } catch (err) {
+    console.error("Failed to delete temp session from backend:", err);
+  }
+}
+
 async function sendMessage() {
   const text = inputEl.value.trim();
   if (!text) return;
@@ -102,7 +112,9 @@ async function handleClear(showNotification = true) {
     document.getElementById("empty-state")?.classList.remove("temp-mode");
 
     if (currentTab && currentTab.id) {
-      chrome.storage.session.remove(`temp_${currentTab.id}`);
+      const tempKey = `temp_${currentTab.id}`;
+      chrome.storage.session.remove(tempKey);
+      await clearTempSessionOnBackend(tempKey); // Wipes backend memory
     }
   }
 
@@ -267,7 +279,9 @@ async function switchToSession(sessionKey) {
     document.getElementById("empty-state")?.classList.remove("temp-mode");
 
     if (currentTab && currentTab.id) {
-      chrome.storage.session.remove(`temp_${currentTab.id}`);
+      const tempKey = `temp_${currentTab.id}`;
+      chrome.storage.session.remove(tempKey);
+      await clearTempSessionOnBackend(tempKey); // Wipes backend memory
     }
   }
 
@@ -278,8 +292,7 @@ async function switchToSession(sessionKey) {
   // Set new session
   currentSessionKey = sessionKey;
 
-  // Remember that this URL now resolves to this session, so it (and any
-  // tab that visits it) resumes here from now on, until browser restart.
+  // Remember that this URL now resolves to this session
   await pinSessionKeyToUrl(currentTab.url, sessionKey);
 
   // Load history for the new session
@@ -488,8 +501,9 @@ incognitoBtn.addEventListener("click", async () => {
 
     NotificationService.show("Temporary mode: Messages won't be saved.");
   } else {
-    // Remove the temp flag for this tab
+    // Remove the temp flag for this tab and wipe backend memory
     await chrome.storage.session.remove(storageKey);
+    await clearTempSessionOnBackend(storageKey);
 
     incognitoBtn.classList.remove("active");
     incognitoBtn.title = "Temporary Chat Mode";

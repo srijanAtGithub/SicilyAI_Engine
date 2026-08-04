@@ -487,4 +487,18 @@ body {
 
 #empty-state.temp-mode .es-temp-notice {
     display: flex;
+    margin-bottom: 0;
+    /* Cleans up spacing when this is the only element visible */
+
+    /* Reddish ambient glow around the badge */
+    box-shadow:
+        0 0 16px rgba(255, 69, 58, 0.35),
+        0 0 4px rgba(255, 69, 58, 0.2);
+}
+
+/* Hide "Ready when you are", subtitle, and chips during Incognito mode */
+#empty-state.temp-mode .es-title,
+#empty-state.temp-mode .es-subtitle,
+#empty-state.temp-mode .es-suggestions {
+    display: none;
 }
