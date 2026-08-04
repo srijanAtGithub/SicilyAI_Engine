@@ -473,18 +473,36 @@ body {
     align-items: center;
     justify-content: center;
     gap: 6px;
-    margin: 0 auto 14px;
-    padding: 6px 12px;
+    margin: 0 auto;
+    padding: 6px 14px;
     border-radius: 20px;
     background: rgba(255, 69, 58, 0.12);
     border: 1px solid rgba(255, 69, 58, 0.3);
     color: #ff8a80;
-    font-size: 13px;
+    font-size: 12.5px;
     font-weight: 600;
     text-align: center;
     width: fit-content;
 }
 
+/* Re-align empty state container to top-center when in temp mode */
+#empty-state.temp-mode {
+    justify-content: flex-start;
+    align-items: center;
+    padding-top: 16px;
+}
+
 #empty-state.temp-mode .es-temp-notice {
     display: flex;
+    /* Reddish ambient glow around the badge */
+    box-shadow:
+        0 0 16px rgba(255, 69, 58, 0.35),
+        0 0 4px rgba(255, 69, 58, 0.2);
+}
+
+/* Hide "Ready when you are", subtitle, and chips during Incognito mode */
+#empty-state.temp-mode .es-title,
+#empty-state.temp-mode .es-subtitle,
+#empty-state.temp-mode .es-suggestions {
+    display: none;
 }
