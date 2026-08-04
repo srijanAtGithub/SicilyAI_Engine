@@ -498,8 +498,6 @@ incognitoBtn.addEventListener("click", async () => {
 
     connectSocket(currentSessionKey);
     inputEl.focus();
-
-    NotificationService.show("Temporary mode: Messages won't be saved.");
   } else {
     // Remove the temp flag for this tab and wipe backend memory
     await chrome.storage.session.remove(storageKey);
@@ -511,6 +509,5 @@ incognitoBtn.addEventListener("click", async () => {
 
     // Revert to a clean standard session
     await handleClear(false);
-    NotificationService.show("Exited temporary mode.");
   }
 });
