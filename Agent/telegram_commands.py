@@ -3,18 +3,24 @@ from telegram import Update, BotCommand
 from telegram.ext import CommandHandler, MessageHandler, filters, ContextTypes
 
 from Agent.agent import tool_manager
-from Agent.connectors import CONNECTORS, get_connector_servers, is_connector_loaded
+from Agent.connectors import (
+    CONNECTORS,
+    get_connector_servers,
+    is_connector_loaded,
+    mark_connector_connected,
+    mark_connector_disconnected,
+)
 
 
 # TELEGRAM COMMANDS EXECUTORS
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import main
+    import Agent.main
 
-    main.active_chat_id = update.effective_chat.id
+    Agent.main.active_chat_id = update.effective_chat.id
 
-    if not main.CHAT_ID_FILE.exists():
-        main.CHAT_ID_FILE.write_text(json.dumps({"chat_id": main.active_chat_id}))
-        print(f"💾 Registered chat_id: {main.active_chat_id} for user {update.effective_user.first_name}")
+    if not Agent.main.CHAT_ID_FILE.exists():
+        Agent.main.CHAT_ID_FILE.write_text(json.dumps({"chat_id": Agent.main.active_chat_id}))
+        print(f"💾 Registered chat_id: {Agent.main.active_chat_id} for user {update.effective_user.first_name}")
         await update.message.reply_text(
             "👋 Hi! I'm Sicily. You're all set up.."
         )
@@ -27,10 +33,10 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Cancel whatever is currently processing for this user.
     No reply to the user — just stop everything silently.
     """
-    import main
+    import Agent.main
 
     user_id = str(update.effective_user.id)
-    session = main._sessions.get(user_id)
+    session = Agent.main._sessions.get(user_id)
  
     if session is None or not session.is_processing:
         # Nothing running — silently do nothing.
@@ -53,15 +59,15 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import main 
+    import Agent.main 
     
     user_id = str(update.effective_user.id)
-    session = main._sessions.get(user_id)
+    session = Agent.main._sessions.get(user_id)
     if session:
         await update.message.reply_text(
             f"🧵 Session ID: {session.session_id[:8]}...\n"
-            f"🕒 Started: {main.format_time(session.started_at)}\n"
-            f"💬 Last msg: {main.format_time(session.last_interaction_at)}\n"
+            f"🕒 Started: {Agent.main.format_time(session.started_at)}\n"
+            f"💬 Last msg: {Agent.main.format_time(session.last_interaction_at)}\n"
             f"⚙️  Processing: {'Yes' if session.is_processing else 'No'}"
         )
     else:
@@ -164,6 +170,7 @@ async def _handle_connect(update: Update, name: str):
     await update.message.reply_text(f"⏳ Connecting {name.title()}...")
     try:
         await CONNECTORS[name](tool_manager)
+        mark_connector_connected(name)  # persist so it survives restarts
         await update.message.reply_text(f"✅ {name.title()} connected successfully!")
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to connect {name.title()}:\n{str(e)}")
@@ -177,6 +184,7 @@ async def _handle_disconnect(update: Update, name: str):
 
     for server in get_connector_servers(name):
         tool_manager.unregister(server)
+    mark_connector_disconnected(name)  # so it's NOT auto-reconnected on next boot
     await update.message.reply_text(f"🗑️ {name.title()} disconnected.")
 
 
