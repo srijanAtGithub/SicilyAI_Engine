@@ -477,9 +477,9 @@
           border: 1px solid rgba(255, 255, 255, 0.18); /* Subtle edge definition */
           
           /* Glassmorphism Effect */
-          backdrop-filter: blur(30px); 
-          -webkit-backdrop-filter: blur(30px); /* Safari support */
-          background: rgba(25, 25, 26, 0.35); /* Premium Dark Mode Gray */
+          backdrop-filter: blur(20px); 
+          -webkit-backdrop-filter: blur(20px); /* Safari support */
+          background: rgba(25, 25, 26, 0.65); /* Premium Dark Mode Gray */
           
           /* The "Shader" / Glowing Border Effect */
           box-shadow: 
