@@ -137,8 +137,12 @@ async def load_spotify_tools(tool_manager):
     spotify_client = MultiServerMCPClient({
         "spotify": {
             "transport": "stdio",
-            "command": "npx",
-            "args": ["-y", "@darrenjaws/spotify-mcp"],
+            "command": "uvx",
+            "args": [
+                "--python", "3.12",
+                "--from", "git+https://github.com/varunneal/spotify-mcp",
+                "spotify-mcp",
+            ],
             "env": env,
         }
     })

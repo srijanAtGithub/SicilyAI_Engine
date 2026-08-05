@@ -242,6 +242,13 @@ TOOL_LABELS = {
     "save_draft":                 "📝 Saving message draft...",
     "get_drafts":                 "📄 Fetching message drafts...",
     "clear_draft":                "🗑️ Clearing message draft...",
+
+    # ── Spotify ──────────────────────────────────────────────
+    "SpotifyPlayback":    "🎵 Controlling Spotify playback...",
+    "SpotifySearch":      "🔍 Searching Spotify...",
+    "SpotifyQueue":       "🎶 Managing Spotify queue...",
+    "SpotifyGetInfo":     "ℹ️ Fetching Spotify details...",
+    "SpotifyPlaylist":    "📂 Managing Spotify playlists...",
 }
 
 
