@@ -1018,6 +1018,21 @@
     margin-top: 6px;
     white-space: pre-wrap;
     line-height: 1.5;
+    
+    /* --- New Restrictive Constraints --- */
+    max-height: 72px; /* Roughly limits to 4 lines of text */
+    overflow-y: auto;
+    padding-right: 4px; /* Gives the scrollbar a little breathing room */
+}
+
+/* Optional but recommended: Style the internal scrollbar to match the modern aesthetic */
+.snippet-text::-webkit-scrollbar {
+    width: 4px;
+}
+
+.snippet-text::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.15);
+    border-radius: 4px;
 }
 
 /* --- Item Delete Button (Collections & Snippets) --- */
