@@ -23,6 +23,35 @@ async function clearTempSessionOnBackend(tempKey) {
   }
 }
 
+async function updateActiveChatTitle() {
+  const titleEl = document.getElementById("active-chat-title");
+  if (!titleEl) return;
+
+  // Clear the title entirely if in incognito mode
+  if (typeof isTempMode !== 'undefined' && isTempMode) {
+    titleEl.textContent = "";
+    return;
+  }
+
+  try {
+    const sessions = await fetchAllSessions();
+    const current = sessions.find(s => s.session_key === currentSessionKey);
+    
+    if (current && current.preview) {
+      titleEl.textContent = current.preview;
+    } else {
+      titleEl.textContent = "New Conversation";
+    }
+  } catch (err) {
+    console.error("Failed to update chat title:", err);
+  }
+}
+
+window.addEventListener("chat-turn-complete", () => {
+  // Give the backend a second to finish generating and saving the title to SQLite
+  setTimeout(updateActiveChatTitle, 1500); 
+});
+
 async function sendMessage() {
   const text = inputEl.value.trim();
   if (!text) return;
@@ -128,6 +157,8 @@ async function handleClear(showNotification = true) {
 
   connectSocket(currentSessionKey);
   inputEl.focus();
+
+  updateActiveChatTitle()
 
   if (showNotification) {
     NotificationService.show("New conversation started.");
@@ -313,6 +344,8 @@ async function switchToSession(sessionKey) {
   connectSocket(sessionKey);
   inputEl.focus();
 
+  updateActiveChatTitle()
+
   NotificationService.show("Switched conversation.");
 }
 
@@ -391,6 +424,8 @@ async function loadSessionForUrl(url) {
     }
     addMessage(m.text, m.role === "user" ? "user" : "ai");
   }
+
+  updateActiveChatTitle()
 
   connectSocket(currentSessionKey);
 }
@@ -498,6 +533,9 @@ incognitoBtn.addEventListener("click", async () => {
 
     connectSocket(currentSessionKey);
     inputEl.focus();
+
+    // instantly wipe the title
+    updateActiveChatTitle();
   } else {
     // Remove the temp flag for this tab and wipe backend memory
     await chrome.storage.session.remove(storageKey);
@@ -509,5 +547,8 @@ incognitoBtn.addEventListener("click", async () => {
 
     // Revert to a clean standard session
     await handleClear(false);
+
+    // restore the standard title
+    updateActiveChatTitle();
   }
 });

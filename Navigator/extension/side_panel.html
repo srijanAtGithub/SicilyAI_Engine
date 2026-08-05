@@ -189,13 +189,12 @@
     </div>
 
     <div id="header">
-      <div id="header-left">
+     <div id="header-left">
         <div id="quick-actions">
-          <button id="quick-actions-btn">
-            <span>Quick Actions</span>
+          <!-- Removed <span>Quick Actions</span> and replaced icon with a generalized menu/action icon for better fit -->
+          <button id="quick-actions-btn" title="Quick Actions">
             <svg viewBox="0 0 12 8" fill="none" xmlns="http://www.w3.org/2000/svg">
-              <path d="M1 1.5L6 6.5L11 1.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
-                stroke-linejoin="round" />
+              <path d="M1 1.5L6 6.5L11 1.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
             </svg>
           </button>
           <div id="quick-actions-bridge"></div>
@@ -285,6 +284,8 @@
           </div>
         </div>
 
+        <div id="active-chat-title" class="active-chat-title">New Conversation</div>
+
         <button id="new-chat-btn" title="Start a new conversation">
           <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" width="17" height="17">
             <path d="M10 4v12M4 10h12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
@@ -302,8 +303,7 @@
         </button>
 
         <button id="incognito-btn" title="Temporary Chat Mode">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
-            stroke-linejoin="round" width="15" height="15">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="15" height="15">
             <path d="M9 10h.01M15 10h.01M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z" />
           </svg>
         </button>
