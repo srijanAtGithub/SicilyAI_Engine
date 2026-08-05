@@ -170,6 +170,9 @@ export function connectSocket(sessionKey) {
     try {
       const data = JSON.parse(event.data);
       addMessage(data.reply ?? "(empty response)", "ai");
+      
+      // Dispatch a custom event so main.js knows a turn finished
+      window.dispatchEvent(new Event("chat-turn-complete"));
     } catch (err) {
       addMessage("Couldn't parse server response.", "system");
     }

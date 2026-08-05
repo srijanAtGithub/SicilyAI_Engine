@@ -464,3 +464,20 @@ body {
 #empty-state.temp-mode .es-suggestions {
     display: none;
 }
+
+.active-chat-title {
+  flex: 1; /* Takes up remaining space between the left and right buttons */
+  margin: 0 12px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #a1a1aa; /* Muted text color, adjust if needed */
+  text-align: left;
+  
+  /* Prevent wrapping */
+  white-space: nowrap;
+  overflow: hidden;
+  
+  /* The standard right-side fade effect for long text */
+  -webkit-mask-image: linear-gradient(to right, rgba(0,0,0,1) 80%, rgba(0,0,0,0) 100%);
+  mask-image: linear-gradient(to right, rgba(0,0,0,1) 80%, rgba(0,0,0,0) 100%);
+}
