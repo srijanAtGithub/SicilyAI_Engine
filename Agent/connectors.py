@@ -1,3 +1,4 @@
+import os
 import json
 from pathlib import Path
 
@@ -7,6 +8,8 @@ from Auth.gmail_auth import get_gmail_token
 from Auth.telegram_auth import get_telegram_config
 from Auth.tavily_auth import get_tavily_config
 from Auth.github_auth import get_github_config
+from Auth.notion_auth import get_notion_config
+from Auth.spotify_auth import get_spotify_config
 
 from configuration import TELEGRAM_BLACKLIST
 
@@ -108,6 +111,42 @@ async def load_github_tools(tool_manager):
     await tool_manager.register(tools, "github")
 
 
+async def load_notion_tools(tool_manager):
+    env_vars = await get_notion_config()
+    env = os.environ.copy()
+    env.update(env_vars)
+
+    notion_client = MultiServerMCPClient({
+        "notion": {
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["-y", "notion-mcp-server"],
+            "env": env,
+        }
+    })
+
+    tools = await notion_client.get_tools()
+    await tool_manager.register(tools, "notion")
+
+
+async def load_spotify_tools(tool_manager):
+    env_vars = await get_spotify_config()
+    env = os.environ.copy()
+    env.update(env_vars)
+
+    spotify_client = MultiServerMCPClient({
+        "spotify": {
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["-y", "@darrenjaws/spotify-mcp"],
+            "env": env,
+        }
+    })
+
+    tools = await spotify_client.get_tools()
+    await tool_manager.register(tools, "spotify")
+
+
 # Registry of all available connectors — add new ones here
 CONNECTORS = {
     "swiggy":      load_swiggy_tools,
@@ -115,6 +154,8 @@ CONNECTORS = {
     "telegram":    load_telegram_tools,
     "tavily":      load_tavily_tools,
     "github":      load_github_tools,
+    "notion":      load_notion_tools,
+    "spotify":     load_spotify_tools,
 }
 
 # Some connectors register more than one MCP server under the hood

@@ -13,7 +13,16 @@ SICILY_HOME = Path.home() / ".sicily"
 SETTINGS_PATH = SICILY_HOME / "settings.json"
 ENV_PATH = SICILY_HOME / ".env"
 
-REQUIRED_KEYS = ["OPENAI_API_KEY", "TELEGRAM_BOT_TOKEN", "TAVILY_API_KEY", "GITHUB_TOKEN"]
+REQUIRED_KEYS = [
+    "OPENAI_API_KEY", 
+    "TELEGRAM_BOT_TOKEN", 
+    "TAVILY_API_KEY", 
+    "GITHUB_TOKEN", 
+    "NOTION_TOKEN", 
+    "SPOTIFY_CLIENT_ID", 
+    "SPOTIFY_CLIENT_SECRET",
+    "SPOTIFY_REDIRECT_URI",
+]
 
 
 def ensure_settings() -> bool:
