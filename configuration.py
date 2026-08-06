@@ -142,62 +142,34 @@ def navigator_general_llm(schema=None):
 
 
 TOOL_LABELS = {
-    # ── Instamart: Discover ──────────────────────────────────
+    # ── Swiggy Instamart ──────────────────────────────────
     "search_products":    "🔍 Searching for products...",
     "your_go_to_items":   "⭐ Fetching your go-to items...",
     "get_addresses":      "📍 Fetching your saved addresses...",
     "create_address":     "📍 Saving new address...",
     "delete_address":     "🗑️ Deleting address...",
-
-    # ── Instamart: Cart ──────────────────────────────────────
     "get_cart":           "🛒 Fetching your cart...",
     "update_cart":        "🛒 Updating your cart...",
     "clear_cart":         "🗑️ Clearing your cart...",
-
-    # ── Instamart: Order ─────────────────────────────────────
     "checkout":           "📦 Placing your order...",
-
-    # ── Instamart: Track ─────────────────────────────────────
     "get_orders":         "📋 Fetching your order history...",
     "get_order_details":  "🔎 Getting order details...",
     "track_order":        "🚴 Tracking your order...",
-
-    # ── Instamart: Support ───────────────────────────────────
     "report_error":       "📝 Generating error report...",
 
-    # ── Food: Discover ───────────────────────────────────────
+    # ── Swiggy Food ───────────────────────────────────────
     "search_restaurants": "🔍 Searching restaurants...",
     "search_menu":        "🍽️ Searching the menu...",
     "get_restaurant_menu":"🍽️ Fetching restaurant menu...",
-
-    # ── Food: Cart ───────────────────────────────────────────
     "get_food_cart":      "🛒 Fetching your food cart...",
     "update_food_cart":   "🛒 Updating your food cart...",
     "flush_food_cart":    "🗑️ Clearing your food cart...",
     "fetch_food_coupons": "🎟️ Finding available coupons...",
     "apply_food_coupon":  "🎟️ Applying coupon...",
-
-    # ── Food: Order ──────────────────────────────────────────
     "place_food_order":   "📦 Placing your food order...",
-
-    # ── Food: Track ──────────────────────────────────────────
     "get_food_orders":    "📋 Fetching your food orders...",
     "get_food_order_details": "🔎 Getting order details...",
     "track_food_order":   "🚴 Tracking your food order...",
-
-    # ── Gmail ────────────────────────────────────────────────
-    "create_draft":       "✉️ Creating email draft...",
-    "list_drafts":        "📄 Fetching email drafts...",
-    "get_thread":         "📧 Loading email conversation...",
-    "search_threads":     "🔍 Searching emails...",
-    "label_thread":       "🏷️ Updating conversation labels...",
-    "unlabel_thread":     "🏷️ Removing conversation labels...",
-    "list_labels":        "📋 Fetching email labels...",
-    "label_message":      "🏷️ Updating email labels...",
-    "unlabel_message":    "🏷️ Removing email labels...",
-    "create_label":       "➕ Creating email label...",
-    "update_label":       "✏️ Updating email label...",
-    "delete_label":       "🗑️ Deleting email label...",
 
     # ── Telegram: Profile & Account ──────────────────────────
     "get_me":                     "👤 Fetching profile details...",
@@ -215,7 +187,7 @@ TOOL_LABELS = {
     "unblock_user":               "✅ Unblocking user...",
     "get_blocked_users":          "📋 Fetching blocked users list...",
 
-    # ── Telegram: Chats & Channels ───────────────────────────
+    # ── Telegram: Chats & Channels ─────────────────────────
     "get_chats":                  "💬 Loading recent chats...",
     "list_chats":                 "📋 Listing available chats...",
     "get_chat":                   "💬 Fetching chat information...",
@@ -223,7 +195,7 @@ TOOL_LABELS = {
     "archive_chat":               "📦 Moving chat to archive...",
     "unarchive_chat":             "📤 Removing chat from archive...",
 
-    # ── Telegram: Messages & History ─────────────────────────
+    # ── Telegram: Messages & History ───────────────────────
     "get_messages":               "💬 Loading specific messages...",
     "send_message":               "💬 Sending message...",
     "send_scheduled_message":     "⏰ Scheduling message...",
@@ -243,12 +215,165 @@ TOOL_LABELS = {
     "get_drafts":                 "📄 Fetching message drafts...",
     "clear_draft":                "🗑️ Clearing message draft...",
 
+    # ── Tavily ──────────────────────────────────────────────
+    "tavily_search":   "🔍 Searching the web with Tavily...",
+    "tavily_extract":  "📄 Extracting web content...",
+    "tavily_crawl":    "🕷️ Crawling web pages...",
+    "tavily_map":      "🗺️ Mapping site structure...",
+    "tavily_research": "🔬 Conducting web research...",
+
+    # ── GitHub ───────────────────────────────────────────────
+    "add_comment_to_pending_review":     "💬 Commenting on PR review...",
+    "add_issue_comment":                 "💬 Commenting on issue...",
+    "add_reply_to_pull_request_comment": "💬 Replying to PR comment...",
+    "create_branch":                     "🌿 Creating Git branch...",
+    "create_or_update_file":             "📝 Updating file on GitHub...",
+    "create_pull_request":               "🔀 Creating pull request...",
+    "create_repository":                 "📦 Creating GitHub repository...",
+    "delete_file":                       "🗑️ Deleting file on GitHub...",
+    "fork_repository":                   "🍴 Forking repository...",
+    "get_commit":                        "📜 Fetching commit details...",
+    "get_file_contents":                 "📄 Reading file contents...",
+    "get_label":                         "🏷️ Fetching GitHub label...",
+    "get_latest_release":                "🚀 Fetching latest release...",
+    "get_me":                            "👤 Fetching GitHub user profile...",
+    "get_release_by_tag":                "🏷️ Fetching release by tag...",
+    "get_tag":                           "🏷️ Fetching Git tag...",
+    "get_team_members":                  "👥 Fetching team members...",
+    "get_teams":                         "👥 Fetching GitHub teams...",
+    "issue_read":                        "👁️ Reading GitHub issue...",
+    "issue_write":                       "✏️ Updating GitHub issue...",
+    "list_branches":                     "🌿 Listing repository branches...",
+    "list_commits":                      "📜 Listing commits...",
+    "list_issue_fields":                 "📋 Listing issue fields...",
+    "list_issue_types":                  "📋 Listing issue types...",
+    "list_issues":                       "📋 Listing GitHub issues...",
+    "list_pull_requests":                "🔀 Listing pull requests...",
+    "list_releases":                     "🚀 Listing releases...",
+    "list_repository_collaborators":     "👥 Listing collaborators...",
+    "list_tags":                         "🏷️ Listing repository tags...",
+    "merge_pull_request":                "🔀 Merging pull request...",
+    "pull_request_read":                 "👁️ Reading pull request...",
+    "pull_request_review_write":        "✏️ Updating PR review...",
+    "push_files":                        "⬆️ Pushing files to GitHub...",
+    "request_copilot_review":            "🤖 Requesting Copilot review...",
+    "run_secret_scanning":               "🛡️ Running secret scanning...",
+    "search_code":                       "🔍 Searching code on GitHub...",
+    "search_commits":                    "🔍 Searching commits...",
+    "search_issues":                     "🔍 Searching GitHub issues...",
+    "search_pull_requests":              "🔍 Searching pull requests...",
+    "search_repositories":               "🔍 Searching repositories...",
+    "search_users":                      "🔍 Searching GitHub users...",
+    "sub_issue_write":                   "✏️ Updating sub-issue...",
+    "update_pull_request":               "✏️ Updating pull request...",
+    "update_pull_request_branch":        "🌿 Updating PR branch...",
+
+    # ── Notion ───────────────────────────────────────────────
+    "notion_execute":  "📝 Executing Notion operation...",
+    "notion_describe": "ℹ️ Describing Notion schema...",
+
     # ── Spotify ──────────────────────────────────────────────
-    "SpotifyPlayback":    "🎵 Controlling Spotify playback...",
-    "SpotifySearch":      "🔍 Searching Spotify...",
-    "SpotifyQueue":       "🎶 Managing Spotify queue...",
-    "SpotifyGetInfo":     "ℹ️ Fetching Spotify details...",
-    "SpotifyPlaylist":    "📂 Managing Spotify playlists...",
+    "SpotifyPlayback":            "🎵 Controlling Spotify playback...",
+    "SpotifySearch":              "🔍 Searching Spotify...",
+    "SpotifyQueue":               "🎶 Managing Spotify queue...",
+    "SpotifyGetInfo":             "ℹ️ Fetching Spotify details...",
+    "SpotifyPlaylist":            "📂 Managing Spotify playlists...",
+
+    # ── Canva ────────────────────────────────────────────────
+    "create-folder":                     "📁 Creating Canva folder...",
+    "list-folder-items":                 "📂 Listing folder items...",
+    "move-item-to-folder":               "📦 Moving item to folder...",
+    "search-folders":                    "🔍 Searching Canva folders...",
+    "export-design":                     "📤 Exporting Canva design...",
+    "get-export-formats":                "⚙️ Fetching export formats...",
+    "comment-on-design":                 "💬 Commenting on design...",
+    "list-comments":                     "💬 Fetching design comments...",
+    "list-replies":                      "💬 Fetching comment replies...",
+    "reply-to-comment":                  "💬 Replying to comment...",
+    "get-design":                        "🎨 Fetching Canva design...",
+    "get-design-pages":                  "📄 Fetching design pages...",
+    "get-design-content":                "📝 Fetching design content...",
+    "get-presenter-notes":               "🗒️ Fetching presenter notes...",
+    "search-designs":                    "🔍 Searching Canva designs...",
+    "copy-design":                       "📋 Copying Canva design...",
+    "create-design-from-brand-template": "✨ Creating design from brand template...",
+    "import-design-from-url":            "📥 Importing design from URL...",
+    "upload-asset-from-url":             "⬆️ Uploading asset from URL...",
+    "resize-design":                     "📐 Resizing Canva design...",
+    "start-editing-transaction":         "✏️ Starting edit session...",
+    "perform-editing-operations":        "⚙️ Performing design edits...",
+    "commit-editing-transaction":        "💾 Saving design edits...",
+    "cancel-editing-transaction":        "❌ Canceling design edits...",
+    "get-design-thumbnail":              "🖼️ Fetching design thumbnail...",
+    "search-brand-templates":            "🔍 Searching brand templates...",
+    "get-brand-template-dataset":        "📊 Fetching brand template data...",
+    "resolve-shortlink":                 "🔗 Resolving Canva shortlink...",
+    "get-assets":                        "🖼️ Fetching assets...",
+    "list-brand-kits":                   "🎨 Listing brand kits...",
+    "get-design-candidates":             "✨ Fetching design candidates...",
+    "create-design-from-candidate":      "🎨 Creating design from candidate...",
+    "generate-design":                   "✨ Generating Canva design...",
+
+    # ── Excalidraw ───────────────────────────────────────────
+    "read_me":                           "📖 Reading Excalidraw info...",
+    "create_view":                       "🖍️ Creating Excalidraw view...",
+    "export_to_excalidraw":              "📤 Exporting to Excalidraw...",
+    "save_checkpoint":                   "💾 Saving Excalidraw checkpoint...",
+    "read_checkpoint":                   "📂 Loading Excalidraw checkpoint...",
+    
+    # ── Linear ───────────────────────────────────────────────
+    "get_attachment":                    "📎 Fetching attachment...",
+    "prepare_attachment_upload":         "⬆️ Preparing attachment upload...",
+    "create_attachment_from_upload":     "📎 Creating attachment from upload...",
+    "create_attachment":                 "📎 Creating attachment...",
+    "delete_attachment":                 "🗑️ Deleting attachment...",
+    "list_agent_skills":                 "🤖 Listing agent skills...",
+    "get_agent_skill":                   "🤖 Fetching agent skill...",
+    "list_comments":                     "💬 Listing comments...",
+    "save_comment":                      "💬 Saving comment...",
+    "delete_comment":                    "🗑️ Deleting comment...",
+    "list_cycles":                       "🔄 Listing cycles...",
+    "get_document":                      "📄 Fetching document...",
+    "list_documents":                    "📄 Listing documents...",
+    "save_document":                     "💾 Saving document...",
+    "extract_images":                    "🖼️ Extracting images...",
+    "get_issue":                         "🎫 Fetching issue...",
+    "list_issues":                       "📋 Listing issues...",
+    "save_issue":                        "💾 Saving issue...",
+    "list_issue_statuses":               "🚥 Listing issue statuses...",
+    "get_issue_status":                  "🚥 Fetching issue status...",
+    "list_issue_labels":                 "🏷️ Listing issue labels...",
+    "create_issue_label":                "🏷️ Creating issue label...",
+    "list_projects":                     "📁 Listing projects...",
+    "get_project":                       "📁 Fetching project...",
+    "save_project":                      "💾 Saving project...",
+    "list_project_labels":               "🏷️ Listing project labels...",
+    "list_release_pipelines":            "🚀 Listing release pipelines...",
+    "list_releases":                     "🚀 Listing releases...",
+    "get_release":                       "🚀 Fetching release...",
+    "save_release":                      "💾 Saving release...",
+    "list_release_notes":                "📝 Listing release notes...",
+    "get_release_note":                  "📝 Fetching release note...",
+    "save_release_note":                 "💾 Saving release note...",
+    "get_diff":                          "📝 Fetching diff...",
+    "list_diffs":                        "📝 Listing diffs...",
+    "get_diff_threads":                  "💬 Fetching diff threads...",
+    "save_diff_comment":                 "💬 Saving diff comment...",
+    "resolve_diff_thread":               "✅ Resolving diff thread...",
+    "delete_diff_comment":               "🗑️ Deleting diff comment...",
+    "submit_diff_review":                "✅ Submitting diff review...",
+    "merge_diff":                        "🔀 Merging diff...",
+    "list_milestones":                   "🎯 Listing milestones...",
+    "get_milestone":                     "🎯 Fetching milestone...",
+    "save_milestone":                    "💾 Saving milestone...",
+    "list_teams":                        "👥 Listing teams...",
+    "get_team":                          "👥 Fetching team...",
+    "list_users":                        "👤 Listing users...",
+    "get_user":                          "👤 Fetching user...",
+    "search_documentation":              "🔍 Searching documentation...",
+    "get_status_updates":                "🚥 Fetching status updates...",
+    "save_status_update":                "💾 Saving status update...",
+    "delete_status_update":              "🗑️ Deleting status update..."
 }
 
 

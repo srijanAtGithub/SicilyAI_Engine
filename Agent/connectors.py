@@ -151,6 +151,72 @@ async def load_spotify_tools(tool_manager):
     await tool_manager.register(tools, "spotify")
 
 
+async def load_excalidraw_tools(tool_manager):
+    """
+    Official Excalidraw MCP (remote) via mcp-remote bridge.
+    Works with zero API keys for basic diagram creation.
+    First connect may open a browser if OAuth is required.
+    """
+    excalidraw_client = MultiServerMCPClient({
+        "excalidraw": {
+            "transport": "stdio",
+            "command": "npx",
+            "args": [
+                "-y",
+                "mcp-remote@latest",
+                "https://mcp.excalidraw.com",
+            ],
+        }
+    })
+
+    tools = await excalidraw_client.get_tools()
+    await tool_manager.register(tools, "excalidraw")
+
+
+async def load_canva_tools(tool_manager):
+    """
+    Official Canva remote MCP server.
+    Uses mcp-remote so the OAuth browser flow works reliably.
+    First connect will open a browser for you to authorize Canva.
+    """
+    canva_client = MultiServerMCPClient({
+        "canva": {
+            "transport": "stdio",
+            "command": "npx",
+            "args": [
+                "-y",
+                "mcp-remote@latest",
+                "https://mcp.canva.com/mcp",
+            ],
+        }
+    })
+
+    tools = await canva_client.get_tools()
+    await tool_manager.register(tools, "canva")
+
+
+async def load_linear_tools(tool_manager):
+    """
+    Official Linear remote MCP server.
+    Uses mcp-remote so the OAuth browser flow works reliably.
+    First connect will open a browser for you to authorize Linear.
+    """
+    linear_client = MultiServerMCPClient({
+        "linear": {
+            "transport": "stdio",
+            "command": "npx",
+            "args": [
+                "-y",
+                "mcp-remote@latest",
+                "https://mcp.linear.app/mcp",
+            ],
+        }
+    })
+
+    tools = await linear_client.get_tools()
+    await tool_manager.register(tools, "linear")
+
+
 # Registry of all available connectors — add new ones here
 CONNECTORS = {
     "swiggy":      load_swiggy_tools,
@@ -160,6 +226,9 @@ CONNECTORS = {
     "github":      load_github_tools,
     "notion":      load_notion_tools,
     "spotify":     load_spotify_tools,
+    "excalidraw":  load_excalidraw_tools,
+    "canva":       load_canva_tools,
+    "linear":      load_linear_tools,
 }
 
 # Some connectors register more than one MCP server under the hood
