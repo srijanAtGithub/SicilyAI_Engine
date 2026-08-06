@@ -6,10 +6,10 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-CONNECTORS_PATH        = PROJECT_ROOT / "connectors.py"
-TELEGRAM_COMMANDS_PATH = PROJECT_ROOT / "telegram_commands.py"
+CONNECTORS_PATH        = PROJECT_ROOT / "Agent/connectors.py"
+TELEGRAM_COMMANDS_PATH = PROJECT_ROOT / "Agent/telegram_commands.py"
 SETTINGS_EXAMPLE_PATH  = PROJECT_ROOT / "settings.example.json"
-AGENT_PATH = PROJECT_ROOT / "agent.py"
+AGENT_PATH = PROJECT_ROOT / "Agent/agent.py"
 SOULS_DIR  = PROJECT_ROOT / "Souls"
 
 # AST helpers — read source as text, no project imports required

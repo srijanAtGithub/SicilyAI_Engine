@@ -6,7 +6,7 @@ import pytest
 # are made — ToolManager() is never instantiated, only the class itself
 # is inspected, since instantiating it creates live OpenAI/Chat clients)
 try:
-    from tool_manager import ToolManager, ToolEntry
+    from Agent.tool_manager import ToolManager, ToolEntry
     _TOOL_MANAGER_IMPORT_ERROR = None
 except Exception as e:  # pragma: no cover
     ToolManager, ToolEntry = None, None
