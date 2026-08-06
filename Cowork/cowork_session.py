@@ -372,6 +372,22 @@ async def run_local_session():
                     messages, summarizer_llm, token_threshold=LOCAL_TOKEN_THRESHOLD, show_log=False
                 )
                 final = await no_tools_llm.ainvoke(trimmed)
+                if hasattr(final, "usage_metadata") and final.usage_metadata:
+                    try:
+                        from usage_tracker import record_usage
+                        usage = final.usage_metadata
+                        model_name = getattr(final, "response_metadata", {}).get("model_name", "unknown")
+                        record_usage(
+                            dimension="cowork",
+                            session_id=thread_id,
+                            model_name=model_name,
+                            input_tokens=usage.get("input_tokens", 0),
+                            output_tokens=usage.get("output_tokens", 0),
+                            cached_input_tokens=usage.get("input_token_details", {}).get("cache_read_tokens", 0),
+                            message_id=getattr(final, "id", None)
+                        )
+                    except Exception as rec_err:
+                        log.warning("record_usage failed for cowork recursion fallback", error=str(rec_err))
                 messages.append(final)
                 print_ai(final.content or "(No response)")
             except Exception:

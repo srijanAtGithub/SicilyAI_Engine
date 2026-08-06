@@ -219,6 +219,23 @@ async def run_evaluator(thread_id: str, messages: list[BaseMessage]) -> None:
                 f"{_FORMAT_RULES}"
             )),
         ])
+        if hasattr(extraction_result, "usage_metadata") and extraction_result.usage_metadata:
+            try:
+                from usage_tracker import record_usage
+                usage_meta = extraction_result.usage_metadata
+                model_name = getattr(extraction_result, "response_metadata", {}).get("model_name", "unknown")
+                msg_id = getattr(extraction_result, "id", None)
+                record_usage(
+                    dimension="agent",
+                    session_id=thread_id,
+                    model_name=model_name,
+                    input_tokens=usage_meta.get("input_tokens", 0),
+                    output_tokens=usage_meta.get("output_tokens", 0),
+                    cached_input_tokens=usage_meta.get("input_token_details", {}).get("cache_read_tokens", 0),
+                    message_id=msg_id
+                )
+            except Exception as rec_err:
+                log.warning("record_usage failed for memory extraction", error=str(rec_err))
     except Exception as e:
         log.error("preference_extraction_failed", error=str(e))
         return
@@ -288,6 +305,23 @@ Merge rules:
         SystemMessage(content="You are a memory consolidation system."),
         HumanMessage(content=merge_prompt),
     ])
+    if hasattr(result, "usage_metadata") and result.usage_metadata:
+        try:
+            from usage_tracker import record_usage
+            usage_meta = result.usage_metadata
+            model_name = getattr(result, "response_metadata", {}).get("model_name", "unknown")
+            msg_id = getattr(result, "id", None)
+            record_usage(
+                dimension="agent",
+                session_id="preference_merge",
+                model_name=model_name,
+                input_tokens=usage_meta.get("input_tokens", 0),
+                output_tokens=usage_meta.get("output_tokens", 0),
+                cached_input_tokens=usage_meta.get("input_token_details", {}).get("cache_read_tokens", 0),
+                message_id=msg_id
+            )
+        except Exception as rec_err:
+            log.warning("record_usage failed for preference merge", error=str(rec_err))
 
     return result.content.strip()
 

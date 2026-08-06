@@ -467,12 +467,50 @@ async def send(message: str, thread_id: str, status_callback=None, cancel_check=
             async for event in graph.astream_events(Command(resume=message), config, version="v2"):
                 if event["event"] == "on_tool_start" and status_callback:
                     await status_callback(event.get("name", ""))
+                elif event["event"] == "on_chat_model_end":
+                    output = event.get("data", {}).get("output")
+                    if output and hasattr(output, "usage_metadata") and output.usage_metadata:
+                        try:
+                            from usage_tracker import record_usage
+                            usage = output.usage_metadata
+                            model_name = getattr(output, "response_metadata", {}).get("model_name", event.get("name", "unknown"))
+                            msg_id = getattr(output, "id", None)
+                            record_usage(
+                                dimension="agent",
+                                session_id=thread_id,
+                                model_name=model_name,
+                                input_tokens=usage.get("input_tokens", 0),
+                                output_tokens=usage.get("output_tokens", 0),
+                                cached_input_tokens=usage.get("input_token_details", {}).get("cache_read_tokens", 0),
+                                message_id=msg_id
+                            )
+                        except Exception as rec_err:
+                            log.warning("record_usage failed during graph streaming", error=str(rec_err))
             await log_latest_message(config)
         else:
             log.info("User message", message=message, thread_id=thread_id)
             async for event in graph.astream_events({"messages": [HumanMessage(content=message)]}, config, version="v2"):
                 if event["event"] == "on_tool_start" and status_callback:
                     await status_callback(event.get("name", ""))
+                elif event["event"] == "on_chat_model_end":
+                    output = event.get("data", {}).get("output")
+                    if output and hasattr(output, "usage_metadata") and output.usage_metadata:
+                        try:
+                            from usage_tracker import record_usage
+                            usage = output.usage_metadata
+                            model_name = getattr(output, "response_metadata", {}).get("model_name", event.get("name", "unknown"))
+                            msg_id = getattr(output, "id", None)
+                            record_usage(
+                                dimension="agent",
+                                session_id=thread_id,
+                                model_name=model_name,
+                                input_tokens=usage.get("input_tokens", 0),
+                                output_tokens=usage.get("output_tokens", 0),
+                                cached_input_tokens=usage.get("input_token_details", {}).get("cache_read_tokens", 0),
+                                message_id=msg_id
+                            )
+                        except Exception as rec_err:
+                            log.warning("record_usage failed during graph streaming", error=str(rec_err))
             await log_latest_message(config)
 
         if cancel_check and cancel_check():
@@ -702,6 +740,24 @@ async def maybe_summarize(messages, summarizer_llm, token_threshold: int = TOKEN
         )),
         HumanMessage(content=history_text)
     ])
+
+    if hasattr(summary, "usage_metadata") and summary.usage_metadata:
+        try:
+            from usage_tracker import record_usage
+            usage = summary.usage_metadata
+            model_name = getattr(summary, "response_metadata", {}).get("model_name", "unknown")
+            msg_id = getattr(summary, "id", None)
+            record_usage(
+                dimension="agent",
+                session_id="summarizer",
+                model_name=model_name,
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+                cached_input_tokens=usage.get("input_token_details", {}).get("cache_read_tokens", 0),
+                message_id=msg_id
+            )
+        except Exception as rec_err:
+            log.warning("record_usage failed for summarizer", error=str(rec_err))
 
     summary_message = SystemMessage(
         content=(

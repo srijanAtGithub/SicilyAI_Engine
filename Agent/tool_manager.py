@@ -59,7 +59,7 @@ class ToolManager:
         # than -3-small, at extra cost/latency that's negligible compared
         # to the LLM calls already happening per turn.
         self._embedder = OpenAIEmbeddings(model="text-embedding-3-large")
-        self._router   = ChatOpenAI(model="gpt-5.4-nano", temperature=0).with_structured_output(RouterOutput, include_raw=False)
+        self._router   = ChatOpenAI(model="gpt-5.4-nano", temperature=0).with_structured_output(RouterOutput, include_raw=True)
         self._describer  = ChatOpenAI(model="gpt-5.4-nano", temperature=0)
 
     # ── Registration ─────────────────────────────────────────
@@ -151,6 +151,24 @@ class ToolManager:
                     "Describe this service."
                 ))
             ])
+            if hasattr(result, "usage_metadata") and result.usage_metadata:
+                try:
+                    from usage_tracker import record_usage
+                    usage_meta = result.usage_metadata
+                    model_name = getattr(result, "response_metadata", {}).get("model_name", "gpt-5.4-nano")
+                    msg_id = getattr(result, "id", None)
+                    record_usage(
+                        dimension="agent",
+                        session_id=f"server_desc_{server}",
+                        model_name=model_name,
+                        input_tokens=usage_meta.get("input_tokens", 0),
+                        output_tokens=usage_meta.get("output_tokens", 0),
+                        cached_input_tokens=usage_meta.get("input_token_details", {}).get("cache_read_tokens", 0),
+                        message_id=msg_id
+                    )
+                except Exception as rec_err:
+                    log.warning("record_usage failed for server description generation", error=str(rec_err))
+
             # Router returns ServerSelection, but we need raw text here
             # Use a separate simple LLM call for this
             return result.content if hasattr(result, 'content') else str(result)
@@ -202,7 +220,7 @@ class ToolManager:
         )
 
         try:
-            result = await self._router.ainvoke([
+            res = await self._router.ainvoke([
                 SystemMessage(content=(
                     "You are a service router and query-rewriter for an AI assistant.\n\n"
                     "TASK 1 — server_names:\n"
@@ -231,6 +249,25 @@ class ToolManager:
                     "user's current intent as one self-contained sentence?"
                 ))
             ])
+            result = res["parsed"]
+            raw_msg = res.get("raw")
+            if raw_msg and hasattr(raw_msg, "usage_metadata") and raw_msg.usage_metadata:
+                try:
+                    from usage_tracker import record_usage
+                    usage_meta = raw_msg.usage_metadata
+                    model_name = getattr(raw_msg, "response_metadata", {}).get("model_name", "gpt-5.4-nano")
+                    msg_id = getattr(raw_msg, "id", None)
+                    record_usage(
+                        dimension="agent",
+                        session_id="tool_router",
+                        model_name=model_name,
+                        input_tokens=usage_meta.get("input_tokens", 0),
+                        output_tokens=usage_meta.get("output_tokens", 0),
+                        cached_input_tokens=usage_meta.get("input_token_details", {}).get("cache_read_tokens", 0),
+                        message_id=msg_id
+                    )
+                except Exception as rec_err:
+                    log.warning("record_usage failed for tool router", error=str(rec_err))
 
             valid = set(self._server_descriptions.keys())
             selected = [s for s in result.server_names if s in valid]
