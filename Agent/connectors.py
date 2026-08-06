@@ -4,7 +4,7 @@ from pathlib import Path
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from Auth.swiggy_auth import get_swiggy_token
-from Auth.gmail_auth import get_gmail_token
+from Auth.google_auth import get_google_token
 from Auth.telegram_auth import get_telegram_config
 from Auth.tavily_auth import get_tavily_config
 from Auth.github_auth import get_github_config
@@ -45,19 +45,19 @@ async def load_swiggy_tools(tool_manager):
     await tool_manager.register(im_tools, "swiggy-instamart")
 
 
-async def load_gmail_tools(tool_manager):
-    token = await get_gmail_token()
+async def load_calendar_tools(tool_manager):
+    token = await get_google_token()
 
-    gmail_client = MultiServerMCPClient({
-        "gmail": {
+    calendar_client = MultiServerMCPClient({
+        "calendar": {
             "transport": "streamable_http",
-            "url": "https://gmailmcp.googleapis.com/mcp/v1",
+            "url": "https://calendarmcp.googleapis.com/mcp/v1",
             "headers": {"Authorization": f"Bearer {token}"},
         }
     })
 
-    tools = await gmail_client.get_tools()
-    await tool_manager.register(tools, "gmail")
+    tools = await calendar_client.get_tools()
+    await tool_manager.register(tools, "calendar")
 
 
 async def load_telegram_tools(tool_manager):
@@ -154,7 +154,7 @@ async def load_spotify_tools(tool_manager):
 # Registry of all available connectors — add new ones here
 CONNECTORS = {
     "swiggy":      load_swiggy_tools,
-    "gmail":       load_gmail_tools,
+    # "calendar":    load_calendar_tools,
     "telegram":    load_telegram_tools,
     "tavily":      load_tavily_tools,
     "github":      load_github_tools,

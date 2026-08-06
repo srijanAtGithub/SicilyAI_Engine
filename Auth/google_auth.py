@@ -1,14 +1,12 @@
-import os
 import socket
 from pathlib import Path
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 
+# Google Calendar & Tasks scopes
 SCOPES = [
-    "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/calendar",
 ]
 
 SICILY_HOME = Path.home() / ".sicily"
@@ -16,10 +14,10 @@ CREDENTIALS_FILE = SICILY_HOME / "google_credentials.json"
 PORT = 8080
 
 
-async def get_gmail_token() -> str:
-    """Get Gmail token, handling stale port from cancelled auth flows."""
+async def get_google_token() -> str:
+    """Get Google OAuth token for Calendar and Tasks, handling stale port if needed."""
 
-    token_file = SICILY_HOME / "gmail_token.json"
+    token_file = SICILY_HOME / "google_token.json"
     creds = None
 
     if token_file.exists():
@@ -59,7 +57,7 @@ def _free_port(port: int):
     import subprocess, sys
     if sys.platform == "win32":
         result = subprocess.run(
-            f"for /f \"tokens=5\" %a in ('netstat -aon ^| find \":{port}\"') do taskkill /F /PID %a",
+            f'for /f "tokens=5" %a in (\'netstat -aon ^| find ":{port}"\') do taskkill /F /PID %a',
             shell=True, capture_output=True
         )
     else:
@@ -68,6 +66,5 @@ def _free_port(port: int):
             f"fuser -k {port}/tcp",
             shell=True, capture_output=True
         )
-    # Give the OS a moment to release the port
     import time
     time.sleep(0.5)
