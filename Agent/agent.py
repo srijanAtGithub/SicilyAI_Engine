@@ -1,5 +1,6 @@
 import operator
 import asyncio
+import json
 from datetime import datetime
 from typing import TypedDict, Annotated, Literal
 
@@ -173,40 +174,23 @@ async def initialize_agent():
         tool_obj  = tool_manager.tool_map.get(tool_name)
         tool_desc = tool_obj.description if tool_obj else "No description available"
 
-        # ── Safety fast-path ─────────────────────────────────────────────
-        # Classify by name pattern first. Only call the safety LLM for
-        # genuinely ambiguous tool names. This avoids misclassifying
-        # read-only tools (search_*, get_*) as unsafe, and keeps latency
-        # low regardless of which MCPs are connected.
-        
-        READ_ONLY_PREFIXES = (
-            "get_", "search_", "fetch_", "find_", "list_",
-            "track_", "browse_", "view_", "read_", "show_",
-        )
-        KNOWN_WRITE_PREFIXES = (
-            "update_", "create_", "delete_", "remove_", "add_",
-            "send_", "post_", "submit_", "place_", "clear_",
-            "flush_", "apply_", "set_", "edit_", "schedule_",
-        )
-
-        if any(tool_name.startswith(p) for p in READ_ONLY_PREFIXES):
-            is_safe = True
-
-        elif any(tool_name.startswith(p) for p in KNOWN_WRITE_PREFIXES):
-            is_safe = False
-
-        else:
-            SAFETY_LLM_SOUL = get_system_message("safety_llm")
-            safety_result = await safety_llm.ainvoke([
-                SystemMessage(content=SAFETY_LLM_SOUL),
-                HumanMessage(content=(
-                    f"Tool name: {tool_name}\n"
-                    f"Tool description: {tool_desc}\n"
-                    f"Args being passed: {tool_call['args']}\n\n"
-                    "Is this safe to auto-execute without asking the user?"
-                ))
-            ])
-            is_safe = safety_result.is_safe
+        # ── Safety classification ────────────────────────────────────────
+        # No prefix fast-path: every tool call goes through safety_llm so
+        # that user preferences (surfaced via the system prompt) are the
+        # sole authority on auto-execute vs. confirm. This costs one LLM
+        # round-trip per tool call, but guarantees no hardcoded rule can
+        # silently override what the user configured.
+        SAFETY_LLM_SOUL = get_system_message("safety_llm")
+        safety_result = await safety_llm.ainvoke([
+            SystemMessage(content=SAFETY_LLM_SOUL),
+            HumanMessage(content=(
+                f"Tool name: {tool_name}\n"
+                f"Tool description: {tool_desc}\n"
+                f"Args being passed: {tool_call['args']}\n\n"
+                "Is this safe to auto-execute without asking the user?"
+            ))
+        ])
+        is_safe = safety_result.is_safe
 
         response.additional_kwargs["safe"] = is_safe
         return {"messages": [response]}
@@ -243,19 +227,23 @@ async def initialize_agent():
         if friendly_title.endswith("..."):
             friendly_title = friendly_title[:-3] # Strip the trailing dots for a cleaner title
             
-        # Formatting the arguments into readable bullet points
+        # Formatting the arguments as a fenced code block so the Telegram
+        # markdown->HTML converter renders them as <pre><code>...</code></pre>
+        # instead of a hand-rolled bullet list.
         if raw_args:
-            args_display = "\n".join(f"  • {str(k).replace('_', ' ').title()}: {v}" for k, v in raw_args.items())
-            details_section = f"Details:\n{args_display}"
+            args_json = json.dumps(raw_args, indent=2, default=str, ensure_ascii=False)
+            details_section = f"```json\n{args_json}\n```"
         else:
             details_section = ""
 
-        # Presenting it naturally to the user
+        # Presenting it naturally to the user. The yes/no choice is offered
+        # via Telegram inline buttons (added on the main.py side); this text
+        # just needs to mention that free-text edits are also accepted.
         user_reply = interrupt(
-            f"{friendly_title}\n\n"
-            f"I need your permission to proceed.\n"
+            f"**{friendly_title}**\n\n"
+            f"I need your permission to proceed.\n\n"
             f"{details_section}\n\n"
-            f"Should I go ahead? (Reply with yes, no, or tell me what to change)"
+            f"Tap a button below, or reply with what you'd like changed."
         )
 
         intent_result = await intent_llm.ainvoke([
