@@ -166,23 +166,24 @@ _FORMAT_RULES = """
 OUTPUT FORMAT — follow exactly, no exceptions:
 - Return ONLY a flat list of bullet points
 - One preference per line, starting with "- "
+- IF NO EXPLICIT, HIGH-VALUE PREFERENCES ARE FOUND, OUTPUT NOTHING AT ALL. Do not force-extract.
 - No headers, no categories, no markdown other than the leading "- "
 - No multi-line bullets — if a thought needs two lines, split it into two bullets
 - No meta-commentary, no preamble, no trailing summary
-- Each bullet must be a self-contained, specific, reusable statement about the user
+- Each bullet must be a specific, reusable statement about the user's tastes (brands, flavors, music), constraints (budget, allergies), or distinct stylistic requests.
 
-Good examples:
-- Prefers concise responses without extra explanation
-- Usually active in the evenings
-- Prefers to confirm before any action that modifies data
-- Likes to see options before making a decision
-- Tends to give partial instructions and refine iteratively
+Good examples (High-Signal Tastes & Rules):
+- Prefers yogurt specifically from the brand Epigamia
+- Maximum budget for grocery items is typically around $50
+- Prefers responses written in a highly technical, formal tone
+- Listens to 90s Grunge music
 
-Bad examples (do NOT do these):
-## Behaviour Patterns        ← no headers
-- Style: likes concise       ← no category prefixes
-- Prefers concise responses. ← no trailing periods
-- Prefers concise responses and also likes options  ← split into two bullets
+Bad examples (DO NOT EXTRACT generic actions/habits like these):
+- Tends to initiate conversations with a greeting
+- Likes to see multiple options before making a decision
+- Uses home as a delivery address
+- Seeks assistance in resolving access issues
+- Tends to decline additional information when not interested
 """.strip()
 
 
@@ -211,8 +212,10 @@ async def run_evaluator(thread_id: str, messages: list[BaseMessage]) -> None:
             SystemMessage(content=EVAL_LLM_SOUL),
             HumanMessage(content=(
                 f"Full session conversation:\n\n{conversation_text}\n\n"
-                "Extract every stable, reusable preference or behavioural pattern "
-                "you can observe about this user.\n\n"
+                "Extract ONLY explicit, high-value, long-term preferences about this user. "
+                "Focus purely on concrete tastes (brands, flavors, topics, songs), structural constraints (price points, dietary needs), or distinct communication styles.\n\n"
+                "CRITICAL: Ignore generic conversational habits, basic app navigation (like adding items to a cart), and temporary tasks. "
+                "If no explicit long-term preferences are present in this session, output absolutely nothing.\n\n"
                 f"{_FORMAT_RULES}"
             )),
         ])
@@ -257,8 +260,9 @@ Both may be in messy formats. Your job is to produce a single clean merged list.
 Merge rules:
 - Remove exact and near-duplicate preferences
 - If new info contradicts old info, keep the newer version only
-- Drop one-time requests or temporary context (e.g. "wanted X today")
-- Keep only stable behavioural patterns that are likely to matter in future sessions
+- Drop one-time requests, generic conversational habits (e.g., "likes options", "says hello", "adds items to cart"), or temporary context
+- Keep ONLY high-signal, explicit preferences (brands, constraints, tastes, specific formatting requirements)
+- If the resulting merged list is empty, output absolutely nothing.
 - Do not invent or infer anything not stated
 
 {_FORMAT_RULES}
