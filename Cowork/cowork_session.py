@@ -57,19 +57,6 @@ from Agent.agent import maybe_summarize
 log = structlog.get_logger()
 
 BANNER = """
-╔═════════════ Sicily v3.0.0 ══════════════╦════════════ What Sicily Cowork Can Do ═════════════╗
-║                                          ║                                                    ║
-║                                          ║    Sicily can search, inspect, read, organize,     ║
-║  Files are sandboxed to this directory.  ║    and safely modify the contents of your          ║
-║      Type  exit/quit  to leave.          ║    workspace, including text, code, PDF, Word,     ║
-║                                          ║    and Excel documents. Semantic search, file      ║
-║                                          ║    discovery, previews, and protected editing      ║
-║                                          ║    are available throughout the session.           ║
-║                                          ║                                                    ║
-╚══════════════════════════════════════════╩════════════════════════════════════════════════════╝
-"""
-
-BANNER = """
 ╔═══════════════════════════════════════════════════════════════════════════════════════════════╗
 ║                                                                                               ║
 ║                                  S I C I L Y   C O W O R K                                    ║
