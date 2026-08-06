@@ -1114,3 +1114,252 @@
     background: rgba(120, 120, 128, 0.4);
     border-radius: 4px;
 }
+
+/* --- Markdown Rendering (AI message bubbles: .msg.ai.md-body) ---
+     .msg.ai already sets white-space: pre-wrap for the plain-text
+     fallback path; that's harmless here since markdownToHtml() produces
+     real block elements (p/ul/pre/etc) rather than relying on newline
+     preservation, but we do want to reset spacing since these are now
+     real HTML elements with their own default margins. */
+.msg.ai.md-body {
+    /* .msg sets white-space: pre-wrap for the plain-text fallback path
+         (role=user/system); once markdownToHtml() has produced real block
+         elements (p, ul, pre, etc.) their own margins/line-height handle
+         spacing, so pre-wrap here would just double up blank lines. */
+    white-space: normal;
+}
+
+.msg.ai.md-body>*:first-child {
+    margin-top: 0;
+}
+
+.msg.ai.md-body>*:last-child {
+    margin-bottom: 0;
+}
+
+.msg.ai.md-body p {
+    margin: 0 0 10px 0;
+}
+
+.msg.ai.md-body h1,
+.msg.ai.md-body h2,
+.msg.ai.md-body h3,
+.msg.ai.md-body h4,
+.msg.ai.md-body h5,
+.msg.ai.md-body h6 {
+    margin: 16px 0 8px 0;
+    font-weight: 600;
+    line-height: 1.3;
+    color: #f2f2f7;
+}
+
+.msg.ai.md-body h1 {
+    font-size: 1.35em;
+}
+
+.msg.ai.md-body h2 {
+    font-size: 1.2em;
+}
+
+.msg.ai.md-body h3 {
+    font-size: 1.08em;
+}
+
+.msg.ai.md-body h4,
+.msg.ai.md-body h5,
+.msg.ai.md-body h6 {
+    font-size: 1em;
+}
+
+.msg.ai.md-body b,
+.msg.ai.md-body strong {
+    font-weight: 600;
+    color: #ffffff;
+}
+
+.msg.ai.md-body i,
+.msg.ai.md-body em {
+    font-style: italic;
+}
+
+.msg.ai.md-body s {
+    text-decoration: line-through;
+    opacity: 0.75;
+}
+
+.msg.ai.md-body a {
+    color: #7ab8ff;
+    text-decoration: underline;
+    text-decoration-color: rgba(122, 184, 255, 0.35);
+    text-underline-offset: 2px;
+    transition: text-decoration-color 0.15s ease;
+}
+
+.msg.ai.md-body a:hover {
+    text-decoration-color: rgba(122, 184, 255, 0.9);
+}
+
+.msg.ai.md-body img {
+    max-width: 100%;
+    border-radius: 8px;
+    margin: 6px 0;
+    display: block;
+}
+
+/* Inline code */
+.msg.ai.md-body code {
+    font-family: "SF Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
+    font-size: 0.9em;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 4px;
+    padding: 1px 5px;
+    color: #ffd479;
+}
+
+/* Fenced code blocks: <pre><code> — reset the inline-code styling
+     since it's nested inside, and give the block its own chrome. */
+.msg.ai.md-body pre {
+    margin: 8px 0 12px 0;
+    padding: 10px 12px;
+    background: rgba(255, 255, 255, 0.07);
+    /* Light overlay, not more black — the panel itself is already near-
+         black, so darkening further (e.g. rgba(0,0,0,x)) barely reads as
+         a distinct surface. A translucent white lift gives real contrast
+         against the message bubble behind it. */
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 10px;
+    overflow-x: auto;
+    line-height: 1.5;
+}
+
+.msg.ai.md-body pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    color: #e6e6ef;
+    white-space: pre;
+}
+
+.msg.ai.md-body pre::-webkit-scrollbar {
+    height: 6px;
+}
+
+.msg.ai.md-body pre::-webkit-scrollbar-thumb {
+    background: rgba(120, 120, 128, 0.4);
+    border-radius: 4px;
+}
+
+/* Lists */
+.msg.ai.md-body ul,
+.msg.ai.md-body ol {
+    margin: 0 0 10px 0;
+    padding-left: 1.4em;
+}
+
+.msg.ai.md-body li {
+    margin: 3px 0;
+}
+
+.msg.ai.md-body li.md-checkbox-item {
+    list-style: none;
+    margin-left: -1.4em;
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+}
+
+.msg.ai.md-body li.md-checkbox-item input[type="checkbox"] {
+    margin-top: 3px;
+    accent-color: #7ab8ff;
+}
+
+/* Blockquote */
+.msg.ai.md-body blockquote {
+    margin: 8px 0 12px 0;
+    padding: 2px 12px;
+    border-left: 2px solid rgba(255, 255, 255, 0.25);
+    color: #c7c7cc;
+    font-style: italic;
+}
+
+/* Horizontal rule */
+.msg.ai.md-body hr {
+    border: none;
+    border-top: 1px solid rgba(255, 255, 255, 0.14);
+    margin: 14px 0;
+}
+
+/* Table */
+.msg.ai.md-body table {
+    margin: 8px 0 12px 0;
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.95em;
+    overflow-x: auto;
+    display: block;
+}
+
+.msg.ai.md-body th,
+.msg.ai.md-body td {
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    padding: 5px 9px;
+    text-align: left;
+}
+
+.msg.ai.md-body th {
+    background: rgba(255, 255, 255, 0.06);
+    font-weight: 600;
+    color: #f2f2f7;
+}
+
+/* --- Code Block Copy Button (top-right corner of each <pre>) ---
+     Separate from .copy-btn (which floats below the whole message) —
+     this one lives inside each fenced code block so multi-snippet
+     replies get a copy control per block, not just for the full message. */
+.msg.ai.md-body pre.code-block-wrap {
+    position: relative;
+    /* anchors .code-copy-btn's absolute positioning to this block */
+    padding-top: 34px;
+    /* keeps the first code line clear of the button */
+}
+
+.code-copy-btn {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 24px;
+    height: 24px;
+    background: rgba(30, 30, 32, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 5px;
+    color: #a1a1aa;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    z-index: 3;
+    opacity: 0;
+    transition: opacity 0.2s ease, background 0.2s ease, color 0.2s ease, transform 0.1s ease;
+}
+
+.code-copy-btn svg {
+    width: 13px;
+    height: 13px;
+}
+
+/* Reveal on hover over the code block itself, same pattern as .copy-btn
+     revealing on .msg:hover */
+.msg.ai.md-body pre.code-block-wrap:hover .code-copy-btn {
+    opacity: 1;
+}
+
+.code-copy-btn:hover {
+    background: rgba(255, 255, 255, 0.15);
+    color: #f2f2f7;
+}
+
+.code-copy-btn:active {
+    transform: scale(0.92);
+}

@@ -1,4 +1,5 @@
 import { makeContextLabel } from "./features.js";
+import { markdownToHtml } from "./markdown.js";
 
 export const appWrap = document.getElementById("app-wrap");
 export const messagesEl = document.getElementById("messages");
@@ -13,6 +14,50 @@ export function hideEmptyState() {
 export function showEmptyState() {
   const empty = document.getElementById("empty-state");
   if (empty) empty.classList.remove("hidden");
+}
+
+// Shared icon markup for any "copy to clipboard" button in the panel
+// (both the per-message copy button and each code block's copy button).
+const COPY_ICON = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <path d="M8 4V16C8 17.1046 8.89543 18 10 18H20C21.1046 18 22 17.1046 22 16V4C22 2.89543 21.1046 2 20 2H10C8.89543 2 8 2.89543 8 4Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+  <path d="M16 18V20C16 21.1046 15.1046 22 14 22H4C2.89543 22 2 21.1046 2 20V8C2 6.89543 2.89543 6 4 6H6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`;
+
+const CHECK_ICON = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <path d="M20 6L9 17L4 12" stroke="#34c759" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`;
+
+// Injects a small "copy" button into the top-right corner of every fenced
+// code block (<pre><code>...) inside a rendered AI message, so long code
+// can be grabbed without selecting text by hand. Copies the code's exact
+// text content (i.e. what's inside <code>, not any HTML around it), so
+// indentation/newlines come out exactly as the model wrote them.
+function addCodeBlockCopyButtons(container) {
+  const blocks = container.querySelectorAll("pre");
+  blocks.forEach((pre) => {
+    pre.classList.add("code-block-wrap");
+
+    const codeEl = pre.querySelector("code") || pre;
+
+    const btn = document.createElement("button");
+    btn.className = "code-copy-btn";
+    btn.type = "button";
+    btn.title = "Copy code";
+    btn.innerHTML = COPY_ICON;
+
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const codeText = codeEl.textContent;
+      navigator.clipboard.writeText(codeText).then(() => {
+        btn.innerHTML = CHECK_ICON;
+        setTimeout(() => {
+          btn.innerHTML = COPY_ICON;
+        }, 1500);
+      }).catch((err) => console.error("Failed to copy code:", err));
+    });
+
+    pre.appendChild(btn);
+  });
 }
 
 export function addMessage(text, role) {
@@ -55,6 +100,9 @@ export function addMessage(text, role) {
 
     const textEl = document.createElement("div");
     textEl.className = "msg-collapse-text";
+    // User messages are never markdown-rendered (see note below) — this
+    // branch only ever fires for long *user* text since AI bubbles skip
+    // the collapsible treatment entirely (see isLong condition above).
     textEl.textContent = text;
 
     bodyInner.appendChild(textEl);
@@ -67,8 +115,18 @@ export function addMessage(text, role) {
     header.addEventListener("click", () => {
       el.classList.toggle("expanded");
     });
+  } else if (role === "ai") {
+    // AI replies are rendered as Markdown -> sanitized HTML (headings,
+    // lists, code blocks, tables, etc). markdownToHtml() escapes all
+    // literal text itself before adding any tag, so this is safe even
+    // though the model's raw text could contain '<', '&', etc.
+    el.classList.add("md-body");
+    el.innerHTML = markdownToHtml(text);
+    addCodeBlockCopyButtons(el);
   } else {
-    // Standard text fallback for short messages or AI messages
+    // User/system messages are shown as plain text, not markdown-rendered:
+    // markdown syntax someone actually typed (e.g. "what does * do in
+    // regex?") shouldn't be reinterpreted as formatting instructions.
     el.textContent = text;
   }
 
@@ -76,26 +134,14 @@ export function addMessage(text, role) {
   const copyBtn = document.createElement("button");
   copyBtn.className = "copy-btn";
   copyBtn.title = "Copy text";
-
-  // Default Copy Icon[cite: 2]
-  const copyIcon = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-    <path d="M8 4V16C8 17.1046 8.89543 18 10 18H20C21.1046 18 22 17.1046 22 16V4C22 2.89543 21.1046 2 20 2H10C8.89543 2 8 2.89543 8 4Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
-    <path d="M16 18V20C16 21.1046 15.1046 22 14 22H4C2.89543 22 2 21.1046 2 20V8C2 6.89543 2.89543 6 4 6H6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-  </svg>`;
-
-  // Success Checkmark Icon[cite: 2]
-  const checkIcon = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-    <path d="M20 6L9 17L4 12" stroke="#34c759" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-  </svg>`;
-
-  copyBtn.innerHTML = copyIcon;
+  copyBtn.innerHTML = COPY_ICON;
 
   // Handle clipboard functionality[cite: 2]
   copyBtn.addEventListener("click", () => {
     navigator.clipboard.writeText(text).then(() => {
-      copyBtn.innerHTML = checkIcon;
+      copyBtn.innerHTML = CHECK_ICON;
       setTimeout(() => {
-        copyBtn.innerHTML = copyIcon;
+        copyBtn.innerHTML = COPY_ICON;
       }, 1500);
     }).catch(err => console.error("Failed to copy text:", err));
   });

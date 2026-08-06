@@ -121,10 +121,10 @@ async def chat_node(state: NavigatorState) -> dict:
                 f"all {num_sources} clearly distinguished by their labels in your answer.\n\n"
                 if num_sources > 1 else ""
             )
-            + "Provide helpful, concise, and insightful answers as plain text "
-            "(no markdown formatting). Keep answers fairly concise — avoid "
-            "unnecessarily long responses when a shorter one would fully "
-            "address the question."
+            + "Provide helpful, concise, and insightful answers. Use Markdown formatting "
+            "whenever deemed necessary to enhance readability, but do not force it. "
+            "Keep answers fairly concise — avoid unnecessarily long responses when a "
+            "shorter one would fully address the question."
         )
     )
 

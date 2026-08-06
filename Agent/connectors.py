@@ -1,12 +1,15 @@
+import os
 import json
 from pathlib import Path
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from Auth.swiggy_auth import get_swiggy_token
-from Auth.gmail_auth import get_gmail_token
+from Auth.google_auth import get_google_token
 from Auth.telegram_auth import get_telegram_config
 from Auth.tavily_auth import get_tavily_config
 from Auth.github_auth import get_github_config
+from Auth.notion_auth import get_notion_config
+from Auth.spotify_auth import get_spotify_config
 
 from configuration import TELEGRAM_BLACKLIST
 
@@ -42,19 +45,19 @@ async def load_swiggy_tools(tool_manager):
     await tool_manager.register(im_tools, "swiggy-instamart")
 
 
-async def load_gmail_tools(tool_manager):
-    token = await get_gmail_token()
+async def load_calendar_tools(tool_manager):
+    token = await get_google_token()
 
-    gmail_client = MultiServerMCPClient({
-        "gmail": {
+    calendar_client = MultiServerMCPClient({
+        "calendar": {
             "transport": "streamable_http",
-            "url": "https://gmailmcp.googleapis.com/mcp/v1",
+            "url": "https://calendarmcp.googleapis.com/mcp/v1",
             "headers": {"Authorization": f"Bearer {token}"},
         }
     })
 
-    tools = await gmail_client.get_tools()
-    await tool_manager.register(tools, "gmail")
+    tools = await calendar_client.get_tools()
+    await tool_manager.register(tools, "calendar")
 
 
 async def load_telegram_tools(tool_manager):
@@ -108,13 +111,124 @@ async def load_github_tools(tool_manager):
     await tool_manager.register(tools, "github")
 
 
+async def load_notion_tools(tool_manager):
+    env_vars = await get_notion_config()
+    env = os.environ.copy()
+    env.update(env_vars)
+
+    notion_client = MultiServerMCPClient({
+        "notion": {
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["-y", "notion-mcp-server"],
+            "env": env,
+        }
+    })
+
+    tools = await notion_client.get_tools()
+    await tool_manager.register(tools, "notion")
+
+
+async def load_spotify_tools(tool_manager):
+    env_vars = await get_spotify_config()
+    env = os.environ.copy()
+    env.update(env_vars)
+
+    spotify_client = MultiServerMCPClient({
+        "spotify": {
+            "transport": "stdio",
+            "command": "uvx",
+            "args": [
+                "--python", "3.12",
+                "--from", "git+https://github.com/varunneal/spotify-mcp",
+                "spotify-mcp",
+            ],
+            "env": env,
+        }
+    })
+
+    tools = await spotify_client.get_tools()
+    await tool_manager.register(tools, "spotify")
+
+
+async def load_excalidraw_tools(tool_manager):
+    """
+    Official Excalidraw MCP (remote) via mcp-remote bridge.
+    Works with zero API keys for basic diagram creation.
+    First connect may open a browser if OAuth is required.
+    """
+    excalidraw_client = MultiServerMCPClient({
+        "excalidraw": {
+            "transport": "stdio",
+            "command": "npx",
+            "args": [
+                "-y",
+                "mcp-remote@latest",
+                "https://mcp.excalidraw.com",
+            ],
+        }
+    })
+
+    tools = await excalidraw_client.get_tools()
+    await tool_manager.register(tools, "excalidraw")
+
+
+async def load_canva_tools(tool_manager):
+    """
+    Official Canva remote MCP server.
+    Uses mcp-remote so the OAuth browser flow works reliably.
+    First connect will open a browser for you to authorize Canva.
+    """
+    canva_client = MultiServerMCPClient({
+        "canva": {
+            "transport": "stdio",
+            "command": "npx",
+            "args": [
+                "-y",
+                "mcp-remote@latest",
+                "https://mcp.canva.com/mcp",
+            ],
+        }
+    })
+
+    tools = await canva_client.get_tools()
+    await tool_manager.register(tools, "canva")
+
+
+async def load_linear_tools(tool_manager):
+    """
+    Official Linear remote MCP server.
+    Uses mcp-remote so the OAuth browser flow works reliably.
+    First connect will open a browser for you to authorize Linear.
+    """
+    linear_client = MultiServerMCPClient({
+        "linear": {
+            "transport": "stdio",
+            "command": "npx",
+            "args": [
+                "-y",
+                "mcp-remote@latest",
+                "https://mcp.linear.app/mcp",
+            ],
+        }
+    })
+
+    tools = await linear_client.get_tools()
+    await tool_manager.register(tools, "linear")
+
+
 # Registry of all available connectors — add new ones here
 CONNECTORS = {
     "swiggy":      load_swiggy_tools,
-    "gmail":       load_gmail_tools,
+    # "calendar":    load_calendar_tools,
     "telegram":    load_telegram_tools,
     "tavily":      load_tavily_tools,
     "github":      load_github_tools,
+    "notion":      load_notion_tools,
+    "spotify":     load_spotify_tools,
+    "excalidraw":  load_excalidraw_tools,
+    "canva":       load_canva_tools,
+    "linear":      load_linear_tools,
 }
 
 # Some connectors register more than one MCP server under the hood

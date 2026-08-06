@@ -18,8 +18,8 @@ load_config()
 import uvicorn
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 from Agent.telegram_commands import setup_command_handlers, setup_bot_commands
 import Agent.agent as agent_module
@@ -62,6 +62,11 @@ class UserSession:
     cancel_requested: bool              = field(default=False)
     active_task: asyncio.Task | None    = field(default=None, repr=False)
 
+    # ── Pending tool-call approval (for inline Yes/No buttons) ─
+    # message_id of the currently-shown approval prompt, so its keyboard
+    # can be cleared once the user responds (by button or free text).
+    pending_approval_message_id: int | None = field(default=None)
+
 
 # key = telegram user_id (str)
 _sessions: dict[str, UserSession] = {}
@@ -85,6 +90,22 @@ async def send_markdown(bot, chat_id: int, text: str, **kwargs):
     except Exception:
         log.warning("Markdown->HTML send failed, falling back to plain text")
         return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+
+
+def build_approval_keyboard(session_id: str) -> InlineKeyboardMarkup:
+    """
+    Yes/No inline keyboard for a tool-call approval prompt.
+
+    callback_data is intentionally small (Telegram caps it at 64 bytes) and
+    carries the session_id so the callback handler resumes the right graph
+    thread, plus a short action tag we can dispatch on.
+    """
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Yes, go ahead", callback_data=f"approve:yes:{session_id}"),
+            InlineKeyboardButton("❌ No", callback_data=f"approve:no:{session_id}"),
+        ]
+    ])
 
 
 async def edit_markdown(bot, chat_id: int, message_id: int, text: str, **kwargs):
@@ -234,19 +255,19 @@ async def get_or_create_session(user_id: str, user_name: str) -> tuple[str, bool
 # ──────────────────────────────────────────────────────────────────────────────
 # Telegram handler
 # ──────────────────────────────────────────────────────────────────────────────
-async def on_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    active_chat_id = update.effective_chat.id
-
-    user      = update.effective_user
-    user_id   = str(user.id)
-    user_name = user.first_name
-    text = update.message.text or context.user_data.pop("voice_text", "") or ""
+async def process_user_reply(user_id: str, user_name: str, chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Shared core for handling a turn from the user — whether it arrived as
+    typed text (on_telegram_message) or as a tapped approval button
+    (on_approval_callback). Both end up calling send(text, session_id) the
+    same way, so the resume-vs-new-turn detection inside send() doesn't
+    need to know or care which UI produced the text.
+    """
 
     # ── Session: get or create ────────────────────────────────────────────────
     session_id, is_new_session = await get_or_create_session(user_id, user_name)
     session = _sessions[user_id]
-    session.chat_id = update.effective_chat.id
+    session.chat_id = chat_id
 
     # Persist after every interaction (updates last_interaction_at)
     await save_session(user_id, session)
@@ -256,7 +277,7 @@ async def on_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # another LangGraph run. Tell them to wait or use /stop.
     if session.is_processing:
         await context.bot.send_message(
-            chat_id=update.effective_chat.id,
+            chat_id=chat_id,
             text=(
                 "⏳ I'm still working on your previous message.\n\n"
                 "Please wait for it to finish — or send /stop if you'd like to cancel it."
@@ -305,7 +326,7 @@ async def on_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # ── Sending the user meaning and helper messages before final response ────
     thinking_msg = await context.bot.send_message(
-        chat_id=update.effective_chat.id,
+        chat_id=chat_id,
         text="⏳ Thinking..."
     )
 
@@ -313,7 +334,7 @@ async def on_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         label = TOOL_LABELS.get(tool_name, f"🔧 Running {tool_name}...")
         try:
             await context.bot.edit_message_text(
-                chat_id=update.effective_chat.id,
+                chat_id=chat_id,
                 message_id=thinking_msg.message_id,
                 text=label
             )
@@ -366,15 +387,17 @@ async def on_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         #  we just silently drop it per spec.)
         if not session.cancel_requested:
             if result["interrupt"]:
-                await send_markdown(
+                sent = await send_markdown(
                     context.bot,
-                    update.effective_chat.id,
-                    result["interrupt"]
+                    chat_id,
+                    result["interrupt"],
+                    reply_markup=build_approval_keyboard(session_id)
                 )
+                session.pending_approval_message_id = sent.message_id if sent else None
             elif result["reply"]:
                 await send_markdown(
                     context.bot,
-                    update.effective_chat.id,
+                    chat_id,
                     result["reply"]
                 )
     except asyncio.CancelledError:
@@ -385,7 +408,7 @@ async def on_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         log.exception("Error in send")
         if not session.cancel_requested:
             await context.bot.send_message(
-                chat_id=update.effective_chat.id,
+                chat_id=chat_id,
                 text="Something went wrong. Please try again."
             )
 
@@ -396,11 +419,86 @@ async def on_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         try:
             await context.bot.delete_message(
-                chat_id=update.effective_chat.id,
+                chat_id=chat_id,
                 message_id=thinking_msg.message_id
             )
         except Exception:
             pass
+
+
+async def on_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user      = update.effective_user
+    user_id   = str(user.id)
+    user_name = user.first_name
+    text = update.message.text or context.user_data.pop("voice_text", "") or ""
+
+    # If an approval prompt is still showing its keyboard for this user and
+    # they chose to type instead of tapping, clear the stale buttons now —
+    # send() below will still correctly resume the interrupted graph with
+    # this free-text reply (that path is unchanged).
+    session = _sessions.get(user_id)
+    if session and session.pending_approval_message_id:
+        await _clear_approval_keyboard(context.bot, update.effective_chat.id, session)
+
+    await process_user_reply(user_id, user_name, update.effective_chat.id, text, context)
+
+
+async def _clear_approval_keyboard(bot, chat_id: int, session: "UserSession"):
+    """Best-effort removal of a stale Yes/No keyboard once it's been acted on."""
+    if not session.pending_approval_message_id:
+        return
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=chat_id,
+            message_id=session.pending_approval_message_id,
+            reply_markup=None
+        )
+    except Exception:
+        pass
+    session.pending_approval_message_id = None
+
+
+async def on_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles taps on the Yes/No inline keyboard attached to a tool-call
+    approval prompt. Feeds "yes" / "no" into the exact same
+    process_user_reply -> send() path a typed reply would use, so
+    human_approval_node's intent classification handles it identically.
+    """
+    query = update.callback_query
+    await query.answer()  # stop Telegram's loading spinner on the button
+
+    try:
+        _, decision, session_id = query.data.split(":", 2)
+    except ValueError:
+        log.warning("Malformed approval callback_data", data=query.data)
+        return
+
+    user      = update.effective_user
+    user_id   = str(user.id)
+    user_name = user.first_name
+    chat_id   = update.effective_chat.id
+
+    session = _sessions.get(user_id)
+
+    # Guard against a stale button: session gone, or it's since moved on to
+    # a different session_id (e.g. expired and a new one started).
+    if session is None or session.session_id != session_id:
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="That request isn't waiting for approval anymore."
+        )
+        return
+
+    await _clear_approval_keyboard(context.bot, chat_id, session)
+
+    reply_text = "yes" if decision == "yes" else "no"
+    await process_user_reply(user_id, user_name, chat_id, reply_text, context)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -504,6 +602,7 @@ async def lifespan(app: FastAPI):
 
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_telegram_message))
     telegram_app.add_handler(MessageHandler(filters.VOICE, on_voice_message))
+    telegram_app.add_handler(CallbackQueryHandler(on_approval_callback, pattern=r"^approve:"))
 
     await telegram_app.initialize()
     await telegram_app.start()
