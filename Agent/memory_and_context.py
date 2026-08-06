@@ -215,7 +215,7 @@ async def run_evaluator(thread_id: str, messages: list[BaseMessage]) -> None:
                 "Extract ONLY explicit, high-value, long-term preferences about this user. "
                 "Focus purely on concrete tastes (brands, flavors, topics, songs), structural constraints (price points, dietary needs), or distinct communication styles.\n\n"
                 "CRITICAL: Ignore generic conversational habits, basic app navigation (like adding items to a cart), and temporary tasks. "
-                "If no explicit long-term preferences are present in this session, output absolutely nothing.\n\n"
+                "If no explicit long-term preferences are present in this session, output exactly the word: \'NONE\'.\n\n"
                 f"{_FORMAT_RULES}"
             )),
         ])
@@ -225,6 +225,14 @@ async def run_evaluator(thread_id: str, messages: list[BaseMessage]) -> None:
 
     session_preferences = extraction_result.content.strip()
     log.info("session_preferences_extracted", content=session_preferences)
+
+    # ── Early Exit: If no preferences were found, stop here ──────────────────
+    session_preferences = extraction_result.content.strip()
+
+    # Check for empty string OR the explicit NONE keyword
+    if not session_preferences or session_preferences.upper() == "NONE":
+        log.info("evaluator_finished", reason="no high-signal preferences detected")
+        return
 
     async with _file_lock:
         # ── Step 2: Load existing ─────────────────────────────────────────────────
