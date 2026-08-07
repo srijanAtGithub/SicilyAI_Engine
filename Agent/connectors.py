@@ -4,7 +4,6 @@ from pathlib import Path
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from Auth.swiggy_auth import get_swiggy_token
-from Auth.google_auth import get_google_token
 from Auth.telegram_auth import get_telegram_config
 from Auth.tavily_auth import get_tavily_config
 from Auth.github_auth import get_github_config
@@ -46,13 +45,21 @@ async def load_swiggy_tools(tool_manager):
 
 
 async def load_calendar_tools(tool_manager):
-    token = await get_google_token()
+    """
+    Local Google Calendar MCP using @cocal/google-calendar-mcp.
+    Works with normal personal OAuth credentials (no Developer Preview needed).
+    """
+
+    credentials_path = str(SICILY_HOME / "google_credentials.json")
 
     calendar_client = MultiServerMCPClient({
         "calendar": {
-            "transport": "streamable_http",
-            "url": "https://calendarmcp.googleapis.com/mcp/v1",
-            "headers": {"Authorization": f"Bearer {token}"},
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["-y", "@cocal/google-calendar-mcp"],
+            "env": {
+                "GOOGLE_OAUTH_CREDENTIALS": credentials_path,
+            },
         }
     })
 
@@ -220,7 +227,7 @@ async def load_linear_tools(tool_manager):
 # Registry of all available connectors — add new ones here
 CONNECTORS = {
     "swiggy":      load_swiggy_tools,
-    # "calendar":    load_calendar_tools,
+    "calendar":    load_calendar_tools,
     "telegram":    load_telegram_tools,
     "tavily":      load_tavily_tools,
     "github":      load_github_tools,
