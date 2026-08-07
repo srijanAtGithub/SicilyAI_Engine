@@ -373,7 +373,22 @@ TOOL_LABELS = {
     "search_documentation":              "🔍 Searching documentation...",
     "get_status_updates":                "🚥 Fetching status updates...",
     "save_status_update":                "💾 Saving status update...",
-    "delete_status_update":              "🗑️ Deleting status update..."
+    "delete_status_update":              "🗑️ Deleting status update...",
+
+    # ── Google Calendar ───────────────────────────────────────────────
+    "list-calendars":                    "📅 Listing calendars...",
+    "list-events":                       "📆 Listing events...",
+    "search-events":                     "🔍 Searching events...",
+    "get-event":                         "📆 Fetching event...",
+    "list-colors":                       "🎨 Listing colors...",
+    "create-event":                      "📅 Creating event...",
+    "create-events":                     "📅 Creating events...",
+    "update-event":                      "✏️ Updating event...",
+    "delete-event":                      "🗑️ Deleting event...",
+    "get-freebusy":                      "📊 Fetching availability...",
+    "get-current-time":                  "⏰ Fetching current time...",
+    "respond-to-event":                  "✉️ Responding to event...",
+    "manage-accounts":                   "⚙️ Managing accounts...",
 }
 
 
