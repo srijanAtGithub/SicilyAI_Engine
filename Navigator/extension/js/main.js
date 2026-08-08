@@ -1,7 +1,7 @@
 import { NotificationService } from "./notifications.js";
 import { addMessage, clearMessagesUI, addContextTrail, setSending, sendBtn, appWrap, showEmptyState } from "./ui.js";
 import { socket, getActiveTabInfo, loadHistory, deleteSessionOnBackend, connectSocket, closeSocket, resolveSessionKey, carrySessionToUrl, startNewSessionForUrl, pinSessionKeyToUrl, fetchAllSessions, BACKEND_HOST } from "./api.js";
-import { attachedContexts, clearAttachedContexts } from "./features.js";
+import { attachedContexts, clearAttachedContexts, currentCapability } from "./features.js";
 import {
   getMentionedTabSnippets, hasMentionedTab, clearMentionedTab, isMentionDropdownOpen,
   hasMentionedCollection, getMentionedCollectionIds, clearMentionedCollection,
@@ -118,7 +118,8 @@ async function sendMessage() {
     text: text,
     page_url: fresh.url,
     page_title: fresh.title,
-    context_snippets: payloadSnippets
+    context_snippets: payloadSnippets,
+    capability: currentCapability
   };
 
   socket.send(JSON.stringify(payload));

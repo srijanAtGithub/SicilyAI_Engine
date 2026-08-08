@@ -24,6 +24,7 @@ class NavigatorState(TypedDict):
     page_url: str
     page_title: str
     context_snippets: list[str] # Add the snippets parameter to the state array
+    capability: str             # "basic" | "general" | "smart"
 
 
 def _build_turn_text(user_text: str, snippets: list[str]) -> str:
@@ -56,9 +57,19 @@ def _build_turn_text(user_text: str, snippets: list[str]) -> str:
     return f"{attached_block}\n\n{user_text}"
 
 
+# Capability → LLM factory mapping
+_LLM_FACTORIES = {
+    "basic":   configuration.navigator_basic_llm,
+    "general": configuration.navigator_general_llm,
+    "smart":   configuration.navigator_smart_llm,
+}
+
+
 # ── The Chat Node Logic ─────────────────────────────────────────────────
 async def chat_node(state: NavigatorState) -> dict:
-    llm = configuration.navigator_basic_llm()
+    capability = state.get("capability") or "basic"
+    llm_factory = _LLM_FACTORIES.get(capability, configuration.navigator_basic_llm)
+    llm = llm_factory()
 
     url = state.get("page_url") or "Unknown"
     title = state.get("page_title") or "Unknown"

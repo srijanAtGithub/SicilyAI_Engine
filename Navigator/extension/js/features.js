@@ -186,10 +186,11 @@ function handleQuickAction(action) {
 }
 
 qaItems.forEach((item) => {
-  // The font-size row isn't a real "action" — it hosts the -/+ buttons
-  // below, which have their own click handlers and must never fall
+  // The font-size row and capability row aren't real "actions" — they host
+  // interactive controls with their own click handlers and must never fall
   // through to handleQuickAction (that always closes the menu).
   if (item.classList.contains("qa-font-size")) return;
+  if (item.classList.contains("qa-capability-row")) return;
   item.addEventListener("click", () => handleQuickAction(item.dataset.action));
 });
 
@@ -257,6 +258,49 @@ qaFontPlusBtn?.addEventListener("click", (e) => {
   e.stopPropagation();
   applyChatFontSize(chatFontSize + CHAT_FONT_STEP);
   persistChatFontSize(chatFontSize);
+});
+
+// ── Chat Capability Selector ─────────────────────────────────────────
+// Three pills (Basic / General / Smart) in the quick-actions menu that
+// let the user choose which LLM backs the chat. Stored here and read
+// by main.js via the exported getter so it can be included in every
+// WebSocket payload.
+export let currentCapability = "basic";
+
+const CAPABILITY_STORAGE_KEY = "chatCapability";
+
+export function setCapability(cap) {
+  currentCapability = cap;
+  // Update active pill
+  document.querySelectorAll(".qa-cap-pill").forEach(pill => {
+    pill.classList.toggle("active", pill.dataset.cap === cap);
+  });
+  // Persist choice
+  try {
+    chrome.storage?.local?.set({ [CAPABILITY_STORAGE_KEY]: cap });
+  } catch (err) {
+    console.error("Failed to persist capability:", err);
+  }
+}
+
+// Restore saved capability on load
+try {
+  chrome.storage?.local?.get([CAPABILITY_STORAGE_KEY], (result) => {
+    const saved = result?.[CAPABILITY_STORAGE_KEY];
+    if (saved && ["basic", "general", "smart"].includes(saved)) {
+      setCapability(saved);
+    }
+  });
+} catch (err) {
+  // Silently fall back to "basic" default
+}
+
+// Wire up the pill buttons — stopPropagation keeps the menu open
+document.querySelectorAll(".qa-cap-pill").forEach(pill => {
+  pill.addEventListener("click", (e) => {
+    e.stopPropagation();
+    setCapability(pill.dataset.cap);
+  });
 });
 
 function setDragHoverState(targetZone) {
