@@ -9,6 +9,7 @@ from Auth.tavily_auth import get_tavily_config
 from Auth.github_auth import get_github_config
 from Auth.notion_auth import get_notion_config
 from Auth.spotify_auth import get_spotify_config
+from Auth.google_auth import get_google_config
 
 from configuration import TELEGRAM_BLACKLIST
 
@@ -44,27 +45,27 @@ async def load_swiggy_tools(tool_manager):
     await tool_manager.register(im_tools, "swiggy-instamart")
 
 
-async def load_calendar_tools(tool_manager):
-    """
-    Local Google Calendar MCP using @cocal/google-calendar-mcp.
-    Works with normal personal OAuth credentials (no Developer Preview needed).
-    """
+# async def load_calendar_tools(tool_manager):
+#     """
+#     Local Google Calendar MCP using @cocal/google-calendar-mcp.
+#     Works with normal personal OAuth credentials (no Developer Preview needed).
+#     """
 
-    credentials_path = str(SICILY_HOME / "google_credentials.json")
+#     credentials_path = str(SICILY_HOME / "google_credentials.json")
 
-    calendar_client = MultiServerMCPClient({
-        "calendar": {
-            "transport": "stdio",
-            "command": "npx",
-            "args": ["-y", "@cocal/google-calendar-mcp"],
-            "env": {
-                "GOOGLE_OAUTH_CREDENTIALS": credentials_path,
-            },
-        }
-    })
+#     calendar_client = MultiServerMCPClient({
+#         "calendar": {
+#             "transport": "stdio",
+#             "command": "npx",
+#             "args": ["-y", "@cocal/google-calendar-mcp"],
+#             "env": {
+#                 "GOOGLE_OAUTH_CREDENTIALS": credentials_path,
+#             },
+#         }
+#     })
 
-    tools = await calendar_client.get_tools()
-    await tool_manager.register(tools, "calendar")
+#     tools = await calendar_client.get_tools()
+#     await tool_manager.register(tools, "calendar")
 
 
 async def load_telegram_tools(tool_manager):
@@ -158,6 +159,31 @@ async def load_spotify_tools(tool_manager):
     await tool_manager.register(tools, "spotify")
 
 
+async def load_google_workspace_tools(tool_manager):
+    """
+    Google Workspace MCP (aaronsb) - Gmail, Calendar, Drive, Docs, Sheets, Tasks, Meet
+    Uses high-level tools (manage_email, manage_calendar, etc.)
+    Auth is handled by the package itself via manage_accounts tool.
+    """
+    
+    client_id, client_secret = await get_google_config()
+
+    workspace_client = MultiServerMCPClient({
+        "google-workspace": {
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["-y", "@aaronsb/google-workspace-mcp"],
+            "env": {
+                "GOOGLE_CLIENT_ID": client_id,
+                "GOOGLE_CLIENT_SECRET": client_secret,
+            },
+        }
+    })
+
+    tools = await workspace_client.get_tools()
+    await tool_manager.register(tools, "google-workspace")
+
+
 async def load_excalidraw_tools(tool_manager):
     """
     Official Excalidraw MCP (remote) via mcp-remote bridge.
@@ -226,16 +252,17 @@ async def load_linear_tools(tool_manager):
 
 # Registry of all available connectors — add new ones here
 CONNECTORS = {
-    "swiggy":      load_swiggy_tools,
-    "calendar":    load_calendar_tools,
-    "telegram":    load_telegram_tools,
-    "tavily":      load_tavily_tools,
-    "github":      load_github_tools,
-    "notion":      load_notion_tools,
-    "spotify":     load_spotify_tools,
-    "excalidraw":  load_excalidraw_tools,
-    "canva":       load_canva_tools,
-    "linear":      load_linear_tools,
+    "swiggy":           load_swiggy_tools,
+    # "calendar":         load_calendar_tools,
+    "telegram":         load_telegram_tools,
+    "tavily":           load_tavily_tools,
+    "github":           load_github_tools,
+    "notion":           load_notion_tools,
+    "spotify":          load_spotify_tools,
+    "google_workspace": load_google_workspace_tools,
+    "excalidraw":       load_excalidraw_tools,
+    "canva":            load_canva_tools,
+    "linear":           load_linear_tools,
 }
 
 # Some connectors register more than one MCP server under the hood
