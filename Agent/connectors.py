@@ -4,11 +4,6 @@ from pathlib import Path
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from Auth.swiggy_auth import get_swiggy_token
-from Auth.telegram_auth import get_telegram_config
-from Auth.tavily_auth import get_tavily_config
-from Auth.github_auth import get_github_config
-from Auth.notion_auth import get_notion_config
-from Auth.spotify_auth import get_spotify_config
 from Auth.google_auth import get_google_config, auto_auth
 
 from configuration import TELEGRAM_BLACKLIST
@@ -18,6 +13,18 @@ log = structlog.get_logger()
 
 SICILY_HOME = Path.home() / ".sicily"
 CONNECTED_PATH = SICILY_HOME / "connected.json"
+
+
+def requires_keys(*keys: str):
+    """
+    Decorator to attach required environment variables to a connector loader.
+    Allows the UI to check for missing keys before attempting to load it.
+    """
+    def decorator(func):
+        func.required_keys = list(keys)
+        return func
+    return decorator
+
 
 async def load_swiggy_tools(tool_manager):
     token = await get_swiggy_token()
@@ -68,8 +75,13 @@ async def load_swiggy_tools(tool_manager):
 #     await tool_manager.register(tools, "calendar")
 
 
+@requires_keys("TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_SESSION_STRING")
 async def load_telegram_tools(tool_manager):
-    env = await get_telegram_config()
+    env = os.environ.copy()
+    
+    env["TELEGRAM_API_ID"] = os.environ["TELEGRAM_API_ID"]
+    env["TELEGRAM_API_HASH"] = os.environ["TELEGRAM_API_HASH"]
+    env["TELEGRAM_SESSION_STRING"] = os.environ["TELEGRAM_SESSION_STRING"]
 
     telegram_client = MultiServerMCPClient({
         "telegram": {
@@ -90,9 +102,10 @@ async def load_telegram_tools(tool_manager):
     await tool_manager.register(filtered_tools, "telegram")
 
 
+@requires_keys("TAVILY_API_KEY")
 async def load_tavily_tools(tool_manager):
-    env = await get_tavily_config()
-    api_key = env["TAVILY_API_KEY"]
+
+    api_key = os.environ["TAVILY_API_KEY"]
 
     tavily_client = MultiServerMCPClient({
         "tavily": {
@@ -104,9 +117,10 @@ async def load_tavily_tools(tool_manager):
     await tool_manager.register(tools, "tavily")
 
 
+@requires_keys("GITHUB_TOKEN")
 async def load_github_tools(tool_manager):
-    env = await get_github_config()
-    token = env["GITHUB_TOKEN"]
+
+    token = os.environ["GITHUB_TOKEN"]
 
     github_client = MultiServerMCPClient({
         "github": {
@@ -119,10 +133,16 @@ async def load_github_tools(tool_manager):
     await tool_manager.register(tools, "github")
 
 
+@requires_keys("NOTION_TOKEN")
 async def load_notion_tools(tool_manager):
-    env_vars = await get_notion_config()
     env = os.environ.copy()
-    env.update(env_vars)
+    
+    # We already know this exists because the decorator checked!
+    token = os.environ["NOTION_TOKEN"]
+    
+    # Map it to whatever the MCP server expects (passing it as both just to be safe)
+    env["NOTION_TOKEN"] = token
+    env["NOTION_API_KEY"] = token 
 
     notion_client = MultiServerMCPClient({
         "notion": {
@@ -137,10 +157,14 @@ async def load_notion_tools(tool_manager):
     await tool_manager.register(tools, "notion")
 
 
+@requires_keys("SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET", "SPOTIFY_REDIRECT_URI")
 async def load_spotify_tools(tool_manager):
-    env_vars = await get_spotify_config()
     env = os.environ.copy()
-    env.update(env_vars)
+    
+    # Grab them directly; the decorator guarantees they are present
+    env["SPOTIFY_CLIENT_ID"] = os.environ["SPOTIFY_CLIENT_ID"]
+    env["SPOTIFY_CLIENT_SECRET"] = os.environ["SPOTIFY_CLIENT_SECRET"]
+    env["SPOTIFY_REDIRECT_URI"] = os.environ.get("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8080/callback")
 
     spotify_client = MultiServerMCPClient({
         "spotify": {
@@ -159,6 +183,7 @@ async def load_spotify_tools(tool_manager):
     await tool_manager.register(tools, "spotify")
 
 
+@requires_keys("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET")
 async def load_google_workspace_tools(tool_manager):
     """
     Google Workspace MCP (aaronsb) - Gmail, Calendar, Drive, Docs, Sheets, Tasks, Meet
@@ -167,7 +192,7 @@ async def load_google_workspace_tools(tool_manager):
 
     On first load, if no account is authenticated, automatically trigger the manage_accounts authenticate flow.
     """
-    
+
     client_id, client_secret = await get_google_config()
 
     workspace_client = MultiServerMCPClient({
