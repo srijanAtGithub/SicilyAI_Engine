@@ -9,7 +9,7 @@ from Auth.tavily_auth import get_tavily_config
 from Auth.github_auth import get_github_config
 from Auth.notion_auth import get_notion_config
 from Auth.spotify_auth import get_spotify_config
-from Auth.google_auth import get_google_config
+from Auth.google_auth import get_google_config, auto_auth
 
 from configuration import TELEGRAM_BLACKLIST
 
@@ -164,6 +164,8 @@ async def load_google_workspace_tools(tool_manager):
     Google Workspace MCP (aaronsb) - Gmail, Calendar, Drive, Docs, Sheets, Tasks, Meet
     Uses high-level tools (manage_email, manage_calendar, etc.)
     Auth is handled by the package itself via manage_accounts tool.
+
+    On first load, if no account is authenticated, automatically trigger the manage_accounts authenticate flow.
     """
     
     client_id, client_secret = await get_google_config()
@@ -182,6 +184,9 @@ async def load_google_workspace_tools(tool_manager):
 
     tools = await workspace_client.get_tools()
     await tool_manager.register(tools, "google-workspace")
+
+    # Auto-auth if no account is configured
+    await auto_auth(tools)
 
 
 async def load_excalidraw_tools(tool_manager):

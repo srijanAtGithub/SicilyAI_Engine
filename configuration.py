@@ -397,6 +397,17 @@ TOOL_LABELS = {
     "get-current-time":                  "⏰ Fetching current time...",
     "respond-to-event":                  "✉️ Responding to event...",
     "manage-accounts":                   "⚙️ Managing accounts...",
+
+    # ── Google Workspace ──────────────────────────────────────────────
+    "manage-workspace":                  "🏢 Managing workspace...",
+    "manage-scratchpad":                 "📝 Managing scratchpad...",
+    "queue-operations":                  "⏳ Managing queued operations...",
+    "manage-docs":                       "📄 Managing documents...",
+    "manage-drive":                      "📁 Managing Drive...",
+    "manage-email":                      "✉️ Managing email...",
+    "manage-meet":                       "🎥 Managing Meet...",
+    "manage-sheets":                     "📊 Managing spreadsheets...",
+    "manage-tasks":                      "✅ Managing tasks..."
 }
 
 
