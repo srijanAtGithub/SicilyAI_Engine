@@ -360,7 +360,7 @@ async def websocket_endpoint(websocket: WebSocket, tab_id: str):
                     import asyncio
                     async def generate_and_save_title():
                         try:
-                            llm = configuration.navigator_general_llm()
+                            llm = configuration.navigator_basic_llm()
                             prompt = (
                                 "Generate a chat title based on this first interaction. "
                                 "Keep the name very short and concise. Just a few words. "

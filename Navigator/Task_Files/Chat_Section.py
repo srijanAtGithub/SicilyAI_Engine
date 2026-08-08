@@ -58,7 +58,7 @@ def _build_turn_text(user_text: str, snippets: list[str]) -> str:
 
 # ── The Chat Node Logic ─────────────────────────────────────────────────
 async def chat_node(state: NavigatorState) -> dict:
-    llm = configuration.navigator_general_llm()
+    llm = configuration.navigator_basic_llm()
 
     url = state.get("page_url") or "Unknown"
     title = state.get("page_title") or "Unknown"
