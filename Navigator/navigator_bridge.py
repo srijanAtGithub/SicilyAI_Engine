@@ -286,6 +286,7 @@ async def websocket_endpoint(websocket: WebSocket, tab_id: str):
             user_text = (payload.get("text") or "").strip()
             page_url = payload.get("page_url") or ""
             page_title = payload.get("page_title") or ""
+            capability = payload.get("capability") or "basic"
             
             context_snippets = payload.get("context_snippets") or []
 
@@ -306,6 +307,7 @@ async def websocket_endpoint(websocket: WebSocket, tab_id: str):
                 "page_url": page_url,
                 "page_title": page_title,
                 "context_snippets": context_snippets, # 2. Forward the snippets into LangGraph state!
+                "capability": capability,
             })
 
             # Track token usage from the returned message state
@@ -360,7 +362,7 @@ async def websocket_endpoint(websocket: WebSocket, tab_id: str):
                     import asyncio
                     async def generate_and_save_title():
                         try:
-                            llm = configuration.navigator_general_llm()
+                            llm = configuration.navigator_basic_llm()
                             prompt = (
                                 "Generate a chat title based on this first interaction. "
                                 "Keep the name very short and concise. Just a few words. "

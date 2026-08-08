@@ -141,6 +141,14 @@ def navigator_general_llm(schema=None):
     return llm
 
 
+def navigator_basic_llm(schema=None):
+    llm = ChatOpenAI(model="gpt-5-nano")
+    
+    if schema:
+        return llm.with_structured_output(schema, include_raw=False)
+    return llm
+
+
 TOOL_LABELS = {
     # ── Swiggy Instamart ──────────────────────────────────
     "search_products":    "🔍 Searching for products...",
@@ -389,6 +397,17 @@ TOOL_LABELS = {
     "get-current-time":                  "⏰ Fetching current time...",
     "respond-to-event":                  "✉️ Responding to event...",
     "manage-accounts":                   "⚙️ Managing accounts...",
+
+    # ── Google Workspace ──────────────────────────────────────────────
+    "manage-workspace":                  "🏢 Managing workspace...",
+    "manage-scratchpad":                 "📝 Managing scratchpad...",
+    "queue-operations":                  "⏳ Managing queued operations...",
+    "manage-docs":                       "📄 Managing documents...",
+    "manage-drive":                      "📁 Managing Drive...",
+    "manage-email":                      "✉️ Managing email...",
+    "manage-meet":                       "🎥 Managing Meet...",
+    "manage-sheets":                     "📊 Managing spreadsheets...",
+    "manage-tasks":                      "✅ Managing tasks..."
 }
 
 

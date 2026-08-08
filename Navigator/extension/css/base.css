@@ -387,6 +387,60 @@ body {
     user-select: none;
 }
 
+/* --- Capability Selector Row --- */
+.qa-item.qa-capability-row {
+    cursor: default;
+    align-items: center;
+}
+
+.qa-item.qa-capability-row:hover {
+    background: transparent;
+    padding-left: 10px;
+}
+
+.qa-item.qa-capability-row:active {
+    transform: none;
+    background: transparent;
+}
+
+.qa-capability-pills {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+}
+
+.qa-cap-pill {
+    padding: 3px 9px;
+    border-radius: 20px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.05);
+    color: rgba(242, 242, 247, 0.55);
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+    white-space: nowrap;
+    user-select: none;
+    flex-shrink: 0;
+}
+
+.qa-cap-pill:hover {
+    background: rgba(255, 255, 255, 0.14);
+    color: #f2f2f7;
+    border-color: rgba(255, 255, 255, 0.2);
+}
+
+.qa-cap-pill.active {
+    background: rgba(40, 110, 230, 0.18);
+    border-color: rgb(37, 113, 255);
+    color: #dbe1e6;
+    box-shadow: 0 0 8px rgba(230, 168, 40, 0.2);
+}
+
+.qa-cap-pill:active {
+    transform: scale(0.93);
+}
+
 /* Scanning scanline for busy state (Matches content_script.js) */
 .wrap::before {
     content: '';
@@ -452,10 +506,6 @@ body {
 
 #empty-state.temp-mode .es-temp-notice {
     display: flex;
-    /* Reddish ambient glow around the badge */
-    box-shadow:
-        0 0 16px rgba(255, 69, 58, 0.35),
-        0 0 4px rgba(255, 69, 58, 0.2);
 }
 
 /* Hide "Ready when you are", subtitle, and chips during Incognito mode */
@@ -466,18 +516,20 @@ body {
 }
 
 .active-chat-title {
-  flex: 1; /* Takes up remaining space between the left and right buttons */
-  margin: 0 12px;
-  font-size: 13px;
-  font-weight: 500;
-  color: #a1a1aa; /* Muted text color, adjust if needed */
-  text-align: left;
-  
-  /* Prevent wrapping */
-  white-space: nowrap;
-  overflow: hidden;
-  
-  /* The standard right-side fade effect for long text */
-  -webkit-mask-image: linear-gradient(to right, rgba(0,0,0,1) 80%, rgba(0,0,0,0) 100%);
-  mask-image: linear-gradient(to right, rgba(0,0,0,1) 80%, rgba(0,0,0,0) 100%);
+    flex: 1;
+    /* Takes up remaining space between the left and right buttons */
+    margin: 0 12px;
+    font-size: 13px;
+    font-weight: 500;
+    color: #a1a1aa;
+    /* Muted text color, adjust if needed */
+    text-align: left;
+
+    /* Prevent wrapping */
+    white-space: nowrap;
+    overflow: hidden;
+
+    /* The standard right-side fade effect for long text */
+    -webkit-mask-image: linear-gradient(to right, rgba(0, 0, 0, 1) 80%, rgba(0, 0, 0, 0) 100%);
+    mask-image: linear-gradient(to right, rgba(0, 0, 0, 1) 80%, rgba(0, 0, 0, 0) 100%);
 }

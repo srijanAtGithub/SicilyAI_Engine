@@ -59,9 +59,12 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import Agent.main 
-    
+    import Agent.main
+    from Agent.session_store import load_session
+
     user_id = str(update.effective_user.id)
+
+    # Prefer the live in-memory session (has is_processing state)
     session = Agent.main._sessions.get(user_id)
     if session:
         await update.message.reply_text(
@@ -69,6 +72,18 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🕒 Started: {Agent.main.format_time(session.started_at)}\n"
             f"💬 Last msg: {Agent.main.format_time(session.last_interaction_at)}\n"
             f"⚙️  Processing: {'Yes' if session.is_processing else 'No'}"
+        )
+        return
+
+    # Fall back to the persisted DB record (e.g. after a restart, or before
+    # the first regular message of this boot has been processed)
+    persisted = await load_session(user_id)
+    if persisted:
+        await update.message.reply_text(
+            f"🧵 Session ID: {persisted.session_id[:8]}...\n"
+            f"🕒 Started: {Agent.main.format_time(persisted.started_at)}\n"
+            f"💬 Last msg: {Agent.main.format_time(persisted.last_interaction_at)}\n"
+            f"⚙️  Processing: No"
         )
     else:
         await update.message.reply_text("No active session.")
@@ -162,15 +177,38 @@ async def loaded_connectors_command(update: Update, context: ContextTypes.DEFAUL
 
 
 async def _handle_connect(update: Update, name: str):
+    import os
+
     loaded = tool_manager.loaded_servers
     if is_connector_loaded(name, loaded):
         await update.message.reply_text(f"⚠️ {name.title()} is already connected.")
         return
 
+    # Grab the actual loader function from the registry
+    loader_func = CONNECTORS[name]
+    
+    # Dynamically read the required keys (defaults to [] if no decorator was used)
+    required_keys = getattr(loader_func, "required_keys", [])
+    
+    missing_keys = [
+        key for key in required_keys 
+        if not os.getenv(key) or "your_" in os.getenv(key).lower()
+    ]
+
+    if missing_keys:
+        keys_str = ", ".join(missing_keys)
+        await update.message.reply_text(
+            f"⚠️ Cannot connect to {name.title()}.\n\n"
+            f"Please add your `{keys_str}` to your `settings.json` file first.\n"
+            "You can open your configuration folder by running `sicily config` in your terminal."
+        )
+        return
+
+    # Proceed with connection
     await update.message.reply_text(f"⏳ Connecting {name.title()}...")
     try:
-        await CONNECTORS[name](tool_manager)
-        mark_connector_connected(name)  # persist so it survives restarts
+        await loader_func(tool_manager)
+        mark_connector_connected(name)
         await update.message.reply_text(f"✅ {name.title()} connected successfully!")
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to connect {name.title()}:\n{str(e)}")
