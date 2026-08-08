@@ -59,9 +59,12 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import Agent.main 
-    
+    import Agent.main
+    from Agent.session_store import load_session
+
     user_id = str(update.effective_user.id)
+
+    # Prefer the live in-memory session (has is_processing state)
     session = Agent.main._sessions.get(user_id)
     if session:
         await update.message.reply_text(
@@ -69,6 +72,18 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🕒 Started: {Agent.main.format_time(session.started_at)}\n"
             f"💬 Last msg: {Agent.main.format_time(session.last_interaction_at)}\n"
             f"⚙️  Processing: {'Yes' if session.is_processing else 'No'}"
+        )
+        return
+
+    # Fall back to the persisted DB record (e.g. after a restart, or before
+    # the first regular message of this boot has been processed)
+    persisted = await load_session(user_id)
+    if persisted:
+        await update.message.reply_text(
+            f"🧵 Session ID: {persisted.session_id[:8]}...\n"
+            f"🕒 Started: {Agent.main.format_time(persisted.started_at)}\n"
+            f"💬 Last msg: {Agent.main.format_time(persisted.last_interaction_at)}\n"
+            f"⚙️  Processing: No"
         )
     else:
         await update.message.reply_text("No active session.")
