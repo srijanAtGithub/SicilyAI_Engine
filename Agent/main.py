@@ -620,18 +620,16 @@ async def lifespan(app: FastAPI):
         except Exception:
             log.exception("Failed to send startup notification")
 
-    set_dispatch(dispatch_recurring_task)
+    # 1. Initialize the agent graph FIRST and await it completely
+    log.info("Initializing agent graph...")
+    await initialize_agent()
 
-    # Do NOT await this here, or startup deadlocks.
-    asyncio.create_task(initialize_agent())
-    asyncio.create_task(start_recurring_tasks())
-
-    # Reconnect whatever MCP connectors the user had turned on before the
-    # last restart (swiggy, gmail, telegram, tavily, github, ...). This
-    # must run AFTER initialize_agent has at least started, since it needs
-    # agent_module.tool_manager to exist. It's fire-and-forget + best-effort
-    # per connector, so one bad token doesn't block startup or the others.
+    # 2. Restore connectors
     asyncio.create_task(restore_connectors_after_agent_ready())
+
+    # 3. Set up the dispatch hook and start recurring tasks only AFTER graph is ready
+    set_dispatch(dispatch_recurring_task)
+    asyncio.create_task(start_recurring_tasks())
 
     yield
 

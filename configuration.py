@@ -262,7 +262,7 @@ TOOL_LABELS = {
     "list_tags":                         "🏷️ Listing repository tags...",
     "merge_pull_request":                "🔀 Merging pull request...",
     "pull_request_read":                 "👁️ Reading pull request...",
-    "pull_request_review_write":        "✏️ Updating PR review...",
+    "pull_request_review_write":         "✏️ Updating PR review...",
     "push_files":                        "⬆️ Pushing files to GitHub...",
     "request_copilot_review":            "🤖 Requesting Copilot review...",
     "run_secret_scanning":               "🛡️ Running secret scanning...",
@@ -399,15 +399,17 @@ TOOL_LABELS = {
     "manage-accounts":                   "⚙️ Managing accounts...",
 
     # ── Google Workspace ──────────────────────────────────────────────
-    "manage-workspace":                  "🏢 Managing workspace...",
-    "manage-scratchpad":                 "📝 Managing scratchpad...",
-    "queue-operations":                  "⏳ Managing queued operations...",
-    "manage-docs":                       "📄 Managing documents...",
-    "manage-drive":                      "📁 Managing Drive...",
-    "manage-email":                      "✉️ Managing email...",
-    "manage-meet":                       "🎥 Managing Meet...",
-    "manage-sheets":                     "📊 Managing spreadsheets...",
-    "manage-tasks":                      "✅ Managing tasks..."
+    "manage_workspace":                  "🏢 Managing workspace...",
+    "manage_scratchpad":                 "📝 Managing scratchpad...",
+    "queue_operations":                  "⏳ Managing queued operations...",
+    "manage_docs":                       "📄 Managing documents...",
+    "manage_drive":                      "📁 Managing Drive...",
+    "manage_email":                      "✉️ Managing email...",
+    "manage_meet":                       "🎥 Managing Meet...",
+    "manage_sheets":                     "📊 Managing spreadsheets...",
+    "manage_tasks":                      "✅ Managing tasks...",
+    "manage_accounts":                   "👥 Managing accounts",
+    "manage_calendar":                   "📅 Managing calendar"
 }
 
 
