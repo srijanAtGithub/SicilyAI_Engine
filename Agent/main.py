@@ -433,12 +433,26 @@ async def on_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_name = user.first_name
     text = update.message.text or context.user_data.pop("voice_text", "") or ""
 
-    # If an approval prompt is still showing its keyboard for this user and
-    # they chose to type instead of tapping, clear the stale buttons now —
-    # send() below will still correctly resume the interrupted graph with
-    # this free-text reply (that path is unchanged).
     session = _sessions.get(user_id)
-    if session and session.pending_approval_message_id:
+    is_pending_approval = session and session.pending_approval_message_id
+
+    # 1. Check for a reply
+    # 2. Ensure they typed actual text (not just an empty voice-to-text glitch)
+    # 3. Ensure we aren't waiting for a simple yes/no tool approval
+    if update.message and update.message.reply_to_message and text.strip() and not is_pending_approval:
+        
+        # Grab text (standard message) OR caption (image/file message)
+        replied_text = update.message.reply_to_message.text or update.message.reply_to_message.caption
+        
+        if replied_text:
+            text = (
+                f"[Context: The user is replying to this specific previous message of yours:\n"
+                f"\"{replied_text}\"]\n\n"
+                f"User's actual reply:\n{text}"
+            )
+
+    # Clear the keyboard if they were in an approval state
+    if is_pending_approval:
         await _clear_approval_keyboard(context.bot, update.effective_chat.id, session)
 
     await process_user_reply(user_id, user_name, update.effective_chat.id, text, context)
@@ -523,7 +537,7 @@ async def dispatch_recurring_task(task_id: str, task_text: str):
         return
 
     reply = result.get("reply") or result.get("interrupt")
-    
+
     if not reply or "<SILENT>" in reply:
         log.info("Recurring task completed silently (no actionable updates)", task_id=task_id)
         return
