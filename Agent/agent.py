@@ -73,7 +73,7 @@ async def initialize_agent():
     # ─────────────────────────────────────────────────────────
     # Nodes
     # ─────────────────────────────────────────────────────────
-    async def main_node(state: AgentState) -> AgentState:
+    async def main_node(state: AgentState, config: dict) -> AgentState:
         """
         PRIMARY AGENT NODE
         ------------------
@@ -152,6 +152,17 @@ async def initialize_agent():
         else:
             system_content = MAIN_LLM_SOUL
 
+        auto_approve = config.get("configurable", {}).get("auto_approve", False)
+        if auto_approve:
+            system_content += (
+                "\n\n---\n\n"
+                "**BACKGROUND TASK MODE:**\n"
+                "You are running as an automated background task. The user is not actively chatting with you.\n"
+                "If the user's prompt asks you to monitor for a specific condition (e.g., 'notify me IF there is an email about jobs'), "
+                "and that condition is NOT met, you MUST reply with exactly the word: <SILENT>\n"
+                "Do not explain that you checked. Do not say 'no new updates'. ONLY output <SILENT>."
+            )
+
         # Rebind with the new tools
         main_llm = configuration.get_main_llm(tools=relevant_tools)
         try:
@@ -174,23 +185,29 @@ async def initialize_agent():
         tool_obj  = tool_manager.tool_map.get(tool_name)
         tool_desc = tool_obj.description if tool_obj else "No description available"
 
-        # ── Safety classification ────────────────────────────────────────
-        # No prefix fast-path: every tool call goes through safety_llm so
-        # that user preferences (surfaced via the system prompt) are the
-        # sole authority on auto-execute vs. confirm. This costs one LLM
-        # round-trip per tool call, but guarantees no hardcoded rule can
-        # silently override what the user configured.
-        SAFETY_LLM_SOUL = get_system_message("safety_llm")
-        safety_result = await safety_llm.ainvoke([
-            SystemMessage(content=SAFETY_LLM_SOUL),
-            HumanMessage(content=(
-                f"Tool name: {tool_name}\n"
-                f"Tool description: {tool_desc}\n"
-                f"Args being passed: {tool_call['args']}\n\n"
-                "Is this safe to auto-execute without asking the user?"
-            ))
-        ])
-        is_safe = safety_result.is_safe
+        # Check if this thread was flagged for auto-approval
+        auto_approve = config.get("configurable", {}).get("auto_approve", False)
+
+        if auto_approve:
+            is_safe = True
+        else:
+            # ── Safety classification ────────────────────────────────────────
+            # No prefix fast-path: every tool call goes through safety_llm so
+            # that user preferences (surfaced via the system prompt) are the
+            # sole authority on auto-execute vs. confirm. This costs one LLM
+            # round-trip per tool call, but guarantees no hardcoded rule can
+            # silently override what the user configured.
+            SAFETY_LLM_SOUL = get_system_message("safety_llm")
+            safety_result = await safety_llm.ainvoke([
+                SystemMessage(content=SAFETY_LLM_SOUL),
+                HumanMessage(content=(
+                    f"Tool name: {tool_name}\n"
+                    f"Tool description: {tool_desc}\n"
+                    f"Args being passed: {tool_call['args']}\n\n"
+                    "Is this safe to auto-execute without asking the user?"
+                ))
+            ])
+            is_safe = safety_result.is_safe
 
         response.additional_kwargs["safe"] = is_safe
         return {"messages": [response]}
@@ -441,9 +458,14 @@ async def initialize_agent():
 
 
 # Send message
-async def send(message: str, thread_id: str, status_callback=None, cancel_check=None):
+async def send(message: str, thread_id: str, status_callback=None, cancel_check=None, auto_approve: bool = False):
 
-    config = {"configurable": {"thread_id": thread_id}}
+    config = {
+        "configurable": {
+            "thread_id": thread_id,
+            "auto_approve": auto_approve
+        }
+    }
     log.info("Thread started", thread_id=thread_id)
 
     if cancel_check and cancel_check():

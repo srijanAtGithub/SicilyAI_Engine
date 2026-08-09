@@ -517,14 +517,15 @@ async def dispatch_recurring_task(task_id: str, task_text: str):
     log.info("Recurring task dispatched", task_id=task_id, session_id=session_id)
 
     try:
-        result = await send(task_text, session_id)
+        result = await send(task_text, session_id, auto_approve=True)
     except Exception as e:
         log.exception("Recurring task agent error", task_id=task_id)
         return
 
     reply = result.get("reply") or result.get("interrupt")
-    if not reply:
-        log.warning("No reply from agent", task_id=task_id)
+    
+    if not reply or "<SILENT>" in reply:
+        log.info("Recurring task completed silently (no actionable updates)", task_id=task_id)
         return
 
     if active_chat_id is None:
