@@ -21,26 +21,44 @@ Extends cowork_tools.py with operations beyond read/write:
                                            search_file_contents can resolve
                                            on their own.
 
-Scope (intentional, for now)
------------------------------
-Everything here operates only on "readable" files: the extensions in
-ALLOWED_WRITE_EXTENSIONS plus the binary-but-parseable formats in
-_BINARY_EXTENSIONS (.pdf, .docx, .doc, .xlsx, .xls). Archives (.zip, .tar),
-APKs, images, and audio/video are explicitly out of scope for this batch —
-they need their own extraction/validation logic and are planned as a
-separate module. Operations here refuse on out-of-scope extensions with a
-clear message rather than silently mishandling them.
+Scope (intentional)
+--------------------
+Two different scopes apply within this module, gated by two different sets:
+
+  CONTENT tools (search_file_contents, preview_files_for_review) only work
+  on READABLE_EXTENSIONS — the extensions in ALLOWED_WRITE_EXTENSIONS plus
+  the binary-but-parseable formats in _BINARY_EXTENSIONS (.pdf, .docx, .doc,
+  .xlsx, .xls). There is no parser for images/video/audio/archives/APKs, so
+  these tools genuinely cannot do anything with them and correctly refuse.
+
+  MANAGEMENT tools (copy_file, move_file, rename_file, delete_file,
+  delete_directory) work on the broader MANAGEABLE_EXTENSIONS — READABLE_EXTENSIONS
+  plus MANAGEABLE_ONLY_EXTENSIONS (images, video, audio, archives/.zip/.tar,
+  APKs, and other common binaries). These ops are pure shutil/Path filesystem
+  calls that never open or interpret file content, so there's no technical
+  reason to block them on file type. delete_directory never had an extension
+  gate at all (it moves whole trees, mixed contents and all).
+
+In short: the agent can organize (copy/move/rename/delete) any file in the
+sandbox, but can only read/search the content of text + PDF/docx/xlsx.
+Operations refuse on genuinely out-of-scope extensions (e.g. an unrecognized
+proprietary format) with a clear message rather than silently mishandling
+them — extend MANAGEABLE_ONLY_EXTENSIONS if a new type should become
+manageable.
 
 IMPORTANT — this is a DIFFERENT (broader) scope than write_file/edit_file_lines
-in cowork_tools.py. Those tools exclude .pdf/.docx/.xlsx/.xls/.doc because
-overwriting binary content requires structured serialisation, not raw text I/O.
+in cowork_tools.py. Those tools exclude non-text formats entirely because
+overwriting content requires structured serialisation, not raw text I/O.
 That restriction does NOT apply here. copy_file, move_file, rename_file, and
 delete_file are pure filesystem operations (shutil.copy2/shutil.move) — they
-never open, parse, or rewrite the file's content, so binary format is
-irrelevant to them. If you're about to tell the user a .pdf/.docx/.xlsx/.xls/.doc
-file "can't be moved because it's binary" — that's a stale generalization from
-the write-tool restriction. It's wrong for the tools in this module. Just call
-the tool and trust its actual return value instead of pre-deciding it will fail.
+never open, parse, or rewrite the file's content, so file format is
+irrelevant to them, whether that's .pdf/.docx/.xlsx or .png/.zip/.mp4/.apk.
+If you're about to tell the user a file "can't be moved/copied/renamed/deleted
+because it's binary" or "because it's an image/video/archive" — that's wrong
+for the tools in this module. Just call the tool and trust its actual return
+value instead of pre-deciding it will fail. The one thing these tools still
+cannot do is show you what's INSIDE an image/video/audio/archive — that
+requires a parser this module doesn't have (see READABLE_EXTENSIONS above).
 
 Safety model (matches cowork_tools.py conventions)
 ----------------------------------------------------
@@ -72,11 +90,37 @@ from Cowork.cowork_tools import (
 
 
 # Combined "readable" universe for this module: anything we can write/edit
-# as text, plus anything we can extract text from (PDF/docx/xlsx). File
-# *management* ops (copy/move/delete) don't strictly need to parse content,
-# but gating them to this set keeps the system's scope honest while
-# archives/images/audio are still unimplemented — see module docstring.
+# as text, plus anything we can extract text from (PDF/docx/xlsx). This set
+# is consumed by the CONTENT tools in this module — search_file_contents and
+# preview_files_for_review — which genuinely cannot do anything with an
+# extension outside it, since there's no parser for it.
 READABLE_EXTENSIONS: frozenset[str] = ALLOWED_WRITE_EXTENSIONS | _BINARY_EXTENSIONS
+
+# Extensions with no content parser, but that pure filesystem ops (copy/move/
+# rename/delete) can still handle safely — those ops never open or interpret
+# the bytes, so parseability is irrelevant to them. Kept as a DELIBERATELY
+# SEPARATE set from READABLE_EXTENSIONS: merging it in would make
+# search_file_contents / preview_files_for_review think they can extract text
+# from a .zip or .mp4, which they can't. Extend this list, not
+# READABLE_EXTENSIONS, if a new binary type should become movable/copyable
+# without becoming "readable".
+MANAGEABLE_ONLY_EXTENSIONS: frozenset[str] = frozenset({
+    # Images
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".heic", ".ico",
+    # Video
+    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v",
+    # Audio
+    ".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac",
+    # Archives
+    ".zip", ".tar", ".gz", ".tgz", ".rar", ".7z", ".bz2",
+    # Packages / installers / misc binaries
+    ".apk", ".ipa", ".exe", ".dmg", ".msi", ".bin", ".iso",
+})
+
+# What copy_file / move_file / rename_file / delete_file are allowed to
+# touch. Union of the two sets above — everything content-readable, plus
+# everything that's only filesystem-manageable.
+MANAGEABLE_EXTENSIONS: frozenset[str] = READABLE_EXTENSIONS | MANAGEABLE_ONLY_EXTENSIONS
 
 TRASH_DIR_NAME = ".sicily-trash"
 
@@ -126,18 +170,18 @@ def copy_file(source: str, destination: str, overwrite: bool = False) -> str:
     Copy a file to a new location within the sandbox. The source is left
     untouched — this only duplicates it.
 
-    Works on PDF, DOCX, XLSX, XLS, and DOC files, not just plain text —
-    this copies raw bytes (shutil.copy2), it never parses or rewrites
-    content, so binary format is not a blocker. Only archives, images,
-    and audio/video are currently out of scope (see module docstring).
+    Works on ANY file this sandbox can manage — plain text, PDF/DOCX/XLSX,
+    and also images, video, audio, archives (.zip/.tar), and APKs. This
+    copies raw bytes (shutil.copy2); it never parses or interprets content,
+    so file type is never a blocker for this tool. (The agent cannot read
+    or extract text from an image/zip/video — only move it around. Don't
+    infer readability from copyability.)
 
     Safety guarantees
     ------------------
     - Both `source` and `destination` must resolve inside the sandbox.
     - Refuses to overwrite an existing file at `destination` unless
       `overwrite=True` is explicitly passed.
-    - Scoped to readable extensions only (text-based files + PDF/docx/xlsx).
-      Archives, images, and audio/video are not yet supported by this tool.
     - Parent directories of `destination` are created automatically.
 
     Args:
@@ -158,11 +202,10 @@ def copy_file(source: str, destination: str, overwrite: bool = False) -> str:
         return f"Source '{source}' is a directory. copy_file only handles files."
 
     ext = src.suffix.lower()
-    if ext not in READABLE_EXTENSIONS:
+    if ext not in MANAGEABLE_EXTENSIONS:
         return (
-            f"Refused: '{ext}' is outside the currently supported file set "
-            "(text-based files and PDF/docx/xlsx). Archives, images, and "
-            "audio/video are not yet supported."
+            f"Refused: '{ext}' is not currently a manageable file type in "
+            "this sandbox."
         )
 
     if dst.exists() and not overwrite:
@@ -189,19 +232,19 @@ def move_file(source: str, destination: str, overwrite: bool = False) -> str:
     sandbox. For renaming a file in place, prefer `rename_file` — same
     underlying operation, but the name better matches that intent.
 
-    Works on PDF, DOCX, XLSX, XLS, and DOC files, not just plain text —
-    this is a filesystem relocation, not a content rewrite, so binary
-    formats are fully supported. (Don't confuse this with write_file's
-    text-only restriction — that's a different tool with a different,
-    narrower scope. Call this tool on binary files directly rather than
-    assuming it will fail.)
+    Works on ANY manageable file type — plain text, PDF/DOCX/XLSX, and also
+    images, video, audio, archives, and APKs. This is a filesystem
+    relocation, not a content rewrite, so file type is never a blocker.
+    (Don't confuse this with write_file/edit_file_lines, which are
+    text-only for a different reason — they rewrite content. Call this
+    tool on binary or media files directly rather than assuming it will
+    fail.)
 
     Safety guarantees
     ------------------
     - Both `source` and `destination` must resolve inside the sandbox.
     - Refuses to overwrite an existing file at `destination` unless
       `overwrite=True` is explicitly passed.
-    - Scoped to readable extensions only, same as copy_file.
     - Parent directories of `destination` are created automatically.
 
     Args:
@@ -222,10 +265,10 @@ def move_file(source: str, destination: str, overwrite: bool = False) -> str:
         return f"Source '{source}' is a directory. Use delete_directory/copy logic for folders."
 
     ext = src.suffix.lower()
-    if ext not in READABLE_EXTENSIONS:
+    if ext not in MANAGEABLE_EXTENSIONS:
         return (
-            f"Refused: '{ext}' is outside the currently supported file set "
-            "(text-based files and PDF/docx/xlsx)."
+            f"Refused: '{ext}' is not currently a manageable file type in "
+            "this sandbox."
         )
 
     if dst.exists() and not overwrite:
@@ -255,11 +298,13 @@ def rename_file(path: str, new_name: str) -> str:
 
     Args:
         path:     Relative path to the existing file.
-        new_name: New filename ONLY (no slashes) — e.g. "final_report.md".
-                  Extension is optional — if omitted, the source file's
-                  current extension is kept (e.g. "test2" on "test.py"
-                  becomes "test2.py"). If provided, it must be one of the
-                  currently supported extensions.
+        new_name: New filename ONLY (no slashes) — e.g. "final_report.md"
+                  or "vacation_photo.jpg". Extension is optional — if
+                  omitted, the source file's current extension is kept
+                  (e.g. "test2" on "test.py" becomes "test2.py"). If
+                  provided, it must be a currently manageable extension
+                  (this includes images, video, audio, archives, and APKs
+                  — not just text/PDF/docx/xlsx).
     """
     if "/" in new_name or "\\" in new_name:
         return (
@@ -280,8 +325,8 @@ def rename_file(path: str, new_name: str) -> str:
     new_name_path = Path(new_name)
     if new_name_path.suffix:
         new_ext = new_name_path.suffix.lower()
-        if new_ext not in READABLE_EXTENSIONS:
-            return f"Refused: '{new_ext}' is outside the currently supported file set."
+        if new_ext not in MANAGEABLE_EXTENSIONS:
+            return f"Refused: '{new_ext}' is not currently a manageable file type."
         final_name = new_name
     else:
         # No extension given — most natural reading of "rename X to Y" is
@@ -320,6 +365,10 @@ def delete_file(path: str, dry_run: bool = True) -> str:
     into a hidden sandbox-local trash folder (.sicily-trash/), not unlinked.
     It can always be recovered by hand afterward.
 
+    Works on ANY manageable file type, including images, video, audio,
+    archives, and APKs — not just text/PDF/docx/xlsx. This is a filesystem
+    move (shutil.move into trash), never a content operation.
+
     Safety design (matches edit_file_lines)
     ----------------------------------------
     - dry_run=True (default): reports what WOULD happen, writes nothing.
@@ -341,10 +390,10 @@ def delete_file(path: str, dry_run: bool = True) -> str:
         return f"'{path}' is a directory. Use delete_directory instead."
 
     ext = target.suffix.lower()
-    if ext not in READABLE_EXTENSIONS:
+    if ext not in MANAGEABLE_EXTENSIONS:
         return (
-            f"Refused: '{ext}' is outside the currently supported file set. "
-            "Deletion of other file types is not yet supported by this tool."
+            f"Refused: '{ext}' is not currently a manageable file type in "
+            "this sandbox."
         )
 
     if dry_run:
