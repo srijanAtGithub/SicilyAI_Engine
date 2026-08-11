@@ -118,11 +118,11 @@ Every tool call goes through a three-gate safety pipeline before execution.
 
 <img src="Media/hitl_safety_pipeline.svg" alt="HITL Safety Pipeline" width="75%">
 
-**Gate 1 — Prefix fast-path:** Tools starting with `get_`, `search_`, `read_` are immediately marked safe. No LLM call needed.
+**Context 1 — Tool Description & Arguments:** The safety LLM receives the full tool specification alongside the specific runtime argument values being passed.
 
-**Gate 2 — Heuristic detection:** Tools starting with `update_`, `delete_`, `send_` are flagged as unsafe automatically.
+**Context 2 — Safety LLM System Prompt (Soul File):** The model is provided with its core behavioral guidelines, defining the precise criteria for identifying safe versus unsafe tool executions.
 
-**Gate 3 — LLM safety net:** Anything ambiguous gets evaluated by a dedicated safety LLM that reads the tool description and the arguments being passed.
+**Evaluation — Pre-Execution Safety Gate:** Leveraging both contexts, the safety LLM determines if the action is safe to execute automatically or unsafe, triggering a requirement for explicit user approval.
 
 If a tool is flagged unsafe, the LangGraph graph _pauses_ and asks you: approve, abort, or edit the arguments. Nothing happens until you decide. If a tool hallucinated by the model doesn't exist, the executor catches it cleanly and returns a `ToolMessage` saying "Tool not found" — no graph crashes, no cascading errors.
 
