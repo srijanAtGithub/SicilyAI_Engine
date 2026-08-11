@@ -824,7 +824,7 @@ FILEOPS_TOOL_STATUS_MAP = {
         f"under [white]'{args.get('path')}'[/white]"
     ),
     "search_file_contents": lambda args: (
-        f"Grepping for [white]'{args.get('pattern')}'[/white] "
+        f"Searching for [white]'{args.get('pattern')}'[/white] "
         f"under [white]'{args.get('path', '.')}'[/white]"
     ),
     "preview_files_for_review": lambda args: (

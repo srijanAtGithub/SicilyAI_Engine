@@ -108,6 +108,9 @@ def build_local_graph():
             - For unknown or potentially large files, inspect only the beginning first before reading the entire file.
             - Prefer targeted reads over loading large files into context.
             - Chain tool calls as needed to gather evidence.
+            - Take your time. If what you've found so far doesn't actually answer the
+              question, don't settle for it — look elsewhere, go deeper, or try a
+              different angle, the way a person would if their first search didn't turn up what they needed.
 
             ## Writing files
             - Any operation that changes the filesystem requires the user's approval unless they have already explicitly requested that exact change. 
