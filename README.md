@@ -68,7 +68,7 @@ Navigator is a Chrome extension that brings Sicily to any web page, backed by a 
 
 **Right-click writing tools:** select any text on any page and get Apple-like writing tools in the context menu — rewrite, summarise, or ask a question about the selection, right where you're reading.
 
-https://github.com/user-attachments/assets/97de426d-9e4c-41e9-82ce-99ffb57cc9f1
+https://github.com/user-attachments/assets/4dc44986-9425-4e4a-9964-d18135965dc4
 
 **Side panel:** A persistent panel with its own set of reading and research tools used for chatting, summarising, and organising as you browse — one-click page summaries, one-click tab organisation, and a "find more like this" for surfacing similar pages, plus a reading list to save pages for later.
 

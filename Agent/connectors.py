@@ -183,7 +183,6 @@ async def load_spotify_tools(tool_manager):
     await tool_manager.register(tools, "spotify")
 
 
-@requires_keys("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET")
 async def load_google_workspace_tools(tool_manager):
     """
     Google Workspace MCP (aaronsb) - Gmail, Calendar, Drive, Docs, Sheets, Tasks, Meet

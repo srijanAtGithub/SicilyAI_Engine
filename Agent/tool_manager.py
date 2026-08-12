@@ -289,7 +289,7 @@ class ToolManager:
     # coarser grain than individual tools, so the two stages can legitimately
     # disagree. This threshold lets stage 2 veto stage 1 rather than always
     # padding out to top_k regardless of fit.
-    MIN_TOOL_SIMILARITY = 0.35
+    MIN_TOOL_SIMILARITY = 0.30
 
     # ── Stage 2: Within-server tool filtering ────────────────
     async def get_tools_for_servers(

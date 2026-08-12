@@ -73,7 +73,9 @@ async def initialize_agent():
     # ─────────────────────────────────────────────────────────
     # Nodes
     # ─────────────────────────────────────────────────────────
-    async def main_node(state: AgentState, config: dict) -> AgentState:
+    async def main_node(state: AgentState, config: dict = None) -> AgentState:
+        config = config or {}
+
         """
         PRIMARY AGENT NODE
         ------------------
