@@ -97,7 +97,11 @@ def get_main_llm(tools=None):
 
 
 def get_cowork_llm(tools=None):
-    llm = ChatOpenAI(model="gpt-5.4-mini")
+    llm = ChatOpenAI(
+        model="gpt-5.6-luna",
+        use_responses_api=True,          # enables tools + reasoning together
+        reasoning_effort="max",          # default is medium
+    )
 
     if tools:
         return llm.bind_tools(tools, parallel_tool_calls=False)

@@ -22,6 +22,11 @@ MODEL_PRICING = {
         "cached_input": 0.020 / 1_000_000,
         "output": 1.25 / 1_000_000
     },
+    "gpt-5.6-luna": {
+        "input": 0.20 / 1_000_000,
+        "cached_input": 0.020 / 1_000_000,
+        "output": 1.20 / 1_000_000
+    },
     "gpt-5-nano": {
         "input": 0.05 / 1_000_000,
         "cached_input": 0.010 / 1_000_000,
