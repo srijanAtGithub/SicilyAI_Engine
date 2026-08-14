@@ -13,7 +13,7 @@ Usage
 # ── The switch ───────────────────────────────────────────────────────────────
 # Flip this by hand. True  = print tool/token debug lines.
 #                    False = production behaviour, nothing extra printed.
-DEBUG = True
+DEBUG = False
 
 _step = 0  # running counter so you can see call order across a whole turn
 
@@ -24,13 +24,16 @@ def reset_step_counter() -> None:
     _step = 0
 
 
-def log_tool_call(name: str) -> None:
-    """Log that a tool started running, with its position in the turn."""
+def log_tool_call(name: str, args: dict | None = None) -> None:
     if not DEBUG:
         return
     global _step
     _step += 1
-    print(f"[DEBUG] #{_step} tool_call  -> {name}")
+    safe_args = {
+        k: (v[:200] + "…" if isinstance(v, str) and len(v) > 200 else v)
+        for k, v in (args or {}).items()
+    }
+    print(f"[DEBUG] #{_step} tool_call  -> {name} args={safe_args}")
 
 
 def log_tool_tokens(name: str, tokens: int) -> None:

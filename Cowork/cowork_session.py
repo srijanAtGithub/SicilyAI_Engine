@@ -72,6 +72,22 @@ BANNER = """
 
 LOCAL_TOKEN_THRESHOLD = 7_000
 
+# Passed to maybe_summarize's additional_agent_specific_system_prompt so
+# Sicily investigations don't lose concrete evidence (exact file paths and
+# line numbers) to a paraphrased summary — this evidence is expensive to
+# re-derive (a fresh search_file_contents call) if it gets vaguened away.
+SICILY_SUMMARIZER_ADDENDUM = """
+    This conversation is a filesystem investigation. In addition to the
+    general summary rules above, preserve the following EXACTLY as found —
+    do not paraphrase, round, or approximate them:
+    - file paths
+    - line numbers (and line ranges) tied to a specific finding
+    - exact symbol/function/component names discovered during search
+
+    Prefer a short bulleted list of these concrete facts over flowing prose.
+    If the same fact reappears from multiple tool calls, keep it once.
+    """
+
 summarizer_llm = configuration.get_summarizer_llm()
 
 # ── Agent state ───────────────────────────────────────────────────────────────
@@ -122,6 +138,16 @@ def build_local_graph():
             - Never fabricate file contents or claim to have inspected something you haven't. 
             - If a tool reports an error, relay it honestly instead of guessing. 
             - Prefer the least invasive tool that can answer the user's question.
+
+            ## Response style
+            - Default to concise responses. Only go long-form when the user asks for
+              detail, or the answer genuinely requires it (e.g. multi-file changes).
+            - When you cite a location you found via a tool, state the line number(s)
+              exactly as returned — never hedge with "around", "approximately", "roughly",
+              or similar. Tool results already give you the real line number; use it as-is.
+              Only omit a line number entirely if you genuinely don't have one from evidence
+              (e.g. a file-level answer with no specific line) — don't invent an approximate
+              one to sound precise.
             """
 
         # NOTE: summarization is intentionally NOT done here. This node
@@ -268,6 +294,7 @@ async def run_local_session():
             summarizer_llm,
             token_threshold=LOCAL_TOKEN_THRESHOLD,
             show_log=False,
+            additional_agent_specific_system_prompt=SICILY_SUMMARIZER_ADDENDUM,
         )
 
         # Per-turn call config. recursion_limit counts graph super-steps
@@ -331,7 +358,7 @@ async def run_local_session():
                         tool_args = event.get("data", {}).get("input", {})
 
                         # DEBUG: which tool, in what order
-                        log_tool_call(tool_name)
+                        log_tool_call(tool_name, tool_args)
                         
                         # Format the payload for your helper function
                         tool_call = {"name": tool_name, "args": tool_args}
@@ -391,7 +418,11 @@ async def run_local_session():
             try:
                 no_tools_llm = configuration.get_cowork_llm(tools=[])
                 trimmed = await maybe_summarize(
-                    messages, summarizer_llm, token_threshold=LOCAL_TOKEN_THRESHOLD, show_log=False
+                    messages,
+                    summarizer_llm,
+                    token_threshold=LOCAL_TOKEN_THRESHOLD,
+                    show_log=False,
+                    additional_agent_specific_system_prompt=SICILY_SUMMARIZER_ADDENDUM,
                 )
                 final = await no_tools_llm.ainvoke(trimmed)
                 if hasattr(final, "usage_metadata") and final.usage_metadata:

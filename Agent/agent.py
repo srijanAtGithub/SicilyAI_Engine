@@ -716,7 +716,13 @@ def get_safe_fresh_messages(messages, keep_last=KEEP_LAST_MESSAGES):
     return fresh
 
 
-async def maybe_summarize(messages, summarizer_llm, token_threshold: int = TOKEN_THRESHOLD, show_log: bool = True):
+async def maybe_summarize(
+    messages,
+    summarizer_llm,
+    token_threshold: int = TOKEN_THRESHOLD,
+    show_log: bool = True,
+    additional_agent_specific_system_prompt: str | None = None,
+):
 
     token_count = count_tokens(messages)
 
@@ -749,19 +755,27 @@ async def maybe_summarize(messages, summarizer_llm, token_threshold: int = TOKEN
         for m in to_summarize
     )
 
-    summary = await summarizer_llm.ainvoke([
-        SystemMessage(content=(
-            """
-            Summarize the conversation briefly while preserving:
-            - important context
-            - user preferences
-            - tool results
-            - pending tasks
-            - decisions and constraints
+    base_summarizer_prompt = """
+        Summarize the conversation briefly while preserving:
+        - important context
+        - user preferences
+        - tool results
+        - pending tasks
+        - decisions and constraints
 
-            Avoid unnecessary details.
-            """
-        )),
+        Avoid unnecessary details.
+        """
+
+    summarizer_system_prompt = base_summarizer_prompt
+    if additional_agent_specific_system_prompt:
+        summarizer_system_prompt = (
+            base_summarizer_prompt
+            + "\n\n---\n\n"
+            + additional_agent_specific_system_prompt
+        )
+
+    summary = await summarizer_llm.ainvoke([
+        SystemMessage(content=summarizer_system_prompt),
         HumanMessage(content=history_text)
     ])
 

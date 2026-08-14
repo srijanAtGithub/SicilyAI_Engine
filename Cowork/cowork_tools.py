@@ -254,11 +254,22 @@ def read_file(path: str, head: int = 0, tail: int = 0) -> str:
     """
     Read the contents of any file and return it as plain text.
 
+    NOT THE DEFAULT FIRST MOVE. Before reaching for this tool, ask whether
+    search_file_contents or search_index would get you a line number instead —
+    if so, use that, then jump straight to read_file_lines around that line.
+    Blindly reading the head of a file you haven't searched yet is a common
+    source of wasted calls (you're guessing where the answer lives instead of
+    letting a search tell you).
+
     RECOMMENDED WORKFLOW:
-    - Start with `head=50` to understand the file's structure and size.
-    - When search_index (RAG) returns specific line numbers, prefer `read_file_lines`.
+    - If you don't yet know where in the file the answer is, search first
+      (search_file_contents / search_index) rather than reading head/tail blind.
+    - When a search returns specific line numbers, prefer `read_file_lines`
+      targeted at that range over reading here.
     - Use full read (`head=0, tail=0`) only for small-to-medium files or when you 
       genuinely need the entire content (e.g. small scripts, configs, short notes).
+    - `head=N` / `tail=N` are for genuinely unknown-structure files with no
+      search hit yet to anchor on — not a routine first step.
 
     Handles two categories transparently:
 
@@ -332,11 +343,22 @@ def read_file_lines(path: str, start_line: int, end_line: int) -> str:
     lines. This lets you work surgically on large files without pulling their
     full content into context.
 
+    DO NOT GUESS start_line/end_line. Only call this with a range you already
+    have evidence for — a line number from a search_file_contents match, a
+    symbol location from search_index, or a range you've already confirmed via
+    a prior read. Picking a speculative window (e.g. "it's probably somewhere
+    around line 400") to go fishing wastes a call on a guess; search for the
+    line first, then read exactly around it.
+
     Typical workflow
     ----------------
-    1. read_file(path, head=50)           — understand structure, find region
-    2. read_file_lines(path, N, M)        — confirm exact lines before editing
-    3. edit_file_lines(path, N, M, ...)   — make the surgical replacement
+    1. search_file_contents(pattern, ...)  — get a real line number as evidence
+    2. read_file_lines(path, N, M)         — read a small window around that
+                                              evidenced line, confirm exact lines
+    3. edit_file_lines(path, N, M, ...)    — make the surgical replacement
+
+    (Use read_file with head/tail only if you have no search hit at all yet
+    and need to understand an unfamiliar file's structure first.)
 
     Args:
         path:       Relative path to the file.
