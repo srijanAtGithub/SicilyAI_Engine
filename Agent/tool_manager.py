@@ -6,6 +6,8 @@ from langchain_core.tools import BaseTool
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
+from shared_utils import content_to_text
+
 import structlog
 log = structlog.get_logger()
 
@@ -59,8 +61,16 @@ class ToolManager:
         # than -3-small, at extra cost/latency that's negligible compared
         # to the LLM calls already happening per turn.
         self._embedder = OpenAIEmbeddings(model="text-embedding-3-large")
-        self._router   = ChatOpenAI(model="gpt-5.4-nano", temperature=0).with_structured_output(RouterOutput, include_raw=True)
-        self._describer  = ChatOpenAI(model="gpt-5.4-nano", temperature=0)
+        self._router   = ChatOpenAI(
+            model="gpt-5.6-luna",
+            use_responses_api=True,
+            reasoning_effort="medium",
+        ).with_structured_output(RouterOutput, include_raw=True)
+        self._describer = ChatOpenAI(
+            model="gpt-5.6-luna",
+            use_responses_api=True,
+            reasoning_effort="medium",
+        )
 
     # ── Registration ─────────────────────────────────────────
     async def register(self, tools: list[BaseTool], server: str, server_description: str | None = None):
@@ -155,7 +165,7 @@ class ToolManager:
                 try:
                     from usage_tracker import record_usage
                     usage_meta = result.usage_metadata
-                    model_name = getattr(result, "response_metadata", {}).get("model_name", "gpt-5.4-nano")
+                    model_name = getattr(result, "response_metadata", {}).get("model_name", "gpt-5.6-luna")
                     msg_id = getattr(result, "id", None)
                     record_usage(
                         dimension="agent",
@@ -171,7 +181,7 @@ class ToolManager:
 
             # Router returns ServerSelection, but we need raw text here
             # Use a separate simple LLM call for this
-            return result.content if hasattr(result, 'content') else str(result)
+            return content_to_text(result.content) if hasattr(result, 'content') else str(result)
         except Exception:
             # Fallback: join tool names
             return f"Service with tools: {', '.join(t.name for t in tools)}"
@@ -255,7 +265,7 @@ class ToolManager:
                 try:
                     from usage_tracker import record_usage
                     usage_meta = raw_msg.usage_metadata
-                    model_name = getattr(raw_msg, "response_metadata", {}).get("model_name", "gpt-5.4-nano")
+                    model_name = getattr(raw_msg, "response_metadata", {}).get("model_name", "gpt-5.6-luna")
                     msg_id = getattr(raw_msg, "id", None)
                     record_usage(
                         dimension="agent",

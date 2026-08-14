@@ -113,11 +113,21 @@ def get_cowork_llm(tools=None):
 
 
 def get_safety_llm(schema):
-    return ChatOpenAI(model="gpt-5.4-nano").with_structured_output(schema, include_raw=False)
+    llm = ChatOpenAI(
+        model="gpt-5.6-luna",
+        use_responses_api=True,
+        reasoning_effort="medium",
+    )
+    return llm.with_structured_output(schema, include_raw=False)
 
 
 def get_intent_llm(schema):
-    return ChatOpenAI(model="gpt-5.4-nano").with_structured_output(schema, include_raw=False)
+    llm = ChatOpenAI(
+        model="gpt-5.6-luna",
+        use_responses_api=True,
+        reasoning_effort="medium",
+    )
+    return llm.with_structured_output(schema, include_raw=False)
 
 
 def get_eval_llm():
