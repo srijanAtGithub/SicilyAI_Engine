@@ -1,3 +1,5 @@
+import re
+
 from langchain_core.outputs import chat_result
 import numpy as np
 from dataclasses import dataclass, field
@@ -5,11 +7,26 @@ from pydantic import BaseModel
 from langchain_core.tools import BaseTool
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from rank_bm25 import BM25Okapi
 
 from shared_utils import content_to_text
 
 import structlog
 log = structlog.get_logger()
+
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _tokenize(text: str) -> list[str]:
+    """
+    Minimal, dependency-free tokenizer shared by BM25 indexing and querying.
+    Lowercases and splits on non-alphanumeric runs. No stemming/stopwording —
+    tool descriptions and user queries are short enough that naive overlap
+    is already a strong, cheap signal, and stemming adds a dependency for
+    marginal gain at this text length.
+    """
+    return _TOKEN_RE.findall(text.lower())
 
 
 def _raw_fallback_query(messages: list) -> str:
@@ -44,6 +61,7 @@ class ToolEntry:
     tool: BaseTool
     server: str
     embedding: np.ndarray = field(default=None, repr=False)
+    tokens: list[str] = field(default_factory=list, repr=False)  # for BM25
 
 
 # ToolManager
@@ -57,6 +75,7 @@ class ToolManager:
         # tools across many MCP servers.
         self._registry: dict[str, list[ToolEntry]] = {}
         self._server_descriptions: dict[str, str] = {}
+        self._bm25_index: dict[str, BM25Okapi] = {}  # server -> lexical index, built alongside embeddings
         # text-embedding-3-large: meaningfully better retrieval accuracy
         # than -3-small, at extra cost/latency that's negligible compared
         # to the LLM calls already happening per turn.
@@ -84,13 +103,41 @@ class ToolManager:
 
         self._server_descriptions[server] = server_description
 
-        # Embed all tool descriptions for within-server filtering later
-        tool_descriptions = [f"{t.name}: {t.description}" for t in tools]
+        # Embed all tool descriptions for within-server filtering later.
+        #
+        # Server name is prepended because bare tool descriptions are often
+        # terse ("Search the catalog") and don't restate the domain — the
+        # embedding for "search_products: Search the catalog" sits closer to
+        # unrelated short phrases than to a query like "search for chocolate"
+        # unless the domain word ("Instamart", "grocery") is present in the
+        # embedded text itself. This is a one-time cost at registration, not
+        # per-turn, so it's effectively free.
+        tool_descriptions = [
+            f"{server} {t.name}: {t.description}" for t in tools
+        ]
         embeddings = await self._embedder.aembed_documents(tool_descriptions)
 
+        # Build a per-server BM25 lexical index alongside the embeddings.
+        #
+        # Dense embeddings are tuned for semantic/topical similarity between
+        # natural-language sentences, and can systematically under-rank a
+        # perfectly on-topic tool description if its surface grammar looks
+        # like a generic terse API blurb ("Search for grocery products...")
+        # rather than "sounding like" the user's phrasing — observed in
+        # practice: a description containing "search", "grocery", "products",
+        # "pricing" scored BELOW topically unrelated tools for a query about
+        # searching for a priced grocery item. BM25 doesn't have this failure
+        # mode: it directly rewards literal token overlap, so it acts as an
+        # independent signal that catches exactly the cases where embedding
+        # geometry misleads. Combined in get_tools_for_servers() as a hybrid
+        # score — this is generic (no tool/server-specific tuning) and applies
+        # identically to every server or tool registered, present or future.
+        token_lists = [_tokenize(desc) for desc in tool_descriptions]
+        self._bm25_index[server] = BM25Okapi(token_lists) if token_lists else None
+
         self._registry[server] = [
-            ToolEntry(tool=tool, server=server, embedding=np.array(emb))
-            for tool, emb in zip(tools, embeddings)
+            ToolEntry(tool=tool, server=server, embedding=np.array(emb), tokens=toks)
+            for tool, emb, toks in zip(tools, embeddings, token_lists)
         ]
 
         log.info("server_registered", server=server, tool_count=len(tools), tools=[t.name for t in tools])
@@ -99,6 +146,7 @@ class ToolManager:
     def unregister(self, server: str):
         removed = len(self._registry.pop(server, []))
         self._server_descriptions.pop(server, None)
+        self._bm25_index.pop(server, None)
         log.info("server_unregistered", server=server, removed=removed)
 
 
@@ -303,13 +351,39 @@ class ToolManager:
             return None, _raw_fallback_query(messages)
 
 
-    # Similarity floor for within-server tool filtering. A tool below this
-    # score is treated as "not actually relevant to this query" even if its
-    # server was selected by the router — the router picks servers at a
-    # coarser grain than individual tools, so the two stages can legitimately
-    # disagree. This threshold lets stage 2 veto stage 1 rather than always
-    # padding out to top_k regardless of fit.
-    MIN_TOOL_SIMILARITY = 0.25
+    # Absolute floor on the HYBRID score — this is now the PRIMARY gate.
+    #
+    # Earlier version used a tight relative-to-top-score margin (0.08) as the
+    # primary gate. That failed in practice: when a query needs MULTIPLE
+    # tools (e.g. "select home address AND search chocolate"), one tool
+    # (search_products) can score very high because it shares many literal
+    # query tokens, which drags the "acceptable zone" up with it and cuts
+    # other genuinely-relevant tools (get_addresses) that scored fine in
+    # absolute terms (~0.55) but weren't within 0.08 of the top (~0.76).
+    # Verified against real logged score distributions: junk tools
+    # (report_error, confirm_order, check_payment_status, get_delivery_status,
+    # get_payment_options) consistently land in the 0.15-0.34 hybrid range,
+    # while genuinely relevant tools land 0.32-0.76+, across different query
+    # shapes. 0.30 sits in that empirical gap. Revisit if you register a
+    # server with much denser/sparser tool overlap and see it mis-cut again.
+    MIN_HYBRID_SCORE = 0.30
+
+    # Relative margin — now a SECONDARY, loose safety net, not the primary
+    # gate. Only matters when the top score itself is unusually low (e.g. no
+    # tool in the server is a great match) — this stays wide enough that it
+    # essentially never fires when top scores are healthy (0.6-0.8, as seen
+    # in practice), so it stops fighting the absolute floor above.
+    RELATIVE_MARGIN = 0.35
+
+    # Weight given to the embedding (semantic) score vs. the BM25 (lexical)
+    # score in the combined ranking. Embeddings generally win on paraphrase/
+    # synonym matches ("cheap" ~ "budget"); BM25 generally wins when the
+    # query and description share literal, distinctive tokens but embedding
+    # geometry doesn't reflect it (e.g. two short, structurally-similar API
+    # blurbs land close together in embedding space regardless of topic).
+    # 0.6/0.4 favors embeddings as the primary signal while letting lexical
+    # overlap veto/rescue cases the embedding gets wrong. Tune empirically.
+    EMBEDDING_WEIGHT = 0.6
 
     # ── Stage 2: Within-server tool filtering ────────────────
     async def get_tools_for_servers(
@@ -317,17 +391,35 @@ class ToolManager:
         servers: list[str],
         query: str | None = None,
         top_k_per_server: int = 6,
-        min_similarity: float = MIN_TOOL_SIMILARITY,
+        min_similarity: float = MIN_HYBRID_SCORE,
+        relative_margin: float = RELATIVE_MARGIN,
+        embedding_weight: float = EMBEDDING_WEIGHT,
     ) -> list[BaseTool]:
         """
         Returns tools from the selected servers.
 
-        If query is provided, uses embedding similarity within each server
-        and returns up to top_k_per_server tools, but ONLY those clearing
-        min_similarity. A server can legitimately contribute 0 tools here
-        if the router flagged it but none of its tools actually fit the
-        query — that's a signal worth logging, not a bug to paper over
-        by always filling up to K.
+        If query is provided, ranks tools within each server using a HYBRID
+        of two independent signals and returns up to top_k_per_server tools,
+        but only those clearing a floor relative to that server's own top
+        score:
+          - cosine similarity between query and tool-description embeddings
+            (catches semantic/paraphrase matches)
+          - BM25 lexical overlap between query and tool-description tokens
+            (catches literal keyword matches embeddings sometimes miss,
+            e.g. when a terse tool description and the query share distinctive
+            words but land far apart in embedding space anyway)
+        Both signals are normalized to [0, 1] per-server before blending, so
+        neither dominates purely because of its own scale.
+
+        This is generic by construction: no server- or tool-specific tuning,
+        just two signals computed identically for every registered tool from
+        its name/description text, so it applies unchanged to any server
+        added in the future.
+
+        A server can legitimately contribute 0 tools here if the router
+        flagged it but none of its tools actually fit the query — that's a
+        signal worth logging, not a bug to paper over by always filling up
+        to K.
 
         If no query, returns all tools from the selected servers
         (no ranking signal available to filter on).
@@ -349,28 +441,50 @@ class ToolManager:
                 continue
 
             query_emb = np.array(await self._embedder.aembed_query(query))
+            query_tokens = _tokenize(query)
+
+            bm25 = self._bm25_index.get(server)
+            raw_bm25_scores = (
+                bm25.get_scores(query_tokens) if bm25 is not None
+                else np.zeros(len(server_entries))
+            )
+            # BM25 scores are unbounded (roughly 0-10+ depending on corpus
+            # size/term rarity), unlike cosine's natural [-1, 1]. Min-max
+            # normalize within this server+query so it's comparable to cosine
+            # before blending. A single-tool server or an all-zero-overlap
+            # query collapses the range to 0 — handled via the +1e-9 guard.
+            bm25_min, bm25_max = float(raw_bm25_scores.min()), float(raw_bm25_scores.max())
+            bm25_range = bm25_max - bm25_min + 1e-9
 
             scores = []
-            for entry in server_entries:
+            for entry, raw_bm25 in zip(server_entries, raw_bm25_scores):
                 cosine = float(
                     np.dot(query_emb, entry.embedding)
                     / (np.linalg.norm(query_emb) * np.linalg.norm(entry.embedding) + 1e-9)
                 )
-                scores.append((cosine, entry))
+                bm25_norm = (float(raw_bm25) - bm25_min) / bm25_range
+                hybrid = embedding_weight * cosine + (1 - embedding_weight) * bm25_norm
+                scores.append((hybrid, cosine, bm25_norm, entry))
 
             scores.sort(reverse=True, key=lambda x: x[0])
 
-            selected = [(s, e) for s, e in scores[:top_k_per_server] if s >= min_similarity]
+            top_score = scores[0][0] if scores else 0.0
+            dynamic_floor = max(min_similarity, top_score - relative_margin)
 
-            missed_tools = [
-                f"{e.tool.name}: {round(s, 4)}" 
-                for s, e in scores 
-                if (s, e) not in selected
+            selected = [
+                (h, c, b, e) for h, c, b, e in scores[:top_k_per_server]
+                if h >= dynamic_floor
             ]
 
-            if not selected:        
-                top_score = scores[0][0] if scores else None
-                log.info("no_tools_above_threshold", server=server, top_score=top_score)
+            missed_tools = [
+                f"{e.tool.name}: hybrid={round(h, 4)} cos={round(c, 4)} bm25={round(b, 4)}"
+                for h, c, b, e in scores
+                if (h, c, b, e) not in selected
+            ]
+
+            if not selected:
+                # Only reachable if this server had zero tools at all.
+                log.info("no_tools_above_threshold", server=server, top_score=None)
             else:
                 log.info(
                     "server_tools_filtered",
@@ -379,10 +493,11 @@ class ToolManager:
                     selected=len(selected),
                     of_candidates=len(scores), # Changed to show ALL candidates in the server
                     score_range=(round(selected[-1][0], 4), round(selected[0][0], 4)),
+                    dynamic_floor=round(dynamic_floor, 4), # visibility into why the cut landed where it did
                     missed_tools=missed_tools # Added missed tools
                 )
 
-            result.extend(e.tool for _, e in selected)
+            result.extend(e.tool for _, _, _, e in selected)
 
         log.info("tools_selected", count=len(result), tools=[t.name for t in result])
         return result

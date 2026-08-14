@@ -94,9 +94,9 @@ Most agents fall apart as you add more tools — the context window fills up, co
 
 <img src="Media/two_stage_tool_retrieval.svg" alt="Two-Stage Tool Retrieval" width="75%">
 
-**Stage 1 — Intent routing:** A cheap nano model reads the last few messages and decides which _services_ are relevant right now (e.g. only Swiggy, not Gmail). Everything else is ignored entirely.
+**Stage 1 — Intent routing + query rewrite:** A single LLM call reads the last few messages and decides which _services_ are relevant right now (e.g. only Swiggy, not Gmail) — everything else is ignored entirely. The same call also rewrites the user's current intent into one self-contained sentence, resolving pronouns and follow-ups ("reply to her", "do it again") into concrete terms. This rewrite, not the raw conversation, is what gets embedded in Stage 2 — it matches tool descriptions far better than a raw message thread full of conversational scaffolding.
 
-**Stage 2 — Semantic filtering:** Within each selected service, tool descriptions are compared to the query using cosine similarity. Only the most relevant tools per service are passed forward.
+**Stage 2 — Hybrid filtering:** Within each selected service, tool descriptions are ranked against the rewritten query using a blend of cosine similarity (semantic/paraphrase matches) and BM25 lexical overlap (literal keyword matches embeddings sometimes miss). Only tools clearing a minimum relevance floor are passed forward, up to a fixed cap per service.
 
 The result: the main LLM always sees a short, focused list of tools regardless of how many are registered. You can add so many more tools tomorrow from multiple servers and the model won't know or care about the ones that aren't relevant.
 
