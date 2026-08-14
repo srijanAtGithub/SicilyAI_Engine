@@ -1,6 +1,7 @@
 import { NotificationService } from "./notifications.js";
 import { appWrap } from "./ui.js";
 import { BACKEND_HOST } from "./api.js";
+import { isScriptableTab } from "./mentions.js";
 
 const quickActionsWrap = document.getElementById("quick-actions");
 const quickActionsBtn = document.getElementById("quick-actions-btn");
@@ -185,7 +186,121 @@ function handleQuickAction(action) {
 }
 
 qaItems.forEach((item) => {
+  // The font-size row and capability row aren't real "actions" — they host
+  // interactive controls with their own click handlers and must never fall
+  // through to handleQuickAction (that always closes the menu).
+  if (item.classList.contains("qa-font-size")) return;
+  if (item.classList.contains("qa-capability-row")) return;
   item.addEventListener("click", () => handleQuickAction(item.dataset.action));
+});
+
+// ── Chat Font Size Controller ───────────────────────────────────────
+// Scoped to chat bubbles ONLY: it just nudges the --chat-font-size CSS
+// variable on #messages, which .msg's font-size (in chat.css) reads
+// from. Nothing else in the UI references that variable.
+const CHAT_FONT_MIN = 11;
+const CHAT_FONT_MAX = 20;
+const CHAT_FONT_DEFAULT = 14;
+const CHAT_FONT_STEP = 1;
+const CHAT_FONT_STORAGE_KEY = "chatFontSize";
+
+const messagesElForFont = document.getElementById("messages");
+const qaFontMinusBtn = document.getElementById("qa-font-minus");
+const qaFontPlusBtn = document.getElementById("qa-font-plus");
+const qaFontValueEl = document.getElementById("qa-font-value");
+
+let chatFontSize = CHAT_FONT_DEFAULT;
+
+function applyChatFontSize(size) {
+  chatFontSize = Math.min(CHAT_FONT_MAX, Math.max(CHAT_FONT_MIN, size));
+  if (messagesElForFont) {
+    messagesElForFont.style.setProperty("--chat-font-size", `${chatFontSize}px`);
+  }
+  if (qaFontValueEl) {
+    qaFontValueEl.textContent = `${chatFontSize}px`;
+  }
+  if (qaFontMinusBtn) qaFontMinusBtn.disabled = chatFontSize <= CHAT_FONT_MIN;
+  if (qaFontPlusBtn) qaFontPlusBtn.disabled = chatFontSize >= CHAT_FONT_MAX;
+}
+
+function persistChatFontSize(size) {
+  try {
+    chrome.storage?.local?.set({ [CHAT_FONT_STORAGE_KEY]: size });
+  } catch (err) {
+    console.error("Failed to persist chat font size:", err);
+  }
+}
+
+// Restore the saved preference on load (falls back to default silently
+// if chrome.storage isn't available or nothing's been saved yet).
+try {
+  chrome.storage?.local?.get([CHAT_FONT_STORAGE_KEY], (result) => {
+    const saved = result?.[CHAT_FONT_STORAGE_KEY];
+    applyChatFontSize(typeof saved === "number" ? saved : CHAT_FONT_DEFAULT);
+  });
+} catch (err) {
+  applyChatFontSize(CHAT_FONT_DEFAULT);
+}
+
+// Critical: stopPropagation on these clicks. The document-level click
+// listener above closes Quick Actions on any click outside the menu,
+// and even inside the menu a bare click would otherwise be free to
+// bubble into logic that closes it. These buttons are meant to be
+// clicked repeatedly while the menu stays open, so every interaction
+// here is fully contained.
+qaFontMinusBtn?.addEventListener("click", (e) => {
+  e.stopPropagation();
+  applyChatFontSize(chatFontSize - CHAT_FONT_STEP);
+  persistChatFontSize(chatFontSize);
+});
+
+qaFontPlusBtn?.addEventListener("click", (e) => {
+  e.stopPropagation();
+  applyChatFontSize(chatFontSize + CHAT_FONT_STEP);
+  persistChatFontSize(chatFontSize);
+});
+
+// ── Chat Capability Selector ─────────────────────────────────────────
+// Two pills (Basic / Smart) in the quick-actions menu that
+// let the user choose which LLM backs the chat. Stored here and read
+// by main.js via the exported getter so it can be included in every
+// WebSocket payload.
+export let currentCapability = "basic";
+
+const CAPABILITY_STORAGE_KEY = "chatCapability";
+
+export function setCapability(cap) {
+  currentCapability = cap;
+  // Update active pill
+  document.querySelectorAll(".qa-cap-pill").forEach(pill => {
+    pill.classList.toggle("active", pill.dataset.cap === cap);
+  });
+  // Persist choice
+  try {
+    chrome.storage?.local?.set({ [CAPABILITY_STORAGE_KEY]: cap });
+  } catch (err) {
+    console.error("Failed to persist capability:", err);
+  }
+}
+
+// Restore saved capability on load
+try {
+  chrome.storage?.local?.get([CAPABILITY_STORAGE_KEY], (result) => {
+    const saved = result?.[CAPABILITY_STORAGE_KEY];
+    if (saved && ["basic", "smart"].includes(saved)) {
+      setCapability(saved);
+    }
+  });
+} catch (err) {
+  // Silently fall back to "basic" default
+}
+
+// Wire up the pill buttons — stopPropagation keeps the menu open
+document.querySelectorAll(".qa-cap-pill").forEach(pill => {
+  pill.addEventListener("click", (e) => {
+    e.stopPropagation();
+    setCapability(pill.dataset.cap);
+  });
 });
 
 function setDragHoverState(targetZone) {
@@ -417,6 +532,17 @@ async function startSummarisePage() {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab) throw new Error("No active tab found.");
 
+    // 1b. Bail early with a clear message for pages Chrome will never let
+    // us script into (chrome://, chrome-extension://, the Web Store, etc.)
+    // — same check @-mention uses, so behaviour stays consistent across
+    // the extension rather than falling through to a generic network-style
+    // error that wrongly implies the backend is down.
+    if (!isScriptableTab(tab)) {
+      NotificationService.show("This page can't be summarised — browser security blocks reading it.");
+      appWrap.classList.remove("busy");
+      return;
+    }
+
     // 2. Pre-LLM Extraction Layer (Domestic Chores)
     const injectionResult = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
@@ -566,6 +692,15 @@ async function startFindMoreLikeThis({ append = false } = {}) {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab) throw new Error("No active tab found.");
+
+    // Same "can we even read this page" guard as Summarise Page — bail
+    // early with a clear message instead of letting executeScript throw
+    // and having that read as a backend/network failure.
+    if (!isScriptableTab(tab)) {
+      NotificationService.show("This page can't be analysed — browser security blocks reading it.");
+      appWrap.classList.remove("busy");
+      return;
+    }
 
     // Same extraction step as Summarise Page — strip boilerplate tags,
     // cap length so the fingerprinting call stays cheap.

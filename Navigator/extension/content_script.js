@@ -477,9 +477,9 @@
           border: 1px solid rgba(255, 255, 255, 0.18); /* Subtle edge definition */
           
           /* Glassmorphism Effect */
-          backdrop-filter: blur(30px); 
-          -webkit-backdrop-filter: blur(30px); /* Safari support */
-          background: rgba(25, 25, 26, 0.35); /* Premium Dark Mode Gray */
+          backdrop-filter: blur(20px); 
+          -webkit-backdrop-filter: blur(20px); /* Safari support */
+          background: rgba(25, 25, 26, 0.65); /* Premium Dark Mode Gray */
           
           /* The "Shader" / Glowing Border Effect */
           box-shadow: 
@@ -660,10 +660,13 @@
           box-sizing: border-box;
           line-height: 1.5;
           overflow-y: auto;
+          scrollbar-width: none; /* Firefox */
+          -ms-overflow-style: none; /* old Edge/IE */
           
           /* Added smooth ease-out for a gradual glow transition */
           transition: border-color 0.25s ease-out, box-shadow 0.25s ease-out, opacity 0.3s ease;
         }
+        textarea::-webkit-scrollbar { display: none; } /* Chrome/Safari */
 
         textarea:focus { 
           /* Ultra-fine pink boundary line */
@@ -785,12 +788,10 @@
           word-wrap: break-word;
           margin-bottom: 16px;
           padding-right: 8px;
+          scrollbar-width: none; /* Firefox */
+          -ms-overflow-style: none; /* old Edge/IE */
         }
-        /* SLEEK APPLE-LIKE SCROLLBAR */
-        .result-text::-webkit-scrollbar { width: 7px; }
-        .result-text::-webkit-scrollbar-track { background: transparent; }
-        .result-text::-webkit-scrollbar-thumb { background: rgba(120, 120, 128, 0.4); border-radius: 4px; }
-        .result-text::-webkit-scrollbar-thumb:hover { background: rgba(120, 120, 128, 0.6); }
+        .result-text::-webkit-scrollbar { display: none; } /* Chrome/Safari */
 
         .actions {
           display: flex;
@@ -811,6 +812,49 @@
         .submit-btn:active:not(:disabled), .btn:active { transform: scale(0.96); }
         .submit-btn:disabled { opacity: 0.4; cursor: not-allowed; }
         .btn-success { background: #34c759 !important; border-color: transparent !important; }
+
+        /* --- Follow-up row (result view) --- */
+        .followup-row {
+          display: flex;
+          gap: 8px;
+          align-items: flex-end;
+          margin-top: 12px;
+          padding-top: 12px;
+          border-top: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        .followup-input {
+          flex: 1;
+          height: 36px;
+          min-height: 36px;
+          max-height: 120px;
+          padding: 8px 12px;
+          border-radius: 10px;
+          border: 1px solid rgba(255, 255, 255, 0.04);
+          background: rgba(10, 10, 12, 0.45);
+          color: #f2f2f7;
+          font-size: 13.5px;
+          outline: none;
+          resize: none;
+          font-family: inherit;
+          box-sizing: border-box;
+          line-height: 1.5;
+          overflow-y: auto;
+          scrollbar-width: none; /* Firefox */
+          -ms-overflow-style: none; /* old Edge/IE */
+          transition: border-color 0.25s ease-out, box-shadow 0.25s ease-out;
+        }
+        .followup-input::-webkit-scrollbar { display: none; } /* Chrome/Safari */
+        .followup-input:focus {
+          border-color: rgba(249, 81, 165, 0.3);
+          box-shadow: 0 0 14px rgba(255, 105, 180, 0.25);
+        }
+        .btn-followup {
+          background: rgba(255, 255, 255, 0.06);
+          color: #f2f2f7;
+          flex-shrink: 0;
+        }
+        .btn-followup:hover:not(:disabled) { background: rgba(255, 255, 255, 0.12); }
+        .wrap.busy .followup-row { opacity: 0.4; pointer-events: none; }
       </style>
 
       <div class="wrap">
@@ -841,6 +885,10 @@
               <button class="btn btn-copy">Copy</button>
               <button class="btn btn-replace">Replace</button>
             </div>
+            <div class="followup-row">
+              <textarea class="followup-input" placeholder="Ask a follow-up..." rows="1"></textarea>
+              <button class="submit-btn btn-followup">Send</button>
+            </div>
           </div>
         </div>
       </div>
@@ -853,7 +901,7 @@
     const wrapEl = shadow.querySelector(".wrap");
     const inputView = shadow.querySelector(".input-view");
     const resultView = shadow.querySelector(".result-view");
-    const input = shadow.querySelector("textarea");
+    const input = shadow.querySelector(".input-view textarea");
     const actionBtns = shadow.querySelector(".action-btns");
     const askBtn = shadow.querySelector(".btn-ask");
     const editBtn = shadow.querySelector(".btn-edit");
@@ -864,8 +912,26 @@
     const resultText = shadow.querySelector(".result-text");
     const replaceBtn = shadow.querySelector(".btn-replace");
     const copyBtn = shadow.querySelector(".btn-copy");
+    const followupInput = shadow.querySelector(".followup-input");
+    const followupBtn = shadow.querySelector(".btn-followup");
 
     let pendingAiText = "";
+
+    // Turn history for THIS open box only. Lives entirely in this
+    // closure — created fresh every time openEditBox() runs, and gone
+    // the instant the box closes (host.remove() in closeActiveBox()
+    // releases this whole scope). Never written anywhere, never reused
+    // across selections or reloads. This is what lets the user ask a
+    // follow-up ("shorter", "more formal", "no actually undo that")
+    // without the model losing context, while keeping the feature
+    // exactly as stateless as before at the box-lifetime boundary.
+    const conversationHistory = [];
+
+    // The action_type of the very first submission in this box. Follow-
+    // ups keep using this so the system persona (ask/edit/rewrite/
+    // summarise) stays consistent for the life of the box rather than
+    // flip-flopping turn to turn.
+    let initialActionType = null;
 
     // Helper for live bounds of target element
     function getFreshRect() {
@@ -945,6 +1011,8 @@
       askBtn.disabled = isBusy;
       editBtn.disabled = isBusy;
       input.disabled = isBusy;
+      followupBtn.disabled = isBusy;
+      followupInput.disabled = isBusy;
 
       // Toggle neural glow/border shaders
       if (isBusy) {
@@ -982,10 +1050,16 @@
           replaceBtn.style.display = ""; // Restores the default button layout for regular edits
         }
       });
+
+      // Let the user immediately keep the conversation going without an
+      // extra click — this is the whole point of not dead-ending here.
+      followupInput.focus();
     }
 
-    function submit(actionType) {
-      let instruction = input.value.trim();
+    function submit(actionType, instructionOverride) {
+      let instruction = instructionOverride !== undefined
+        ? instructionOverride.trim()
+        : input.value.trim();
 
       // Allow 'summarise' and 'rewrite' to proceed even if the text box is empty
       if (!instruction) {
@@ -994,7 +1068,7 @@
         } else if (actionType === "rewrite") {
           instruction = "Rewrite this professionally.";
         } else {
-          // If it's 'ask' or 'edit', we still strictly require user input
+          // If it's 'ask'/'edit'/a follow-up, we still strictly require user input
           return;
         }
       }
@@ -1008,7 +1082,8 @@
           selected_text: context.text,
           instruction,
           action_type: actionType,
-          surrounding_context: context.pageContext || ""
+          surrounding_context: context.pageContext || "",
+          history: conversationHistory
         },
         (response) => {
           setBusy(false);
@@ -1022,6 +1097,23 @@
             return;
           }
 
+          // Record this turn so a follow-up (still within this same
+          // open box) has the context. Nothing here survives the box
+          // closing — see conversationHistory's declaration above.
+          if (initialActionType === null) initialActionType = actionType;
+
+          conversationHistory.push({ role: "user", text: instruction });
+          conversationHistory.push({ role: "ai", text: response.edited_text });
+
+          if (instructionOverride !== undefined) {
+            followupInput.value = "";
+            followupInput.style.height = "auto";
+          } else {
+            input.value = "";
+            input.style.height = "auto";
+            actionBtns.classList.remove("has-text");
+          }
+
           showPreviewMode(response.edited_text, actionType);
         }
       );
@@ -1031,6 +1123,32 @@
     editBtn.addEventListener("click", () => submit("edit"));
     summariseBtn.addEventListener("click", () => submit("summarise"));
     rewriteBtn.addEventListener("click", () => submit("rewrite"));
+
+    // Follow-up flow: reuses whatever action_type started this box (the
+    // system persona doesn't change mid-conversation), just supplies a
+    // new instruction each time. History (built up above) is what gives
+    // the model the thread to follow.
+    function submitFollowup() {
+      followupBtn.disabled || submit(initialActionType || "ask", followupInput.value);
+    }
+
+    followupBtn.addEventListener("click", submitFollowup);
+
+    followupInput.addEventListener("input", () => {
+      followupInput.style.height = "auto";
+      followupInput.style.height = `${Math.min(followupInput.scrollHeight, 120)}px`;
+    });
+
+    followupInput.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        submitFollowup();
+      }
+      if (e.key === "Escape") closeActiveBox();
+    });
+    followupInput.addEventListener("keyup", (e) => e.stopPropagation());
+    followupInput.addEventListener("keypress", (e) => e.stopPropagation());
 
     // Smooth auto-grow mechanic and state toggle for the buttons
     input.addEventListener("input", () => {

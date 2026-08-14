@@ -3,18 +3,24 @@ from telegram import Update, BotCommand
 from telegram.ext import CommandHandler, MessageHandler, filters, ContextTypes
 
 from Agent.agent import tool_manager
-from Agent.connectors import CONNECTORS, get_connector_servers, is_connector_loaded
+from Agent.connectors import (
+    CONNECTORS,
+    get_connector_servers,
+    is_connector_loaded,
+    mark_connector_connected,
+    mark_connector_disconnected,
+)
 
 
 # TELEGRAM COMMANDS EXECUTORS
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import main
+    import Agent.main
 
-    main.active_chat_id = update.effective_chat.id
+    Agent.main.active_chat_id = update.effective_chat.id
 
-    if not main.CHAT_ID_FILE.exists():
-        main.CHAT_ID_FILE.write_text(json.dumps({"chat_id": main.active_chat_id}))
-        print(f"💾 Registered chat_id: {main.active_chat_id} for user {update.effective_user.first_name}")
+    if not Agent.main.CHAT_ID_FILE.exists():
+        Agent.main.CHAT_ID_FILE.write_text(json.dumps({"chat_id": Agent.main.active_chat_id}))
+        print(f"💾 Registered chat_id: {Agent.main.active_chat_id} for user {update.effective_user.first_name}")
         await update.message.reply_text(
             "👋 Hi! I'm Sicily. You're all set up.."
         )
@@ -27,10 +33,10 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Cancel whatever is currently processing for this user.
     No reply to the user — just stop everything silently.
     """
-    import main
+    import Agent.main
 
     user_id = str(update.effective_user.id)
-    session = main._sessions.get(user_id)
+    session = Agent.main._sessions.get(user_id)
  
     if session is None or not session.is_processing:
         # Nothing running — silently do nothing.
@@ -53,16 +59,31 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import main 
-    
+    import Agent.main
+    from Agent.session_store import load_session
+
     user_id = str(update.effective_user.id)
-    session = main._sessions.get(user_id)
+
+    # Prefer the live in-memory session (has is_processing state)
+    session = Agent.main._sessions.get(user_id)
     if session:
         await update.message.reply_text(
             f"🧵 Session ID: {session.session_id[:8]}...\n"
-            f"🕒 Started: {main.format_time(session.started_at)}\n"
-            f"💬 Last msg: {main.format_time(session.last_interaction_at)}\n"
+            f"🕒 Started: {Agent.main.format_time(session.started_at)}\n"
+            f"💬 Last msg: {Agent.main.format_time(session.last_interaction_at)}\n"
             f"⚙️  Processing: {'Yes' if session.is_processing else 'No'}"
+        )
+        return
+
+    # Fall back to the persisted DB record (e.g. after a restart, or before
+    # the first regular message of this boot has been processed)
+    persisted = await load_session(user_id)
+    if persisted:
+        await update.message.reply_text(
+            f"🧵 Session ID: {persisted.session_id[:8]}...\n"
+            f"🕒 Started: {Agent.main.format_time(persisted.started_at)}\n"
+            f"💬 Last msg: {Agent.main.format_time(persisted.last_interaction_at)}\n"
+            f"⚙️  Processing: No"
         )
     else:
         await update.message.reply_text("No active session.")
@@ -156,14 +177,38 @@ async def loaded_connectors_command(update: Update, context: ContextTypes.DEFAUL
 
 
 async def _handle_connect(update: Update, name: str):
+    import os
+
     loaded = tool_manager.loaded_servers
     if is_connector_loaded(name, loaded):
         await update.message.reply_text(f"⚠️ {name.title()} is already connected.")
         return
 
+    # Grab the actual loader function from the registry
+    loader_func = CONNECTORS[name]
+    
+    # Dynamically read the required keys (defaults to [] if no decorator was used)
+    required_keys = getattr(loader_func, "required_keys", [])
+    
+    missing_keys = [
+        key for key in required_keys 
+        if not os.getenv(key) or "your_" in os.getenv(key).lower()
+    ]
+
+    if missing_keys:
+        keys_str = ", ".join(missing_keys)
+        await update.message.reply_text(
+            f"⚠️ Cannot connect to {name.title()}.\n\n"
+            f"Please add your `{keys_str}` to your `settings.json` file first.\n"
+            "You can open your configuration folder by running `sicily config` in your terminal."
+        )
+        return
+
+    # Proceed with connection
     await update.message.reply_text(f"⏳ Connecting {name.title()}...")
     try:
-        await CONNECTORS[name](tool_manager)
+        await loader_func(tool_manager)
+        mark_connector_connected(name)
         await update.message.reply_text(f"✅ {name.title()} connected successfully!")
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to connect {name.title()}:\n{str(e)}")
@@ -177,6 +222,7 @@ async def _handle_disconnect(update: Update, name: str):
 
     for server in get_connector_servers(name):
         tool_manager.unregister(server)
+    mark_connector_disconnected(name)  # so it's NOT auto-reconnected on next boot
     await update.message.reply_text(f"🗑️ {name.title()} disconnected.")
 
 

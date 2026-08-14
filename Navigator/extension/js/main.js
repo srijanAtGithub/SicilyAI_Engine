@@ -1,7 +1,7 @@
 import { NotificationService } from "./notifications.js";
 import { addMessage, clearMessagesUI, addContextTrail, setSending, sendBtn, appWrap, showEmptyState } from "./ui.js";
 import { socket, getActiveTabInfo, loadHistory, deleteSessionOnBackend, connectSocket, closeSocket, resolveSessionKey, carrySessionToUrl, startNewSessionForUrl, pinSessionKeyToUrl, fetchAllSessions, BACKEND_HOST } from "./api.js";
-import { attachedContexts, clearAttachedContexts } from "./features.js";
+import { attachedContexts, clearAttachedContexts, currentCapability } from "./features.js";
 import {
   getMentionedTabSnippets, hasMentionedTab, clearMentionedTab, isMentionDropdownOpen,
   hasMentionedCollection, getMentionedCollectionIds, clearMentionedCollection,
@@ -12,6 +12,45 @@ const inputEl = document.getElementById("input-box");
 const clearBtn = document.getElementById("new-chat-btn");
 let currentTab = { id: null, url: "", title: "" };
 let currentSessionKey = null;
+
+// Purges the in-memory temporary session on the backend
+async function clearTempSessionOnBackend(tempKey) {
+  if (!tempKey) return;
+  try {
+    await fetch(`http://${BACKEND_HOST}/temp_session/${tempKey}`, { method: "DELETE" });
+  } catch (err) {
+    console.error("Failed to delete temp session from backend:", err);
+  }
+}
+
+async function updateActiveChatTitle() {
+  const titleEl = document.getElementById("active-chat-title");
+  if (!titleEl) return;
+
+  // Clear the title entirely if in incognito mode
+  if (typeof isTempMode !== 'undefined' && isTempMode) {
+    titleEl.textContent = "";
+    return;
+  }
+
+  try {
+    const sessions = await fetchAllSessions();
+    const current = sessions.find(s => s.session_key === currentSessionKey);
+    
+    if (current && current.preview) {
+      titleEl.textContent = current.preview;
+    } else {
+      titleEl.textContent = "New Conversation";
+    }
+  } catch (err) {
+    console.error("Failed to update chat title:", err);
+  }
+}
+
+window.addEventListener("chat-turn-complete", () => {
+  // Give the backend a second to finish generating and saving the title to SQLite
+  setTimeout(updateActiveChatTitle, 1500); 
+});
 
 async function sendMessage() {
   const text = inputEl.value.trim();
@@ -79,7 +118,8 @@ async function sendMessage() {
     text: text,
     page_url: fresh.url,
     page_title: fresh.title,
-    context_snippets: payloadSnippets
+    context_snippets: payloadSnippets,
+    capability: currentCapability
   };
 
   socket.send(JSON.stringify(payload));
@@ -95,7 +135,19 @@ async function sendMessage() {
 // socket. The old conversation is untouched and stays reachable from
 // the Chats panel — including from any other URL that had been carried
 // along with it via navigation.
-async function handleClear() {
+async function handleClear(showNotification = true) {
+  if (typeof isTempMode !== 'undefined' && isTempMode) {
+    isTempMode = false;
+    document.getElementById("incognito-btn").classList.remove("active");
+    document.getElementById("empty-state")?.classList.remove("temp-mode");
+
+    if (currentTab && currentTab.id) {
+      const tempKey = `temp_${currentTab.id}`;
+      chrome.storage.session.remove(tempKey);
+      await clearTempSessionOnBackend(tempKey); // Wipes backend memory
+    }
+  }
+
   closeSocket();
   clearMessagesUI();
   showEmptyState();
@@ -107,7 +159,11 @@ async function handleClear() {
   connectSocket(currentSessionKey);
   inputEl.focus();
 
-  NotificationService.show("New conversation started.");
+  updateActiveChatTitle()
+
+  if (showNotification) {
+    NotificationService.show("New conversation started.");
+  }
 }
 
 // ── Chats Panel ───────────────────────────────────────────────────────
@@ -190,6 +246,10 @@ async function populateChatsPanel() {
       // Stop this from bubbling up to the row's own click handler
       // (which would otherwise switch to the session we're deleting).
       e.stopPropagation();
+
+      const confirmed = window.confirm("Delete this conversation? This can't be undone.");
+      if (!confirmed) return;
+
       deleteBtn.disabled = true;
 
       // If deleting the active session, close our socket BEFORE the
@@ -245,6 +305,18 @@ async function switchToSession(sessionKey) {
 
   if (sessionKey === currentSessionKey) return;
 
+  if (typeof isTempMode !== 'undefined' && isTempMode) {
+    isTempMode = false;
+    document.getElementById("incognito-btn").classList.remove("active");
+    document.getElementById("empty-state")?.classList.remove("temp-mode");
+
+    if (currentTab && currentTab.id) {
+      const tempKey = `temp_${currentTab.id}`;
+      chrome.storage.session.remove(tempKey);
+      await clearTempSessionOnBackend(tempKey); // Wipes backend memory
+    }
+  }
+
   // Tear down old session
   closeSocket();
   clearMessagesUI();
@@ -252,8 +324,7 @@ async function switchToSession(sessionKey) {
   // Set new session
   currentSessionKey = sessionKey;
 
-  // Remember that this URL now resolves to this session, so it (and any
-  // tab that visits it) resumes here from now on, until browser restart.
+  // Remember that this URL now resolves to this session
   await pinSessionKeyToUrl(currentTab.url, sessionKey);
 
   // Load history for the new session
@@ -273,6 +344,8 @@ async function switchToSession(sessionKey) {
   // Reconnect socket to the new session
   connectSocket(sessionKey);
   inputEl.focus();
+
+  updateActiveChatTitle()
 
   NotificationService.show("Switched conversation.");
 }
@@ -353,6 +426,8 @@ async function loadSessionForUrl(url) {
     addMessage(m.text, m.role === "user" ? "user" : "ai");
   }
 
+  updateActiveChatTitle()
+
   connectSocket(currentSessionKey);
 }
 
@@ -396,11 +471,85 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     return;
   }
 
-  // Resolves to whatever conversation this URL currently maps to in this
-  // browser session (shared across any tab that's visited it, including
-  // one carried forward from navigation) — or mints a fresh one if
-  // there's no live mapping (first visit this browser session, or the
-  // browser has restarted since). See api.js for the full rules.
-  await loadSessionForUrl(currentTab.url);
+  // Check if this specific tab was already toggled into temp mode
+  const storageKey = `temp_${currentTab.id}`;
+  const tempState = await chrome.storage.session.get(storageKey);
+
+  if (tempState[storageKey]) {
+    isTempMode = true;
+    incognitoBtn.classList.add("active");
+    incognitoBtn.title = "Exit Temporary Chat Mode";
+    document.getElementById("empty-state")?.classList.add("temp-mode");
+
+    currentSessionKey = storageKey;
+
+    closeSocket();
+    clearMessagesUI();
+
+    const history = await loadHistory(currentSessionKey);
+
+    if (history.length === 0) {
+      showEmptyState();
+      autoMentionActiveTab(currentTab);
+    }
+
+    for (const m of history) {
+      if (m.role === "user" && Array.isArray(m.context_snippets) && m.context_snippets.length) {
+        addContextTrail(m.context_snippets);
+      }
+      addMessage(m.text, m.role === "user" ? "user" : "ai");
+    }
+
+    connectSocket(currentSessionKey);
+  } else {
+    // Resolves to whatever conversation this URL currently maps to in this
+    // browser session...
+    await loadSessionForUrl(currentTab.url);
+  }
+
   inputEl.focus();
 })();
+
+const incognitoBtn = document.getElementById("incognito-btn");
+let isTempMode = false;
+
+incognitoBtn.addEventListener("click", async () => {
+  isTempMode = !isTempMode;
+  const storageKey = `temp_${currentTab.id}`;
+
+  if (isTempMode) {
+    // Flag this tab as being in temp mode across panel closes
+    await chrome.storage.session.set({ [storageKey]: true });
+
+    incognitoBtn.classList.add("active");
+    incognitoBtn.title = "Exit Temporary Chat Mode";
+
+    closeSocket();
+    clearMessagesUI();
+    showEmptyState();
+    document.getElementById("empty-state")?.classList.add("temp-mode");
+
+    // Tie the temporary session strictly to this Tab ID
+    currentSessionKey = storageKey;
+
+    connectSocket(currentSessionKey);
+    inputEl.focus();
+
+    // instantly wipe the title
+    updateActiveChatTitle();
+  } else {
+    // Remove the temp flag for this tab and wipe backend memory
+    await chrome.storage.session.remove(storageKey);
+    await clearTempSessionOnBackend(storageKey);
+
+    incognitoBtn.classList.remove("active");
+    incognitoBtn.title = "Temporary Chat Mode";
+    document.getElementById("empty-state")?.classList.remove("temp-mode");
+
+    // Revert to a clean standard session
+    await handleClear(false);
+
+    // restore the standard title
+    updateActiveChatTitle();
+  }
+});

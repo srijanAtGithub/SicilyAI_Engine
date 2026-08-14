@@ -32,16 +32,24 @@ Opens `~/.sicily/` in your file manager. Fill in `settings.json` with your API k
 
 ```json
 {
-  "OPENAI_API_KEY": "sk-...",
-  "TELEGRAM_BOT_TOKEN": "...",
-  "TAVILY_API_KEY": "...",
-  "GITHUB_TOKEN": "..."
+    "OPENAI_API_KEY": "",
+    "TELEGRAM_BOT_TOKEN": "",
+    "TAVILY_API_KEY": "",
+    "GITHUB_TOKEN": "",
+    "NOTION_TOKEN": "",
+    "SPOTIFY_CLIENT_ID": "",
+    "SPOTIFY_CLIENT_SECRET": "",
+    "SPOTIFY_REDIRECT_URI": "",
+    "TELEGRAM_API_ID": "",
+    "TELEGRAM_API_HASH": "",
+    "TELEGRAM_SESSION_STRING": ""
 }
 ```
 
-- `TELEGRAM_BOT_TOKEN` and `GITHUB_TOKEN` are only required for `sicily run` (Agent mode).
-- `TAVILY_API_KEY` is required for `sicily run` (Agent mode) and for `sicily navigator --start` (Navigator's backend).
-- For local file sessions (`sicily start`, Cowork mode), only `OPENAI_API_KEY` is needed.
+- All tokens are required to use the Agent mode:
+  - `TELEGRAM_BOT_TOKEN` is the token of the telegram bot
+  - Rest of the tokens are used for the respective connectors
+- For Sicily Cowork and Sicily Navigator, only `OPENAI_API_KEY` is needed.
 
 ---
 

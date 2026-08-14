@@ -20,10 +20,11 @@ Design:
     with LLM configuration/ToolManagers in the future[cite: 3].
 
 Run:
-  uv run uvicorn Navigator.navigator_bridge:app --reload --port 8765[cite: 3]
+  uv run uvicorn Navigator.navigator_bridge:app --reload --port 8765
 """
 
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, BaseMessage
+from shared_utils import content_to_text
 
 import configuration
 configuration.load_config()
@@ -178,6 +179,10 @@ async def set_reading_list_item_read(item_id: int, req: SetReadRequest):
 graph = build_navigator_graph()
 
 
+# Ephemeral memory for temporary sessions
+temp_sessions: dict[str, list[BaseMessage]] = {}
+
+
 # Persistent, tab-scoped conversation history. Replaces the old
 # in-memory SessionStore — same get/set/clear/__len__ shape, but backed
 # by SQLite under ~/.sicily/Navigator/ChatsData/chats.db, so history
@@ -225,6 +230,22 @@ async def get_session(tab_id: str):
     and @-mentioned tab content all reappear exactly as they looked
     when the turn was sent, not just the message text.
     """
+
+    # incognito chats
+    if tab_id.startswith("temp_"):
+        if tab_id not in temp_sessions:
+            return {"messages": []}
+        
+        formatted_messages = []
+        for msg in temp_sessions[tab_id]:
+            if isinstance(msg, HumanMessage):
+                snippets = msg.additional_kwargs.get("context_snippets", [])
+                formatted_messages.append({"role": "user", "text": str(msg.content), "context_snippets": snippets})
+            elif isinstance(msg, AIMessage):
+                formatted_messages.append({"role": "ai", "text": content_to_text(msg.content), "context_snippets": []})
+                
+        return {"messages": formatted_messages}
+
     return {"messages": sessions.get_full(tab_id)}
 
 
@@ -241,10 +262,23 @@ async def delete_session(tab_id: str):
     return {"status": "cleared", "existed": existed}
 
 
+@app.delete("/temp_session/{tab_id}")
+async def delete_temp_session(tab_id: str):
+    """Called explicitly by the background script when a browser tab closes."""
+    if tab_id in temp_sessions:
+        del temp_sessions[tab_id]
+    return {"status": "cleared"}
+
+
 @app.websocket("/ws/{tab_id}")
 async def websocket_endpoint(websocket: WebSocket, tab_id: str):
     await websocket.accept()
     log.info("Extension connected", tab_id=tab_id)
+
+    # Check if this is an incognito session
+    is_temp = tab_id.startswith("temp_")
+    if is_temp and tab_id not in temp_sessions:
+        temp_sessions[tab_id] = []
 
     try:
         while True:
@@ -253,6 +287,7 @@ async def websocket_endpoint(websocket: WebSocket, tab_id: str):
             user_text = (payload.get("text") or "").strip()
             page_url = payload.get("page_url") or ""
             page_title = payload.get("page_title") or ""
+            capability = payload.get("capability") or "basic"
             
             context_snippets = payload.get("context_snippets") or []
 
@@ -262,15 +297,18 @@ async def websocket_endpoint(websocket: WebSocket, tab_id: str):
                 await websocket.send_json({"reply": "(empty message ignored)"})
                 continue
 
-            # Feed in this tab's history so far, not just the new message —
-            # this is what makes the graph's state class actually mean
-            # something instead of being a fresh single-turn call every time.
-            history = sessions.get(tab_id)
+            # Pull history from memory if temp, otherwise from the DB
+            if is_temp:
+                history = temp_sessions[tab_id]
+            else:
+                history = sessions.get(tab_id)
+
             result = await graph.ainvoke({
                 "messages": history + [HumanMessage(content=user_text)],
                 "page_url": page_url,
                 "page_title": page_title,
                 "context_snippets": context_snippets, # 2. Forward the snippets into LangGraph state!
+                "capability": capability,
             })
 
             # Track token usage from the returned message state
@@ -301,35 +339,74 @@ async def websocket_endpoint(websocket: WebSocket, tab_id: str):
             reply_text = "(no response)"
             for msg in reversed(result["messages"]):
                 if isinstance(msg, AIMessage) and msg.content:
-                    reply_text = msg.content
+                    reply_text = content_to_text(msg.content)
                     break
 
-            # Persist just this turn (the new human message + the new AI
-            # reply), along with whatever context_snippets rode alongside
-            # the human message — not the whole rebuilt `result["messages"]`
-            # array, since `history` already contains everything before
-            # this turn and is itself sourced from ChatStore on the next
-            # call. This is what makes the "Ctrl+Shift+T reopen the same
-            # tab" and "backend restarted" cases both come back exactly as
-            # they were: the row-level context_snippets travel with the
-            # user's message, not just its text.
-            sessions.append_turn(
-                tab_id=tab_id,
-                user_text=user_text,
-                ai_text=reply_text,
-                context_snippets=context_snippets,
-            )
+            # Save to memory OR database depending on the session type
+            if is_temp:
+                # We store context_snippets in additional_kwargs so the GET /session endpoint can restore them
+                temp_sessions[tab_id].append(HumanMessage(
+                    content=user_text, 
+                    additional_kwargs={"context_snippets": context_snippets}
+                ))
+                temp_sessions[tab_id].append(AIMessage(content=reply_text))
+            else:
+                sessions.append_turn(
+                    tab_id=tab_id,
+                    user_text=user_text,
+                    ai_text=reply_text,
+                    context_snippets=context_snippets,
+                )
+            
+                # Title generation is now safely nested inside the standard (non-temp) block
+                if not history:
+                    import asyncio
+                    async def generate_and_save_title():
+                        try:
+                            llm = configuration.navigator_basic_llm()
+                            prompt = (
+                                "Generate a chat title based on this first interaction. "
+                                "Keep the name very short and concise. Just a few words. "
+                                "Do not use quotes or prefixes. Just the title.\n\n"
+                                f"User: {user_text}\n\nAI: {reply_text}"
+                            )
+                            title_msg = await llm.ainvoke(prompt)
+                            title = content_to_text(title_msg.content).strip(' "')
+                            sessions.set_title(tab_id, title)
+                            
+                            # Record token usage for title generation
+                            try:
+                                from usage_tracker import record_usage
+                                if hasattr(title_msg, "usage_metadata") and title_msg.usage_metadata:
+                                    usage_meta = title_msg.usage_metadata
+                                    model_name = title_msg.response_metadata.get("model_name", "unknown")
+                                    msg_id = getattr(title_msg, "id", None)
+                                    
+                                    record_usage(
+                                        dimension="navigator",
+                                        session_id=tab_id,
+                                        model_name=model_name,
+                                        input_tokens=usage_meta.get("input_tokens", 0),
+                                        output_tokens=usage_meta.get("output_tokens", 0),
+                                        cached_input_tokens=usage_meta.get("input_token_details", {}).get("cache_read_tokens", 0),
+                                        message_id=msg_id
+                                    )
+                            except Exception as rec_err:
+                                log.warning("record_usage failed for navigator title gen", error=str(rec_err))
+                        except Exception as e:
+                            log.warning("Failed to generate chat title", error=str(e))
+                    
+                    asyncio.create_task(generate_and_save_title())
 
             await websocket.send_json({"reply": reply_text})
 
     except WebSocketDisconnect:
         # The popup closing disconnects this socket, but the tab itself is
         # very likely still open — so we deliberately do NOT clear the
-        # session here. Only DELETE /session/{tab_id} clears it, and only
-        # in response to the user's explicit "Clear chat" action —
-        # background.js no longer clears on tab close (see note on
-        # delete_session above).
+        # session here (even for temp sessions, which are now wiped by 
+        # background.js tracking the actual browser tab closure).
         log.info("Extension disconnected", tab_id=tab_id)
+
     except Exception as e:
         log.exception("Bridge error", tab_id=tab_id)
         try:

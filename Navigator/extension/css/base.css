@@ -19,8 +19,8 @@ body {
     border: 1px solid rgba(255, 255, 255, 0.18);
 
     /* Glassmorphism Effect */
-    backdrop-filter: blur(30px);
-    -webkit-backdrop-filter: blur(30px);
+    backdrop-filter: blur(40px);
+    -webkit-backdrop-filter: blur(40px);
     background: rgba(10, 10, 10, 0.95);
     /* Dark base for side panel */
 
@@ -92,63 +92,79 @@ body {
     display: flex;
     align-items: center;
     width: 100%;
-    gap: 10px;
+    gap: 8px;
 }
 
+/* --- Shared Modern Button Base (New, Chats, Incognito, Quick Actions) --- */
+#new-chat-btn,
+#chats-btn,
+#incognito-btn,
+#quick-actions-btn {
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border-radius: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.08);
+    color: transparent;
+    font-size: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    backdrop-filter: blur(30px);
+    -webkit-backdrop-filter: blur(30px);
+}
 
+/* Ensure #new-chat-btn stays on the right side */
 #new-chat-btn {
-    padding: 5px 10px;
-    border-radius: 8px;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    background: rgba(255, 255, 255, 0.06);
-    color: #f2f2f7;
-    font-size: 11.5px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.15s, transform 0.1s;
-    backdrop-filter: blur(20px);
     margin-left: auto;
-    display: flex;
-    align-items: center;
-    gap: 5px;
 }
 
-#new-chat-btn svg {
+/* Base SVG styling for all header buttons */
+#new-chat-btn svg,
+#chats-btn svg,
+#incognito-btn svg,
+#quick-actions-btn svg {
+    width: 16px;
+    height: 16px;
     flex-shrink: 0;
-    opacity: 0.9;
-}
-
-#new-chat-btn:hover {
-    background: rgba(255, 255, 255, 0.28);
-}
-
-#new-chat-btn:active {
-    transform: scale(0.96);
-}
-
-/* --- Chats Button --- */
-#chats-btn {
-    padding: 5px 10px;
-    border-radius: 8px;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    background: rgba(255, 255, 255, 0.06);
+    opacity: 0.85;
     color: #f2f2f7;
-    font-size: 11.5px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.15s, transform 0.1s;
-    backdrop-filter: blur(20px);
-    display: flex;
-    align-items: center;
-    gap: 5px;
+    transition: transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
-#chats-btn:hover {
-    background: rgba(255, 255, 255, 0.28);
+/* Hover States */
+#new-chat-btn:hover,
+#chats-btn:hover,
+#incognito-btn:hover,
+#quick-actions-btn:hover {
+    background: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.15);
+    transform: translateY(-1px);
 }
 
-#chats-btn:active {
-    transform: scale(0.96);
+/* Active (Click) States */
+#new-chat-btn:active,
+#chats-btn:active,
+#incognito-btn:active,
+#quick-actions-btn:active {
+    transform: scale(0.92);
+    background: rgba(255, 255, 255, 0.08);
+}
+
+/* Enhanced Incognito State */
+#incognito-btn.active {
+    background: rgba(255, 69, 58, 0.15);
+    border-color: rgba(255, 69, 58, 0.4);
+    box-shadow: 0 0 12px rgba(255, 69, 58, 0.2);
+}
+
+#incognito-btn.active svg {
+    opacity: 1;
+    color: #ff453a;
+    fill: #ff453a;
 }
 
 /* --- Quick Actions --- */
@@ -156,39 +172,12 @@ body {
     position: relative;
 }
 
-#quick-actions-btn {
-    padding: 5px 10px;
-    border-radius: 8px;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    background: rgba(255, 255, 255, 0.06);
-    color: #f2f2f7;
-    font-size: 11.5px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.15s, transform 0.1s;
-    backdrop-filter: blur(20px);
-    display: flex;
-    align-items: center;
-    gap: 5px;
-}
-
-#quick-actions-btn svg {
-    width: 10px;
-    height: 10px;
-    transition: transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1);
-}
-
 #quick-actions.open #quick-actions-btn svg {
     transform: rotate(180deg);
 }
 
-#quick-actions-btn:hover,
 #quick-actions.open #quick-actions-btn {
     background: rgba(255, 255, 255, 0.28);
-}
-
-#quick-actions-btn:active {
-    transform: scale(0.96);
 }
 
 #quick-actions-bridge {
@@ -208,9 +197,9 @@ body {
     min-width: 190px;
 
     /* FIXED: Glassmorphism settings matching content_script.js */
-    background: rgba(25, 25, 26, 0.35);
-    backdrop-filter: blur(30px);
-    -webkit-backdrop-filter: blur(30px);
+    background: rgba(20, 20, 22, 0.85);
+    backdrop-filter: blur(40px);
+    -webkit-backdrop-filter: blur(40px);
 
     border: 1px solid rgba(255, 255, 255, 0.12);
     border-radius: 14px;
@@ -290,6 +279,10 @@ body {
     animation-delay: 0.19s;
 }
 
+#quick-actions.open .qa-item:nth-child(8) {
+    animation-delay: 0.23s;
+}
+
 @keyframes qaItemIn {
     from {
         opacity: 0;
@@ -333,6 +326,121 @@ body {
     margin: 4px 4px;
 }
 
+/* --- Font Size Controller (6th quick action row) --- */
+.qa-item.qa-font-size {
+    cursor: default;
+}
+
+.qa-item.qa-font-size:hover {
+    background: transparent;
+    padding-left: 10px;
+}
+
+.qa-item.qa-font-size:active {
+    transform: none;
+    background: transparent;
+}
+
+.qa-font-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.06);
+    color: #f2f2f7;
+    cursor: pointer;
+    padding: 0;
+    flex-shrink: 0;
+    transition: background 0.15s ease, transform 0.1s ease;
+}
+
+.qa-font-btn svg {
+    width: 10px;
+    height: 10px;
+}
+
+.qa-font-btn:hover {
+    background: rgba(255, 255, 255, 0.22);
+}
+
+.qa-font-btn:active {
+    transform: scale(0.92);
+    background: rgba(255, 255, 255, 0.3);
+}
+
+.qa-font-btn:disabled {
+    opacity: 0.35;
+    cursor: default;
+    pointer-events: none;
+}
+
+.qa-font-value {
+    font-size: 11.5px;
+    font-weight: 600;
+    color: #f2f2f7;
+    min-width: 32px;
+    text-align: center;
+    flex-shrink: 0;
+    user-select: none;
+}
+
+/* --- Capability Selector Row --- */
+.qa-item.qa-capability-row {
+    cursor: default;
+    align-items: center;
+}
+
+.qa-item.qa-capability-row:hover {
+    background: transparent;
+    padding-left: 10px;
+}
+
+.qa-item.qa-capability-row:active {
+    transform: none;
+    background: transparent;
+}
+
+.qa-capability-pills {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.qa-cap-pill {
+    padding: 5px 16px;
+    border-radius: 20px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.05);
+    color: rgba(242, 242, 247, 0.55);
+    font-size: 12.5px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+    white-space: nowrap;
+    user-select: none;
+    flex-shrink: 0;
+}
+
+.qa-cap-pill:hover {
+    background: rgba(255, 255, 255, 0.14);
+    color: #f2f2f7;
+    border-color: rgba(255, 255, 255, 0.2);
+}
+
+.qa-cap-pill.active {
+    background: rgba(40, 110, 230, 0.18);
+    border-color: rgb(37, 113, 255);
+    color: #dbe1e6;
+    box-shadow: 0 0 8px rgba(230, 168, 40, 0.2);
+}
+
+.qa-cap-pill:active {
+    transform: scale(0.93);
+}
+
 /* Scanning scanline for busy state (Matches content_script.js) */
 .wrap::before {
     content: '';
@@ -359,4 +467,69 @@ body {
     100% {
         transform: translateY(100%);
     }
+}
+
+/* Invisible overlay to prevent interactions while waiting for a response */
+.wrap.busy::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: 9999;
+    background: transparent;
+    pointer-events: auto;
+}
+
+/* --- Temporary Chat Mode notice (shown in empty state) --- */
+.es-temp-notice {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    margin: 0 auto;
+    padding: 6px 14px;
+    border-radius: 20px;
+    background: rgba(255, 69, 58, 0.12);
+    border: 1px solid rgba(255, 69, 58, 0.3);
+    color: #ff8a80;
+    font-size: 12.5px;
+    font-weight: 600;
+    text-align: center;
+    width: fit-content;
+}
+
+/* Re-align empty state container to top-center when in temp mode */
+#empty-state.temp-mode {
+    justify-content: flex-start;
+    align-items: center;
+    padding-top: 16px;
+}
+
+#empty-state.temp-mode .es-temp-notice {
+    display: flex;
+}
+
+/* Hide "Ready when you are", subtitle, and chips during Incognito mode */
+#empty-state.temp-mode .es-title,
+#empty-state.temp-mode .es-subtitle,
+#empty-state.temp-mode .es-suggestions {
+    display: none;
+}
+
+.active-chat-title {
+    flex: 1;
+    /* Takes up remaining space between the left and right buttons */
+    margin: 0 12px;
+    font-size: 13px;
+    font-weight: 500;
+    color: #a1a1aa;
+    /* Muted text color, adjust if needed */
+    text-align: left;
+
+    /* Prevent wrapping */
+    white-space: nowrap;
+    overflow: hidden;
+
+    /* The standard right-side fade effect for long text */
+    -webkit-mask-image: linear-gradient(to right, rgba(0, 0, 0, 1) 80%, rgba(0, 0, 0, 0) 100%);
+    mask-image: linear-gradient(to right, rgba(0, 0, 0, 1) 80%, rgba(0, 0, 0, 0) 100%);
 }

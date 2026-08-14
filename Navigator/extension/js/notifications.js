@@ -1,5 +1,7 @@
 export const NotificationService = {
   container: null,
+  activeToast: null,
+  hideTimeout: null,
   initContainer() {
     if (this.container) return;
     const appWrap = document.getElementById("app-wrap") || document.body;
@@ -9,25 +11,36 @@ export const NotificationService = {
   },
   show(message, duration = 3000) {
     this.initContainer();
-    const toast = document.createElement("div");
-    toast.className = "glass-notification";
+    clearTimeout(this.hideTimeout);
+
+    // Reuse the single active toast if one's already showing/animating out,
+    // instead of stacking a new one on top of it.
+    let toast = this.activeToast;
+    if (!toast || !toast.isConnected) {
+      toast = document.createElement("div");
+      toast.className = "glass-notification";
+      toast.style.cursor = "pointer";
+      toast.addEventListener("click", () => {
+        clearTimeout(this.hideTimeout);
+        this.dismiss(toast);
+      });
+      this.container.appendChild(toast);
+      this.activeToast = toast;
+      toast.offsetHeight;
+    }
+
     toast.textContent = message;
-    this.container.appendChild(toast);
-    toast.offsetHeight;
     toast.classList.add("show");
-    const hideTimeout = setTimeout(() => {
-      toast.classList.remove("show");
-      toast.addEventListener("transitionend", () => {
-        toast.remove();
-      });
+
+    this.hideTimeout = setTimeout(() => {
+      this.dismiss(toast);
     }, duration);
-    toast.style.cursor = "pointer";
-    toast.addEventListener("click", () => {
-      clearTimeout(hideTimeout);
-      toast.classList.remove("show");
-      toast.addEventListener("transitionend", () => {
-        toast.remove();
-      });
-    });
+  },
+  dismiss(toast) {
+    toast.classList.remove("show");
+    toast.addEventListener("transitionend", () => {
+      toast.remove();
+      if (this.activeToast === toast) this.activeToast = null;
+    }, { once: true });
   }
 };

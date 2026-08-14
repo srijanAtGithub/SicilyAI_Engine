@@ -94,3 +94,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // as the browser stays open. Deleting ChatStore rows only ever happens
 // via the panel's explicit per-conversation delete in the Chats list,
 // or Collections/Reading List's own delete actions.
+
+// However, for Temporary/Incognito chats, the memory IS strictly bound 
+// to the tab. We catch the tab closing here to wipe the backend memory.
+chrome.tabs.onRemoved.addListener((tabId) => {
+  fetch(`http://${BACKEND_HOST}/temp_session/temp_${tabId}`, { method: "DELETE" })
+    .catch(() => { }); // silently ignore if backend is unreachable
+});

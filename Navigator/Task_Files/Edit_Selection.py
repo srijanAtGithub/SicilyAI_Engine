@@ -1,7 +1,7 @@
 import uuid
 
 from pydantic import BaseModel, Field
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 import configuration
 configuration.load_config()
@@ -13,11 +13,26 @@ log = structlog.get_logger()
 
 
 # WRITING MAJOR TOOL - PYDANTIC SCHEMAS AND DATA MODELS
+
+# A single prior turn from THIS SAME edit box. The frontend keeps this
+# array in memory for as long as the floating box stays open and throws
+# it away the moment the box closes (Escape, outside click, or a
+# successful Replace) — nothing here is ever written to disk or to the
+# tab-chat's SQLite history. We accept it as plain role/text pairs
+# (mirroring the shape navigator_bridge.py already uses for the chat
+# feature) rather than LangChain message objects, since this is the
+# wire format and stays framework-agnostic on the JS side.
+class EditHistoryTurn(BaseModel):
+    role: str  # "user" or "ai"
+    text: str
+
+
 class EditSelectionRequest(BaseModel):
     selected_text: str
     instruction: str
     surrounding_context: str = ""
     action_type: str = "edit"  # New flag: "edit" or "ask"
+    history: list[EditHistoryTurn] = Field(default_factory=list)
 
 
 class EditSelectionResponse(BaseModel):
@@ -38,13 +53,20 @@ async def process_edit_selection(req: EditSelectionRequest) -> EditSelectionResp
         req.selected_text, 
         req.instruction, 
         req.action_type, 
-        req.surrounding_context
+        req.surrounding_context,
+        req.history,
     )
     return EditSelectionResponse(edited_text=edited)
 
 
-async def call_edit_model(selected_text: str, instruction: str, action_type: str = "edit", surrounding_context: str = "") -> str:
-    llm = configuration.navigator_general_llm(EditResult) 
+async def call_edit_model(
+    selected_text: str,
+    instruction: str,
+    action_type: str = "edit",
+    surrounding_context: str = "",
+    history: list[EditHistoryTurn] | None = None,
+) -> str:
+    llm = configuration.navigator_smart_llm(EditResult)
     
     # Branch the persona based on the button clicked
     if action_type == "ask":
@@ -92,29 +114,54 @@ async def call_edit_model(selected_text: str, instruction: str, action_type: str
             )
         )
     
-    prompt_text = f"Instruction: {instruction}\n\n"
-    
-    # If the selection exists perfectly inside the context, split it apart to remove overlap
-    if surrounding_context and selected_text in surrounding_context:
-        before, after = surrounding_context.split(selected_text, 1)
-        if before.strip():
-            prompt_text += f"--- CONTEXT BEFORE ---\n{before.strip()}\n\n"
-            
-        prompt_text += f"--- TEXT TO EDIT (REWRITE ONLY THIS) ---\n{selected_text}\n\n"
-        
-        if after.strip():
-            prompt_text += f"--- CONTEXT AFTER ---\n{after.strip()}\n"
-            
-    # Fallback if the string formatting doesn't perfectly match
-    elif surrounding_context:
-        prompt_text += f"--- BACKGROUND CONTEXT ---\n{surrounding_context.strip()}\n\n"
-        prompt_text += f"--- TEXT TO EDIT (REWRITE ONLY THIS) ---\n{selected_text}\n"
-        
+    history = history or []
+
+    if not history:
+        # First turn: give the model the full selected-text scaffolding,
+        # same as before.
+        prompt_text = f"Instruction: {instruction}\n\n"
+
+        # If the selection exists perfectly inside the context, split it apart to remove overlap
+        if surrounding_context and selected_text in surrounding_context:
+            before, after = surrounding_context.split(selected_text, 1)
+            if before.strip():
+                prompt_text += f"--- CONTEXT BEFORE ---\n{before.strip()}\n\n"
+
+            prompt_text += f"--- TEXT TO EDIT (REWRITE ONLY THIS) ---\n{selected_text}\n\n"
+
+            if after.strip():
+                prompt_text += f"--- CONTEXT AFTER ---\n{after.strip()}\n"
+
+        # Fallback if the string formatting doesn't perfectly match
+        elif surrounding_context:
+            prompt_text += f"--- BACKGROUND CONTEXT ---\n{surrounding_context.strip()}\n\n"
+            prompt_text += f"--- TEXT TO EDIT (REWRITE ONLY THIS) ---\n{selected_text}\n"
+
+        else:
+            prompt_text += f"--- TEXT TO EDIT (REWRITE ONLY THIS) ---\n{selected_text}\n"
+
+        prompt_text += f"--- SELECTED TEXT (ONLY REWRITE THIS) ---\n{selected_text}"
     else:
-        prompt_text += f"--- TEXT TO EDIT (REWRITE ONLY THIS) ---\n{selected_text}\n"
-    
-    prompt_text += f"--- SELECTED TEXT (ONLY REWRITE THIS) ---\n{selected_text}"
-        
+        # Follow-up turn within the same still-open box: the model
+        # already has the original text and the prior exchange in
+        # `history` below. Sending the full scaffolding again would just
+        # duplicate it and waste tokens — a plain instruction is enough.
+        prompt_text = instruction
+
+    # Replay this box's prior turns (if any) as real messages so the
+    # model has the actual conversation, not just a text blob. This list
+    # only ever contains turns from the CURRENT still-open box — the
+    # frontend never sends anything left over from a previous selection
+    # or a previous session.
+    history_messages: list[HumanMessage | AIMessage] = []
+    for turn in history:
+        if turn.role == "ai":
+            history_messages.append(AIMessage(content=turn.text))
+        else:
+            history_messages.append(HumanMessage(content=turn.text))
+
+    messages = [system_msg, *history_messages, HumanMessage(content=prompt_text)]
+
     from usage_tracker import record_usage 
     
     edited_text = "" 
@@ -122,7 +169,7 @@ async def call_edit_model(selected_text: str, instruction: str, action_type: str
     
     try:
         # Use astream_events to catch the AIMessage tokens before Pydantic parsing 
-        async for event in llm.astream_events([system_msg, HumanMessage(content=prompt_text)], version="v2"): 
+        async for event in llm.astream_events(messages, version="v2"): 
             
             # 1. Catch the raw LLM usage stats 
             if event["event"] == "on_chat_model_end": 
@@ -154,7 +201,7 @@ async def call_edit_model(selected_text: str, instruction: str, action_type: str
     
     # Fallback in case the event stream didn't resolve the text correctly 
     if not edited_text: 
-        response = await llm.ainvoke([system_msg, HumanMessage(content=prompt_text)]) 
+        response = await llm.ainvoke(messages) 
         edited_text = response.edited_text 
         
     return edited_text

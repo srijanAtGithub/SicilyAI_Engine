@@ -18,8 +18,8 @@ load_config()
 import uvicorn
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 from Agent.telegram_commands import setup_command_handlers, setup_bot_commands
 import Agent.agent as agent_module
@@ -28,6 +28,8 @@ from configuration import TOOL_LABELS, get_transcriber
 from Agent.memory_and_context import run_evaluator
 from Recurring_Tasks.recurring_tasks import start_recurring_tasks, set_dispatch
 from Agent.session_store import init_db, load_all_sessions, load_session, save_session, delete_session
+from Agent.markdown_helper import markdown_to_html
+from Agent.connectors import restore_connected_connectors
 
 SICILY_HOME = Path.home() / ".sicily"
 
@@ -60,6 +62,11 @@ class UserSession:
     cancel_requested: bool              = field(default=False)
     active_task: asyncio.Task | None    = field(default=None, repr=False)
 
+    # ── Pending tool-call approval (for inline Yes/No buttons) ─
+    # message_id of the currently-shown approval prompt, so its keyboard
+    # can be cleared once the user responds (by button or free text).
+    pending_approval_message_id: int | None = field(default=None)
+
 
 # key = telegram user_id (str)
 _sessions: dict[str, UserSession] = {}
@@ -67,6 +74,48 @@ _sessions: dict[str, UserSession] = {}
 
 def format_time(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+async def send_markdown(bot, chat_id: int, text: str, **kwargs):
+    """
+    Send a message with Markdown rendered as Telegram HTML.
+
+    Falls back to plain text if the converted HTML is somehow rejected by
+    Telegram (e.g. an unbalanced tag from unusual model output), so a
+    formatting edge case never turns into a silently dropped message.
+    """
+    html_text = markdown_to_html(text)
+    try:
+        return await bot.send_message(chat_id=chat_id, text=html_text, parse_mode="HTML", **kwargs)
+    except Exception:
+        log.warning("Markdown->HTML send failed, falling back to plain text")
+        return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+
+
+def build_approval_keyboard(session_id: str) -> InlineKeyboardMarkup:
+    """
+    Yes/No inline keyboard for a tool-call approval prompt.
+
+    callback_data is intentionally small (Telegram caps it at 64 bytes) and
+    carries the session_id so the callback handler resumes the right graph
+    thread, plus a short action tag we can dispatch on.
+    """
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Yes, go ahead", callback_data=f"approve:yes:{session_id}"),
+            InlineKeyboardButton("❌ No", callback_data=f"approve:no:{session_id}"),
+        ]
+    ])
+
+
+async def edit_markdown(bot, chat_id: int, message_id: int, text: str, **kwargs):
+    """Same as send_markdown but for editing an existing message."""
+    html_text = markdown_to_html(text)
+    try:
+        return await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=html_text, parse_mode="HTML", **kwargs)
+    except Exception:
+        log.warning("Markdown->HTML edit failed, falling back to plain text")
+        return await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, **kwargs)
 
 
 async def expire_session_after_timeout(user_id: str, session_id: str, user_name: str, override_seconds: float | None = None):
@@ -206,19 +255,19 @@ async def get_or_create_session(user_id: str, user_name: str) -> tuple[str, bool
 # ──────────────────────────────────────────────────────────────────────────────
 # Telegram handler
 # ──────────────────────────────────────────────────────────────────────────────
-async def on_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    active_chat_id = update.effective_chat.id
-
-    user      = update.effective_user
-    user_id   = str(user.id)
-    user_name = user.first_name
-    text = update.message.text or context.user_data.pop("voice_text", "") or ""
+async def process_user_reply(user_id: str, user_name: str, chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Shared core for handling a turn from the user — whether it arrived as
+    typed text (on_telegram_message) or as a tapped approval button
+    (on_approval_callback). Both end up calling send(text, session_id) the
+    same way, so the resume-vs-new-turn detection inside send() doesn't
+    need to know or care which UI produced the text.
+    """
 
     # ── Session: get or create ────────────────────────────────────────────────
     session_id, is_new_session = await get_or_create_session(user_id, user_name)
     session = _sessions[user_id]
-    session.chat_id = update.effective_chat.id
+    session.chat_id = chat_id
 
     # Persist after every interaction (updates last_interaction_at)
     await save_session(user_id, session)
@@ -228,7 +277,7 @@ async def on_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # another LangGraph run. Tell them to wait or use /stop.
     if session.is_processing:
         await context.bot.send_message(
-            chat_id=update.effective_chat.id,
+            chat_id=chat_id,
             text=(
                 "⏳ I'm still working on your previous message.\n\n"
                 "Please wait for it to finish — or send /stop if you'd like to cancel it."
@@ -277,7 +326,7 @@ async def on_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # ── Sending the user meaning and helper messages before final response ────
     thinking_msg = await context.bot.send_message(
-        chat_id=update.effective_chat.id,
+        chat_id=chat_id,
         text="⏳ Thinking..."
     )
 
@@ -285,7 +334,7 @@ async def on_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         label = TOOL_LABELS.get(tool_name, f"🔧 Running {tool_name}...")
         try:
             await context.bot.edit_message_text(
-                chat_id=update.effective_chat.id,
+                chat_id=chat_id,
                 message_id=thinking_msg.message_id,
                 text=label
             )
@@ -338,14 +387,18 @@ async def on_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         #  we just silently drop it per spec.)
         if not session.cancel_requested:
             if result["interrupt"]:
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=result["interrupt"]
+                sent = await send_markdown(
+                    context.bot,
+                    chat_id,
+                    result["interrupt"],
+                    reply_markup=build_approval_keyboard(session_id)
                 )
+                session.pending_approval_message_id = sent.message_id if sent else None
             elif result["reply"]:
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=result["reply"]
+                await send_markdown(
+                    context.bot,
+                    chat_id,
+                    result["reply"]
                 )
     except asyncio.CancelledError:
         # /stop fired — task was cancelled externally. Say nothing. Do nothing.
@@ -355,7 +408,7 @@ async def on_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         log.exception("Error in send")
         if not session.cancel_requested:
             await context.bot.send_message(
-                chat_id=update.effective_chat.id,
+                chat_id=chat_id,
                 text="Something went wrong. Please try again."
             )
 
@@ -366,11 +419,100 @@ async def on_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         try:
             await context.bot.delete_message(
-                chat_id=update.effective_chat.id,
+                chat_id=chat_id,
                 message_id=thinking_msg.message_id
             )
         except Exception:
             pass
+
+
+async def on_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user      = update.effective_user
+    user_id   = str(user.id)
+    user_name = user.first_name
+    text = update.message.text or context.user_data.pop("voice_text", "") or ""
+
+    session = _sessions.get(user_id)
+    is_pending_approval = session and session.pending_approval_message_id
+
+    # 1. Check for a reply
+    # 2. Ensure they typed actual text (not just an empty voice-to-text glitch)
+    # 3. Ensure we aren't waiting for a simple yes/no tool approval
+    if update.message and update.message.reply_to_message and text.strip() and not is_pending_approval:
+        
+        # Grab text (standard message) OR caption (image/file message)
+        replied_text = update.message.reply_to_message.text or update.message.reply_to_message.caption
+        
+        if replied_text:
+            text = (
+                f"[Context: The user is replying to this specific previous message of yours:\n"
+                f"\"{replied_text}\"]\n\n"
+                f"User's actual reply:\n{text}"
+            )
+
+    # Clear the keyboard if they were in an approval state
+    if is_pending_approval:
+        await _clear_approval_keyboard(context.bot, update.effective_chat.id, session)
+
+    await process_user_reply(user_id, user_name, update.effective_chat.id, text, context)
+
+
+async def _clear_approval_keyboard(bot, chat_id: int, session: "UserSession"):
+    """Best-effort removal of a stale Yes/No keyboard once it's been acted on."""
+    if not session.pending_approval_message_id:
+        return
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=chat_id,
+            message_id=session.pending_approval_message_id,
+            reply_markup=None
+        )
+    except Exception:
+        pass
+    session.pending_approval_message_id = None
+
+
+async def on_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles taps on the Yes/No inline keyboard attached to a tool-call
+    approval prompt. Feeds "yes" / "no" into the exact same
+    process_user_reply -> send() path a typed reply would use, so
+    human_approval_node's intent classification handles it identically.
+    """
+    query = update.callback_query
+    await query.answer()  # stop Telegram's loading spinner on the button
+
+    try:
+        _, decision, session_id = query.data.split(":", 2)
+    except ValueError:
+        log.warning("Malformed approval callback_data", data=query.data)
+        return
+
+    user      = update.effective_user
+    user_id   = str(user.id)
+    user_name = user.first_name
+    chat_id   = update.effective_chat.id
+
+    session = _sessions.get(user_id)
+
+    # Guard against a stale button: session gone, or it's since moved on to
+    # a different session_id (e.g. expired and a new one started).
+    if session is None or session.session_id != session_id:
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="That request isn't waiting for approval anymore."
+        )
+        return
+
+    await _clear_approval_keyboard(context.bot, chat_id, session)
+
+    reply_text = "yes" if decision == "yes" else "no"
+    await process_user_reply(user_id, user_name, chat_id, reply_text, context)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -389,14 +531,15 @@ async def dispatch_recurring_task(task_id: str, task_text: str):
     log.info("Recurring task dispatched", task_id=task_id, session_id=session_id)
 
     try:
-        result = await send(task_text, session_id)
+        result = await send(task_text, session_id, auto_approve=True)
     except Exception as e:
         log.exception("Recurring task agent error", task_id=task_id)
         return
 
     reply = result.get("reply") or result.get("interrupt")
-    if not reply:
-        log.warning("No reply from agent", task_id=task_id)
+
+    if not reply or "<SILENT>" in reply:
+        log.info("Recurring task completed silently (no actionable updates)", task_id=task_id)
         return
 
     if active_chat_id is None:
@@ -404,7 +547,7 @@ async def dispatch_recurring_task(task_id: str, task_text: str):
         return
 
     try:
-        await telegram_app.bot.send_message(chat_id=active_chat_id, text=reply)
+        await send_markdown(telegram_app.bot, active_chat_id, reply)
         log.info("Recurring task reply sent", task_id=task_id)
     except Exception as e:
         log.exception("Failed to send recurring task reply", task_id=task_id)
@@ -474,6 +617,7 @@ async def lifespan(app: FastAPI):
 
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_telegram_message))
     telegram_app.add_handler(MessageHandler(filters.VOICE, on_voice_message))
+    telegram_app.add_handler(CallbackQueryHandler(on_approval_callback, pattern=r"^approve:"))
 
     await telegram_app.initialize()
     await telegram_app.start()
@@ -491,10 +635,15 @@ async def lifespan(app: FastAPI):
         except Exception:
             log.exception("Failed to send startup notification")
 
-    set_dispatch(dispatch_recurring_task)
+    # 1. Initialize the agent graph FIRST and await it completely
+    log.info("Initializing agent graph...")
+    await initialize_agent()
 
-    # Do NOT await this here, or startup deadlocks.
-    asyncio.create_task(initialize_agent())
+    # 2. Restore connectors
+    asyncio.create_task(restore_connectors_after_agent_ready())
+
+    # 3. Set up the dispatch hook and start recurring tasks only AFTER graph is ready
+    set_dispatch(dispatch_recurring_task)
     asyncio.create_task(start_recurring_tasks())
 
     yield
@@ -563,6 +712,23 @@ async def lifespan(app: FastAPI):
     await telegram_app.shutdown()
 
 
+async def restore_connectors_after_agent_ready():
+    """
+    Waits for agent_module.tool_manager to exist (initialize_agent runs
+    concurrently and creates it), then reconnects every connector the
+    user had previously turned on.
+    """
+    for _ in range(100):  # ~10s max wait, in 0.1s steps
+        if getattr(agent_module, "tool_manager", None) is not None:
+            break
+        await asyncio.sleep(0.1)
+    else:
+        log.warning("tool_manager_never_ready, skipping connector restore")
+        return
+
+    await restore_connected_connectors(agent_module.tool_manager)
+
+
 async def on_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     voice = update.message.voice
     tg_file = await context.bot.get_file(voice.file_id)
@@ -618,7 +784,7 @@ async def send_to_telegram(text: str):
     if active_chat_id is None:
         return {"error": "No active chat yet — send a message from Telegram first"}
 
-    await telegram_app.bot.send_message(chat_id=active_chat_id, text=text)
+    await send_markdown(telegram_app.bot, active_chat_id, text)
 
     log.info("Message sent to Telegram", text=text)
 

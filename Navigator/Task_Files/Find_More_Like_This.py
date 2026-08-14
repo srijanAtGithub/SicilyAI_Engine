@@ -5,10 +5,10 @@ Backend logic for the "Find More Like This" quick action.
 
 Pipeline:
 
-  1. FINGERPRINT (nano, via navigator_general_llm(schema=_Fingerprint)):
+  1. FINGERPRINT (nano, via navigator_basic_llm(schema=_Fingerprint)):
      turn the page's extracted text into a compact fingerprint — topic,
      subtopics, content type, style — plus 2-3 good search queries.
-     navigator_general_llm's schema param wraps the model in
+     navigator_basic_llm's schema param wraps the model in
      with_structured_output, so this returns an already-validated
      _Fingerprint instance directly, no manual JSON parsing needed.
 
@@ -20,7 +20,7 @@ Pipeline:
      Returns title + url + a relevance-ranked content snippet per result —
      already close to publish-ready, no extraction step needed.
 
-  3. RANK (nano, via navigator_general_llm(schema=_RankResult)): hand
+  3. RANK (via navigator_smart_llm(schema=_RankResult)): hand
      Tavily's candidates (title + url + snippet) back to the model
      alongside the fingerprint, ask for exactly 5 best matches with a
      one-line reason each — same structured-output pattern as step 1.
@@ -90,7 +90,7 @@ class FindMoreLikeThisResponse(BaseModel):
 
 class _Fingerprint(BaseModel):
     """Internal only — not returned to the frontend. Passed as the schema
-    to navigator_general_llm(schema=...) for step 1, so the model's output
+    to navigator_basic_llm(schema=...) for step 1, so the model's output
     is constrained/parsed directly into this shape rather than us hand-
     parsing a JSON string out of response.content."""
     topic: str
@@ -101,7 +101,7 @@ class _Fingerprint(BaseModel):
 
 
 class _RankResult(BaseModel):
-    """Internal only — the schema passed to navigator_general_llm(schema=...)
+    """Internal only — the schema passed to navigator_smart_llm(schema=...)
     for step 3. Wraps RelatedLink in the { "results": [...] } shape the
     ranking prompt asks for."""
     results: List[RelatedLink]
@@ -130,11 +130,11 @@ _FINGERPRINT_SYSTEM = SystemMessage(content=(
 async def _build_fingerprint(
     url: str, title: str, content: str, already_shown_count: int = 0
 ) -> _Fingerprint:
-    # Passing the schema makes navigator_general_llm return a
+    # Passing the schema makes navigator_basic_llm return a
     # with_structured_output-wrapped model (see configuration.py) — the
     # call below returns an already-validated _Fingerprint instance
     # directly, not a chat message we'd need to parse JSON out of.
-    llm = configuration.navigator_general_llm(schema=_Fingerprint)
+    llm = configuration.navigator_basic_llm(schema=_Fingerprint)
 
     extra_instruction = ""
     if already_shown_count > 0:
@@ -272,7 +272,7 @@ async def _search_all_queries(
     return candidates
 
 
-# ── STEP 3: RANK (nano, via navigator_general_llm) ──────────────────────
+# ── STEP 3: RANK (via navigator_smart_llm) ──────────────────────────────
 
 _RANK_SYSTEM = SystemMessage(content=(
     "You are given a description of a web page (the 'source') and a list of "
@@ -311,7 +311,7 @@ async def _rank_candidates(
 
     # Same pattern as _build_fingerprint — schema=_RankResult gets back an
     # already-validated instance, no manual JSON parsing needed.
-    llm = configuration.navigator_general_llm(schema=_RankResult)
+    llm = configuration.navigator_smart_llm(schema=_RankResult)
     
     rank_result = None
     session_id = f"rank_{uuid.uuid4().hex[:8]}"

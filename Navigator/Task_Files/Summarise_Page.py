@@ -20,7 +20,7 @@ async def process_summarise_page(req: SummarisePageRequest) -> SummarisePageResp
     """
     Summarise the provided page content using a cost-effective, fast LLM.
     """
-    llm = configuration.navigator_general_llm()
+    llm = configuration.navigator_basic_llm()
     
     system_msg = SystemMessage(
         content=(

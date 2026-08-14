@@ -147,7 +147,7 @@ def config():
 @main_cli.command()
 def run():
     """Start the Sicily agent."""
-    ensure_initialized()
+    ensure_initialized(required_keys=["OPENAI_API_KEY", "TELEGRAM_BOT_TOKEN"])
     from Agent.main import main
     main()
 

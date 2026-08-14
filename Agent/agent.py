@@ -1,5 +1,6 @@
 import operator
 import asyncio
+import json
 from datetime import datetime
 from typing import TypedDict, Annotated, Literal
 
@@ -20,6 +21,7 @@ from Agent.memory_and_context import get_system_message, get_relevant_preference
 from Agent.tool_manager import ToolManager
 import configuration
 from Agent.session_store import DB_PATH
+from shared_utils import content_to_text
 
 # State Class
 class AgentState(TypedDict):
@@ -72,7 +74,9 @@ async def initialize_agent():
     # ─────────────────────────────────────────────────────────
     # Nodes
     # ─────────────────────────────────────────────────────────
-    async def main_node(state: AgentState) -> AgentState:
+    async def main_node(state: AgentState, config: dict = None) -> AgentState:
+        config = config or {}
+
         """
         PRIMARY AGENT NODE
         ------------------
@@ -97,26 +101,47 @@ async def initialize_agent():
         MAIN_LLM_SOUL = get_system_message("main_llm")
 
         # ── Two-stage tool retrieval ──────────────────────────────────────
-        # Stage 1: router LLM picks which servers are needed
-        # Stage 2: within-server embedding filter picks top tools per server
-        retrieval_context = " ".join(
-            m.content
-            for m in state["messages"][-8:]
-            if isinstance(m, (HumanMessage, AIMessage)) and isinstance(m.content, str)
+        # Stage 1: router LLM picks which servers are needed, AND rewrites
+        #          the current turn into a clean self-contained intent string
+        # Stage 2: within-server embedding filter, using that rewritten
+        #          intent (not raw message concatenation) as the query,
+        #          returns only tools clearing the similarity threshold
+        user_preferences = await get_relevant_preferences(
+            " ".join(
+                content_to_text(m.content)
+                for m in state["messages"][-8:]
+                if isinstance(m, (HumanMessage, AIMessage)) and m.content
+            )
         )
 
-        user_preferences = await get_relevant_preferences(retrieval_context)
+        relevant_servers, rewritten_query = await tool_manager.route(state["messages"], user_preferences=user_preferences)
 
-        relevant_servers = await tool_manager.get_relevant_servers(state["messages"])
-        relevant_tools   = await tool_manager.get_tools_for_servers(
+        if relevant_servers is None:
+            # Router call itself FAILED (exception/bad output) — this is
+            # distinct from "correctly decided no tools are needed" and
+            # must never be treated as "give the model everything."
+            # Bounded fallback: whatever servers were actually used last
+            # turn, or nothing if this is turn one. Never all_tools —
+            # dumping every connected server's tools is the exact
+            # context-bloat failure mode this routing exists to prevent,
+            # and doing it silently on the one turn routing hiccups is
+            # the worst possible time for it.
+            relevant_servers = _last_used_servers(state["messages"], tool_manager)
+            log.warning(
+                "router_failed_using_bounded_fallback",
+                fallback_servers=relevant_servers,
+            )
+
+        relevant_tools = await tool_manager.get_tools_for_servers(
             servers=relevant_servers,
-            query=retrieval_context,
-            top_k_per_server=12,
+            query=rewritten_query,
+            top_k_per_server=6,
         )
-
-        # Fallback: conversational message or router returned nothing
-        if not relevant_tools:
-            relevant_tools = tool_manager.all_tools
+        # NOTE: no "if not relevant_tools: relevant_tools = tool_manager.all_tools"
+        # fallback here anymore, intentionally. Empty is a valid, correct
+        # outcome for pure-conversational turns and for router-failure
+        # turns where the bounded fallback above also comes up empty
+        # (e.g. very first message in a session).
 
         # ── Build system message — inject preferences only if something was retrieved ──
         if user_preferences:
@@ -129,6 +154,17 @@ async def initialize_agent():
             )
         else:
             system_content = MAIN_LLM_SOUL
+
+        auto_approve = config.get("configurable", {}).get("auto_approve", False)
+        if auto_approve:
+            system_content += (
+                "\n\n---\n\n"
+                "**BACKGROUND TASK MODE:**\n"
+                "You are running as an automated background task. The user is not actively chatting with you.\n"
+                "If the user's prompt asks you to monitor for a specific condition (e.g., 'notify me IF there is an email about jobs'), "
+                "and that condition is NOT met, you MUST reply with exactly the word: <SILENT>\n"
+                "Do not explain that you checked. Do not say 'no new updates'. ONLY output <SILENT>."
+            )
 
         # Rebind with the new tools
         main_llm = configuration.get_main_llm(tools=relevant_tools)
@@ -149,33 +185,21 @@ async def initialize_agent():
         tool_call = response.tool_calls[0]
         tool_name  = tool_call["name"]
 
-        tool_map  = {e.tool.name: e.tool for e in tool_manager._registry}
-        tool_obj  = tool_map.get(tool_name)
+        tool_obj  = tool_manager.tool_map.get(tool_name)
         tool_desc = tool_obj.description if tool_obj else "No description available"
 
-        # ── Safety fast-path ─────────────────────────────────────────────
-        # Classify by name pattern first. Only call the safety LLM for
-        # genuinely ambiguous tool names. This avoids misclassifying
-        # read-only tools (search_*, get_*) as unsafe, and keeps latency
-        # low regardless of which MCPs are connected.
-        
-        READ_ONLY_PREFIXES = (
-            "get_", "search_", "fetch_", "find_", "list_",
-            "track_", "browse_", "view_", "read_", "show_",
-        )
-        KNOWN_WRITE_PREFIXES = (
-            "update_", "create_", "delete_", "remove_", "add_",
-            "send_", "post_", "submit_", "place_", "clear_",
-            "flush_", "apply_", "set_", "edit_", "schedule_",
-        )
+        # Check if this thread was flagged for auto-approval
+        auto_approve = config.get("configurable", {}).get("auto_approve", False)
 
-        if any(tool_name.startswith(p) for p in READ_ONLY_PREFIXES):
+        if auto_approve:
             is_safe = True
-
-        elif any(tool_name.startswith(p) for p in KNOWN_WRITE_PREFIXES):
-            is_safe = False
-
         else:
+            # ── Safety classification ────────────────────────────────────────
+            # No prefix fast-path: every tool call goes through safety_llm so
+            # that user preferences (surfaced via the system prompt) are the
+            # sole authority on auto-execute vs. confirm. This costs one LLM
+            # round-trip per tool call, but guarantees no hardcoded rule can
+            # silently override what the user configured.
             SAFETY_LLM_SOUL = get_system_message("safety_llm")
             safety_result = await safety_llm.ainvoke([
                 SystemMessage(content=SAFETY_LLM_SOUL),
@@ -223,19 +247,23 @@ async def initialize_agent():
         if friendly_title.endswith("..."):
             friendly_title = friendly_title[:-3] # Strip the trailing dots for a cleaner title
             
-        # Formatting the arguments into readable bullet points
+        # Formatting the arguments as a fenced code block so the Telegram
+        # markdown->HTML converter renders them as <pre><code>...</code></pre>
+        # instead of a hand-rolled bullet list.
         if raw_args:
-            args_display = "\n".join(f"  • {str(k).replace('_', ' ').title()}: {v}" for k, v in raw_args.items())
-            details_section = f"Details:\n{args_display}"
+            args_json = json.dumps(raw_args, indent=2, default=str, ensure_ascii=False)
+            details_section = f"```json\n{args_json}\n```"
         else:
             details_section = ""
 
-        # Presenting it naturally to the user
+        # Presenting it naturally to the user. The yes/no choice is offered
+        # via Telegram inline buttons (added on the main.py side); this text
+        # just needs to mention that free-text edits are also accepted.
         user_reply = interrupt(
-            f"{friendly_title}\n\n"
-            f"I need your permission to proceed.\n"
+            f"**{friendly_title}**\n\n"
+            f"I need your permission to proceed.\n\n"
             f"{details_section}\n\n"
-            f"Should I go ahead? (Reply with yes, no, or tell me what to change)"
+            f"Tap a button below, or reply with what you'd like changed."
         )
 
         intent_result = await intent_llm.ainvoke([
@@ -293,8 +321,7 @@ async def initialize_agent():
         tool_call = last.tool_calls[0]
 
         # Look up the tool by name from the live registry
-        tool_map = {e.tool.name: e.tool for e in tool_manager._registry}
-        tool = tool_map.get(tool_call["name"])
+        tool = tool_manager.tool_map.get(tool_call["name"])
 
         if not tool:
             timestamp = datetime.utcnow().isoformat()
@@ -434,9 +461,14 @@ async def initialize_agent():
 
 
 # Send message
-async def send(message: str, thread_id: str, status_callback=None, cancel_check=None):
+async def send(message: str, thread_id: str, status_callback=None, cancel_check=None, auto_approve: bool = False):
 
-    config = {"configurable": {"thread_id": thread_id}}
+    config = {
+        "configurable": {
+            "thread_id": thread_id,
+            "auto_approve": auto_approve
+        }
+    }
     log.info("Thread started", thread_id=thread_id)
 
     if cancel_check and cancel_check():
@@ -460,12 +492,50 @@ async def send(message: str, thread_id: str, status_callback=None, cancel_check=
             async for event in graph.astream_events(Command(resume=message), config, version="v2"):
                 if event["event"] == "on_tool_start" and status_callback:
                     await status_callback(event.get("name", ""))
+                elif event["event"] == "on_chat_model_end":
+                    output = event.get("data", {}).get("output")
+                    if output and hasattr(output, "usage_metadata") and output.usage_metadata:
+                        try:
+                            from usage_tracker import record_usage
+                            usage = output.usage_metadata
+                            model_name = getattr(output, "response_metadata", {}).get("model_name", event.get("name", "unknown"))
+                            msg_id = getattr(output, "id", None)
+                            record_usage(
+                                dimension="agent",
+                                session_id=thread_id,
+                                model_name=model_name,
+                                input_tokens=usage.get("input_tokens", 0),
+                                output_tokens=usage.get("output_tokens", 0),
+                                cached_input_tokens=usage.get("input_token_details", {}).get("cache_read_tokens", 0),
+                                message_id=msg_id
+                            )
+                        except Exception as rec_err:
+                            log.warning("record_usage failed during graph streaming", error=str(rec_err))
             await log_latest_message(config)
         else:
             log.info("User message", message=message, thread_id=thread_id)
             async for event in graph.astream_events({"messages": [HumanMessage(content=message)]}, config, version="v2"):
                 if event["event"] == "on_tool_start" and status_callback:
                     await status_callback(event.get("name", ""))
+                elif event["event"] == "on_chat_model_end":
+                    output = event.get("data", {}).get("output")
+                    if output and hasattr(output, "usage_metadata") and output.usage_metadata:
+                        try:
+                            from usage_tracker import record_usage
+                            usage = output.usage_metadata
+                            model_name = getattr(output, "response_metadata", {}).get("model_name", event.get("name", "unknown"))
+                            msg_id = getattr(output, "id", None)
+                            record_usage(
+                                dimension="agent",
+                                session_id=thread_id,
+                                model_name=model_name,
+                                input_tokens=usage.get("input_tokens", 0),
+                                output_tokens=usage.get("output_tokens", 0),
+                                cached_input_tokens=usage.get("input_token_details", {}).get("cache_read_tokens", 0),
+                                message_id=msg_id
+                            )
+                        except Exception as rec_err:
+                            log.warning("record_usage failed during graph streaming", error=str(rec_err))
             await log_latest_message(config)
 
         if cancel_check and cancel_check():
@@ -490,7 +560,7 @@ async def send(message: str, thread_id: str, status_callback=None, cancel_check=
     latest_ai_message = None
     for msg in reversed(messages):
         if isinstance(msg, AIMessage) and msg.content:
-            latest_ai_message = msg.content
+            latest_ai_message = content_to_text(msg.content)  # was: msg.content
             break
 
     # ── Interrupt check ───────────────────────────────────────
@@ -527,7 +597,7 @@ def count_tokens(messages) -> int:
 def message_to_text(m) -> str:
 
     msg_type = type(m).__name__
-    content = getattr(m, "content", "")
+    content = content_to_text(getattr(m, "content", ""))
 
     # Tool calls
     if hasattr(m, "tool_calls") and m.tool_calls:
@@ -542,6 +612,30 @@ def message_to_text(m) -> str:
         return f"{msg_type}: {' '.join(tool_parts)}"
 
     return f"{msg_type}: {content}"
+
+
+def _last_used_servers(messages, tool_manager: ToolManager, lookback: int = 20) -> list[str]:
+    """
+    Bounded fallback for when the server router itself fails (exception,
+    not "correctly decided nothing's needed"). Scans recent AIMessage
+    tool_calls, maps each tool name back to its owning server via
+    tool_manager, and returns the deduped set — NOT the full catalog.
+
+    Deliberately conservative: on a fresh session with no tool-call
+    history yet, this returns [] and the turn proceeds with zero tools
+    rather than guessing. That's the correct failure mode — a turn with
+    no tools is recoverable (user can be asked to clarify or retry);
+    a turn silently given every connected server's tools is the exact
+    context-bloat / wrong-tool-selection problem routing exists to avoid.
+    """
+    servers: list[str] = []
+    for m in reversed(messages[-lookback:]):
+        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+            for tc in m.tool_calls:
+                server = tool_manager.server_for_tool(tc["name"])
+                if server and server not in servers:
+                    servers.append(server)
+    return servers
 
 
 def get_safe_fresh_messages(messages, keep_last=KEEP_LAST_MESSAGES):
@@ -623,7 +717,13 @@ def get_safe_fresh_messages(messages, keep_last=KEEP_LAST_MESSAGES):
     return fresh
 
 
-async def maybe_summarize(messages, summarizer_llm, token_threshold: int = TOKEN_THRESHOLD, show_log: bool = True):
+async def maybe_summarize(
+    messages,
+    summarizer_llm,
+    token_threshold: int = TOKEN_THRESHOLD,
+    show_log: bool = True,
+    additional_agent_specific_system_prompt: str | None = None,
+):
 
     token_count = count_tokens(messages)
 
@@ -656,21 +756,47 @@ async def maybe_summarize(messages, summarizer_llm, token_threshold: int = TOKEN
         for m in to_summarize
     )
 
-    summary = await summarizer_llm.ainvoke([
-        SystemMessage(content=(
-            """
-            Summarize the conversation briefly while preserving:
-            - important context
-            - user preferences
-            - tool results
-            - pending tasks
-            - decisions and constraints
+    base_summarizer_prompt = """
+        Summarize the conversation briefly while preserving:
+        - important context
+        - user preferences
+        - tool results
+        - pending tasks
+        - decisions and constraints
 
-            Avoid unnecessary details.
-            """
-        )),
+        Avoid unnecessary details.
+        """
+
+    summarizer_system_prompt = base_summarizer_prompt
+    if additional_agent_specific_system_prompt:
+        summarizer_system_prompt = (
+            base_summarizer_prompt
+            + "\n\n---\n\n"
+            + additional_agent_specific_system_prompt
+        )
+
+    summary = await summarizer_llm.ainvoke([
+        SystemMessage(content=summarizer_system_prompt),
         HumanMessage(content=history_text)
     ])
+
+    if hasattr(summary, "usage_metadata") and summary.usage_metadata:
+        try:
+            from usage_tracker import record_usage
+            usage = summary.usage_metadata
+            model_name = getattr(summary, "response_metadata", {}).get("model_name", "unknown")
+            msg_id = getattr(summary, "id", None)
+            record_usage(
+                dimension="agent",
+                session_id="summarizer",
+                model_name=model_name,
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+                cached_input_tokens=usage.get("input_token_details", {}).get("cache_read_tokens", 0),
+                message_id=msg_id
+            )
+        except Exception as rec_err:
+            log.warning("record_usage failed for summarizer", error=str(rec_err))
 
     summary_message = SystemMessage(
         content=(

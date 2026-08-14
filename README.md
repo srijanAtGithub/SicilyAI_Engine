@@ -68,7 +68,7 @@ Navigator is a Chrome extension that brings Sicily to any web page, backed by a 
 
 **Right-click writing tools:** select any text on any page and get Apple-like writing tools in the context menu — rewrite, summarise, or ask a question about the selection, right where you're reading.
 
-https://github.com/user-attachments/assets/97de426d-9e4c-41e9-82ce-99ffb57cc9f1
+https://github.com/user-attachments/assets/4dc44986-9425-4e4a-9964-d18135965dc4
 
 **Side panel:** A persistent panel with its own set of reading and research tools used for chatting, summarising, and organising as you browse — one-click page summaries, one-click tab organisation, and a "find more like this" for surfacing similar pages, plus a reading list to save pages for later.
 
@@ -94,9 +94,9 @@ Most agents fall apart as you add more tools — the context window fills up, co
 
 <img src="Media/two_stage_tool_retrieval.svg" alt="Two-Stage Tool Retrieval" width="75%">
 
-**Stage 1 — Intent routing:** A cheap nano model reads the last few messages and decides which _services_ are relevant right now (e.g. only Swiggy, not Gmail). Everything else is ignored entirely.
+**Stage 1 — Intent routing + query rewrite:** A single LLM call reads the last few messages and decides which _services_ are relevant right now (e.g. only Swiggy, not Gmail) — everything else is ignored entirely. The same call also rewrites the user's current intent into one self-contained sentence, resolving pronouns and follow-ups ("reply to her", "do it again") into concrete terms. This rewrite, not the raw conversation, is what gets embedded in Stage 2 — it matches tool descriptions far better than a raw message thread full of conversational scaffolding.
 
-**Stage 2 — Semantic filtering:** Within each selected service, tool descriptions are compared to the query using cosine similarity. Only the most relevant tools per service are passed forward.
+**Stage 2 — Hybrid filtering:** Within each selected service, tool descriptions are ranked against the rewritten query using a blend of cosine similarity (semantic/paraphrase matches) and BM25 lexical overlap (literal keyword matches embeddings sometimes miss). Only tools clearing a minimum relevance floor are passed forward, up to a fixed cap per service.
 
 The result: the main LLM always sees a short, focused list of tools regardless of how many are registered. You can add so many more tools tomorrow from multiple servers and the model won't know or care about the ones that aren't relevant.
 
@@ -118,11 +118,11 @@ Every tool call goes through a three-gate safety pipeline before execution.
 
 <img src="Media/hitl_safety_pipeline.svg" alt="HITL Safety Pipeline" width="75%">
 
-**Gate 1 — Prefix fast-path:** Tools starting with `get_`, `search_`, `read_` are immediately marked safe. No LLM call needed.
+**Context 1 — Tool Description & Arguments:** The safety LLM receives the full tool specification alongside the specific runtime argument values being passed.
 
-**Gate 2 — Heuristic detection:** Tools starting with `update_`, `delete_`, `send_` are flagged as unsafe automatically.
+**Context 2 — Safety LLM System Prompt (Soul File):** The model is provided with its core behavioral guidelines, defining the precise criteria for identifying safe versus unsafe tool executions.
 
-**Gate 3 — LLM safety net:** Anything ambiguous gets evaluated by a dedicated safety LLM that reads the tool description and the arguments being passed.
+**Evaluation — Pre-Execution Safety Gate:** Leveraging both contexts, the safety LLM determines if the action is safe to execute automatically or unsafe, triggering a requirement for explicit user approval.
 
 If a tool is flagged unsafe, the LangGraph graph _pauses_ and asks you: approve, abort, or edit the arguments. Nothing happens until you decide. If a tool hallucinated by the model doesn't exist, the executor catches it cleanly and returns a `ToolMessage` saying "Tool not found" — no graph crashes, no cascading errors.
 
