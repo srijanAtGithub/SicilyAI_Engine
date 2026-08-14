@@ -188,7 +188,7 @@ class ToolManager:
 
 
     # ── Stage 1: Server routing + query rewrite (fused) ──────
-    async def route(self, messages: list) -> tuple[list[str] | None, str]:
+    async def route(self, messages: list, user_preferences: str | None = None) -> tuple[list[str] | None, str]:
         """
         Single cheap LLM call that reads the conversation and returns:
           - which servers are needed right now (routing decision)
@@ -229,6 +229,12 @@ class ToolManager:
             and isinstance(m.content, str)
         )
 
+        preferences_block = (
+            f"\n\nRelevant user preferences (use these to make the rewritten query more specific):\n{user_preferences}"
+            if user_preferences
+            else ""
+        )
+
         try:
             res = await self._router.ainvoke([
                 SystemMessage(content=(
@@ -250,11 +256,15 @@ class ToolManager:
                     "'reply to her', 'do it again') into concrete terms using the "
                     "conversation context. Do not include past-tense completed "
                     "actions or unrelated history. If the message is pure "
-                    "conversation with no action needed, just restate it plainly."
+                    "conversation with no action needed, just restate it plainly.\n"
+                    "IMPORTANT: If user preferences are provided, incorporate the "
+                    "relevant ones into the rewritten query to make it more specific "
+                    "(e.g. preferred brand, price range, dietary restrictions)."
                 )),
                 HumanMessage(content=(
                     f"Available services:\n{server_list}\n\n"
-                    f"Conversation (most recent last):\n{recent}\n\n"
+                    f"Conversation (most recent last):\n{recent}"
+                    f"{preferences_block}\n\n"
                     "Which services are needed right now, and what is the "
                     "user's current intent as one self-contained sentence?"
                 ))
@@ -299,7 +309,7 @@ class ToolManager:
     # coarser grain than individual tools, so the two stages can legitimately
     # disagree. This threshold lets stage 2 veto stage 1 rather than always
     # padding out to top_k regardless of fit.
-    MIN_TOOL_SIMILARITY = 0.30
+    MIN_TOOL_SIMILARITY = 0.25
 
     # ── Stage 2: Within-server tool filtering ────────────────
     async def get_tools_for_servers(

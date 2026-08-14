@@ -114,7 +114,7 @@ async def initialize_agent():
             )
         )
 
-        relevant_servers, rewritten_query = await tool_manager.route(state["messages"])
+        relevant_servers, rewritten_query = await tool_manager.route(state["messages"], user_preferences=user_preferences)
 
         if relevant_servers is None:
             # Router call itself FAILED (exception/bad output) — this is
