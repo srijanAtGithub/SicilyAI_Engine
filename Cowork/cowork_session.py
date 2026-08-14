@@ -53,6 +53,7 @@ import configuration
 console = Console()
 from Cowork.cowork_tools import LOCAL_TOOLS, set_sandbox_root, get_friendly_tool_message
 from Agent.agent import maybe_summarize
+from Cowork.debug_log import reset_step_counter, log_tool_call, log_llm_tokens, log_turn_summary
 
 log = structlog.get_logger()
 
@@ -70,6 +71,22 @@ BANNER = """
 """
 
 LOCAL_TOKEN_THRESHOLD = 7_000
+
+# Passed to maybe_summarize's additional_agent_specific_system_prompt so
+# Sicily investigations don't lose concrete evidence (exact file paths and
+# line numbers) to a paraphrased summary — this evidence is expensive to
+# re-derive (a fresh search_file_contents call) if it gets vaguened away.
+SICILY_SUMMARIZER_ADDENDUM = """
+    This conversation is a filesystem investigation. In addition to the
+    general summary rules above, preserve the following EXACTLY as found —
+    do not paraphrase, round, or approximate them:
+    - file paths
+    - line numbers (and line ranges) tied to a specific finding
+    - exact symbol/function/component names discovered during search
+
+    Prefer a short bulleted list of these concrete facts over flowing prose.
+    If the same fact reappears from multiple tool calls, keep it once.
+    """
 
 summarizer_llm = configuration.get_summarizer_llm()
 
@@ -121,6 +138,16 @@ def build_local_graph():
             - Never fabricate file contents or claim to have inspected something you haven't. 
             - If a tool reports an error, relay it honestly instead of guessing. 
             - Prefer the least invasive tool that can answer the user's question.
+
+            ## Response style
+            - Default to concise responses. Only go long-form when the user asks for
+              detail, or the answer genuinely requires it (e.g. multi-file changes).
+            - When you cite a location you found via a tool, state the line number(s)
+              exactly as returned — never hedge with "around", "approximately", "roughly",
+              or similar. Tool results already give you the real line number; use it as-is.
+              Only omit a line number entirely if you genuinely don't have one from evidence
+              (e.g. a file-level answer with no specific line) — don't invent an approximate
+              one to sound precise.
             """
 
         # NOTE: summarization is intentionally NOT done here. This node
@@ -267,6 +294,7 @@ async def run_local_session():
             summarizer_llm,
             token_threshold=LOCAL_TOKEN_THRESHOLD,
             show_log=False,
+            additional_agent_specific_system_prompt=SICILY_SUMMARIZER_ADDENDUM,
         )
 
         # Per-turn call config. recursion_limit counts graph super-steps
@@ -275,6 +303,13 @@ async def run_local_session():
         MAX_TOOL_CALLS_PER_TURN = 60
         turn_config = {**config, "recursion_limit": MAX_TOOL_CALLS_PER_TURN * 2 + 5}
         tool_call_count = 0
+
+        # DEBUG: restart the #1, #2, #3... ordering for this fresh turn,
+        # and track running totals to print once at the end.
+        reset_step_counter()
+        turn_llm_calls = 0
+        turn_input_tokens = 0
+        turn_output_tokens = 0
 
         try:
             # 1. Start the rich status spinner
@@ -307,11 +342,23 @@ async def run_local_session():
                                 cached_input_tokens=usage.get("input_token_details", {}).get("cache_read_tokens", 0)
                             )
 
+                            # DEBUG: tokens for this single LLM call, plus running total
+                            in_tok = usage.get("input_tokens", 0)
+                            out_tok = usage.get("output_tokens", 0)
+                            cached_tok = usage.get("input_token_details", {}).get("cache_read_tokens", 0)
+                            log_llm_tokens(model_name, in_tok, out_tok, cached_tok)
+                            turn_llm_calls += 1
+                            turn_input_tokens += in_tok
+                            turn_output_tokens += out_tok
+
                     # 3. Intercept tool execution 
                     if event["event"] == "on_tool_start":
                         tool_call_count += 1
                         tool_name = event.get("name")
                         tool_args = event.get("data", {}).get("input", {})
+
+                        # DEBUG: which tool, in what order
+                        log_tool_call(tool_name, tool_args)
                         
                         # Format the payload for your helper function
                         tool_call = {"name": tool_name, "args": tool_args}
@@ -336,6 +383,9 @@ async def run_local_session():
                         output = event.get("data", {}).get("output")
                         if output and "messages" in output:
                             messages = output["messages"]
+
+            # DEBUG: total tool calls + total tokens for this whole turn
+            log_turn_summary(tool_call_count, turn_llm_calls, turn_input_tokens, turn_output_tokens)
 
             # 5. Find the last AI text response
             reply = None
@@ -368,7 +418,11 @@ async def run_local_session():
             try:
                 no_tools_llm = configuration.get_cowork_llm(tools=[])
                 trimmed = await maybe_summarize(
-                    messages, summarizer_llm, token_threshold=LOCAL_TOKEN_THRESHOLD, show_log=False
+                    messages,
+                    summarizer_llm,
+                    token_threshold=LOCAL_TOKEN_THRESHOLD,
+                    show_log=False,
+                    additional_agent_specific_system_prompt=SICILY_SUMMARIZER_ADDENDUM,
                 )
                 final = await no_tools_llm.ainvoke(trimmed)
                 if hasattr(final, "usage_metadata") and final.usage_metadata:
@@ -403,8 +457,36 @@ async def run_local_session():
 
 
 # ── Terminal I/O helpers ──────────────────────────────────────────────────────
+def _content_to_text(content) -> str:
+    """Extract displayable text from AIMessage.content (str or list of blocks)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                # Prefer final text blocks; skip pure reasoning blocks
+                if block.get("type") == "text" and block.get("text"):
+                    parts.append(block["text"])
+                elif block.get("type") == "output_text" and block.get("text"):
+                    parts.append(block["text"])
+                # Optional: include reasoning summary if you ever want it
+                # elif block.get("type") == "reasoning" and block.get("summary"):
+                #     parts.append(...)
+            elif hasattr(block, "text"):  # some LangChain content objects
+                parts.append(getattr(block, "text") or "")
+        return "\n".join(p for p in parts if p).strip()
+    return str(content)
+
+
 def print_ai(text: str):
-    # Renders the text as Markdown inside a styled box
+    text = _content_to_text(text)
+    if not text:
+        text = "(No response)"
     md = Markdown(text)
     panel = Panel(md, title="[grey50]Sicily[/grey50]", border_style="grey50", padding=(1, 2), title_align="left")
     console.print()
