@@ -105,10 +105,8 @@
     align-items: center;
     padding: 10px 14px;
     border-radius: 12px;
-    background: rgba(255, 255, 255, 0.05);
+    background: #1c1c1e;
     border: 1px solid rgba(255, 255, 255, 0.12);
-    backdrop-filter: blur(16px);
-    -webkit-backdrop-filter: blur(16px);
     color: #d8d8de;
     font-size: 14px;
     font-weight: 500;
@@ -126,7 +124,7 @@
 .es-chip:hover {
     transform: translateY(-2px);
     border-color: rgba(255, 255, 255, 0.28);
-    background: rgba(255, 255, 255, 0.08);
+    background: #28282c;
     color: #f2f2f7;
     box-shadow: 0 6px 16px rgba(0, 0, 0, 0.3), 0 0 14px rgba(255, 255, 255, 0.08);
 }
@@ -156,7 +154,7 @@
     gap: 5px;
     padding: 3px 8px;
     border-radius: 20px;
-    background: rgba(255, 255, 255, 0.05);
+    background: #1c1c1e;
     border: 1px solid rgba(255, 255, 255, 0.12);
     font-size: 10.5px;
     font-weight: 500;
@@ -169,7 +167,7 @@
 .context-trail-chip:hover {
     border-color: rgba(255, 255, 255, 0.28);
     color: #d8d8de;
-    background: rgba(255, 255, 255, 0.08);
+    background: #28282c;
 }
 
 .context-trail-icon {
@@ -438,7 +436,7 @@
 
 #input-row {
     display: flex;
-    padding: 8px 12px 14px 12px;
+    padding: 0 12px 14px 12px;
     gap: 8px;
     align-items: center;
     background: transparent;
@@ -449,11 +447,9 @@
     padding: 9px 12px;
     border-radius: 10px;
     border: 1px solid rgba(255, 255, 255, 0.2);
-    background: rgba(0, 0, 0, 0.9);
-    /* Solid-ish so it reads as its own floating pill against the
-         busy messages list scrolling underneath it */
-    backdrop-filter: blur(16px);
-    -webkit-backdrop-filter: blur(16px);
+    background: rgba(0, 0, 0, 0.92);
+    backdrop-filter: blur(36px);
+    -webkit-backdrop-filter: blur(36px);
     box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
     color: #f2f2f7;
     font-size: 13.5px;
@@ -483,12 +479,14 @@
     padding: 9px 15px;
     border-radius: 10px;
     border: 1px solid rgba(255, 255, 255, 0.08);
-    background: rgba(255, 255, 255, 0.06);
+    background: rgba(255, 255, 255, 0.14);
     color: #f2f2f7;
     font-size: 13.5px;
     font-weight: 600;
     cursor: pointer;
-    backdrop-filter: blur(20px);
+    backdrop-filter: blur(30px);
+    -webkit-backdrop-filter: blur(30px);
+
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
 
     /* Hidden state: collapsed into the input's right edge */
@@ -553,9 +551,7 @@
     height: 0;
     border-radius: 10px;
     border: 1px solid rgba(255, 255, 255, 0.1);
-    background: rgba(255, 255, 255, 0.055);
-    backdrop-filter: blur(16px);
-    -webkit-backdrop-filter: blur(16px);
+    background: #1c1c1e;
     box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3), inset 0 0 1px rgba(255, 255, 255, 0.12);
 
     overflow: hidden;
@@ -574,7 +570,7 @@
 
 .using-tab-bar--visible {
     height: 34px;
-    margin-top: 8px;
+    margin-top: 0;
     opacity: 1;
     transform: scaleY(1) translateY(0);
     pointer-events: auto;
@@ -740,9 +736,9 @@
 
     border-radius: 14px;
     border: 1px solid rgba(255, 255, 255, 0.14);
-    background: rgba(20, 20, 22, 0.82);
-    backdrop-filter: blur(24px);
-    -webkit-backdrop-filter: blur(24px);
+    background: rgba(20, 20, 22, 0.92);
+    backdrop-filter: blur(34px);
+    -webkit-backdrop-filter: blur(34px);
     box-shadow:
         0 10px 30px rgba(0, 0, 0, 0.45),
         inset 0 0 1px rgba(255, 255, 255, 0.14);
@@ -883,7 +879,7 @@
     flex-wrap: nowrap;
     align-items: flex-start;
     gap: 8px;
-    padding: 10px 12px 0 12px;
+    padding: 0 12px;
     background: transparent;
     max-height: 220px;
     overflow-x: auto;
@@ -911,11 +907,9 @@
     flex-direction: column;
     max-width: 220px;
     flex-shrink: 0;
-    background: rgba(255, 255, 255, 0.06);
+    background: #1c1c1e;
     border: 1px solid rgba(255, 255, 255, 0.14);
     border-radius: 14px;
-    backdrop-filter: blur(16px);
-    -webkit-backdrop-filter: blur(16px);
     box-shadow:
         0 2px 8px rgba(0, 0, 0, 0.25),
         inset 0 0 1px rgba(255, 255, 255, 0.1);
@@ -1210,7 +1204,7 @@
 .msg.ai.md-body code {
     font-family: "SF Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
     font-size: 0.9em;
-    background: rgba(255, 255, 255, 0.08);
+    background: rgba(20, 20, 22, 0.75);
     border: 1px solid rgba(255, 255, 255, 0.1);
     border-radius: 4px;
     padding: 1px 5px;
@@ -1222,12 +1216,10 @@
 .msg.ai.md-body pre {
     margin: 8px 0 12px 0;
     padding: 10px 12px;
-    background: rgba(255, 255, 255, 0.07);
-    /* Light overlay, not more black — the panel itself is already near-
-         black, so darkening further (e.g. rgba(0,0,0,x)) barely reads as
-         a distinct surface. A translucent white lift gives real contrast
-         against the message bubble behind it. */
+    background: rgba(20, 20, 22, 0.85);
     border: 1px solid rgba(255, 255, 255, 0.14);
+    backdrop-filter: blur(30px);
+    -webkit-backdrop-filter: blur(30px);
     border-radius: 10px;
     overflow-x: auto;
     line-height: 1.5;

@@ -19,8 +19,8 @@ body {
     border: 1px solid rgba(255, 255, 255, 0.18);
 
     /* Glassmorphism Effect */
-    backdrop-filter: blur(30px);
-    -webkit-backdrop-filter: blur(30px);
+    backdrop-filter: blur(40px);
+    -webkit-backdrop-filter: blur(40px);
     background: rgba(10, 10, 10, 0.95);
     /* Dark base for side panel */
 
@@ -105,7 +105,7 @@ body {
     padding: 0;
     border-radius: 10px;
     border: 1px solid rgba(255, 255, 255, 0.08);
-    background: rgba(255, 255, 255, 0.04);
+    background: rgba(255, 255, 255, 0.08);
     color: transparent;
     font-size: 0;
     display: flex;
@@ -113,8 +113,8 @@ body {
     justify-content: center;
     cursor: pointer;
     transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
+    backdrop-filter: blur(30px);
+    -webkit-backdrop-filter: blur(30px);
 }
 
 /* Ensure #new-chat-btn stays on the right side */
@@ -197,9 +197,9 @@ body {
     min-width: 190px;
 
     /* FIXED: Glassmorphism settings matching content_script.js */
-    background: rgba(25, 25, 26, 0.35);
-    backdrop-filter: blur(30px);
-    -webkit-backdrop-filter: blur(30px);
+    background: rgba(20, 20, 22, 0.85);
+    backdrop-filter: blur(40px);
+    -webkit-backdrop-filter: blur(40px);
 
     border: 1px solid rgba(255, 255, 255, 0.12);
     border-radius: 14px;
