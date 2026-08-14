@@ -700,18 +700,23 @@ def search_file_contents(
                 )
                 matches.append(f"[{rel}]\n{snippet}")
 
+    search_desc = (
+        f"Searched for {'regex' if regex else 'literal'} pattern '{pattern}' "
+        f"({'case-sensitive' if case_sensitive else 'case-insensitive'}) under '{path}'"
+    )
+
     if not matches:
         note = f" ({len(files_skipped)} file(s) could not be read)" if files_skipped else ""
         return (
-            f"No matches for '{pattern}' across {files_scanned} readable file(s) "
-            f"under '{path}'{note}.\n"
+            f"{search_desc}\n"
+            f"No matches across {files_scanned} readable file(s){note}.\n"
             "If this query is vague, numeric, or paraphrased, see the "
             "ESCALATION PATH in this tool's description — try "
             "find_files_by_name to narrow candidates, then "
             "preview_files_for_review."
         )
 
-    header = f"Found {len(matches)} match(es) across {files_scanned} file(s) scanned"
+    header = f"{search_desc}\nFound {len(matches)} match(es) across {files_scanned} file(s) scanned"
     if len(matches) >= max_results:
         header += f" (capped at max_results={max_results}, there may be more)"
     return header + ":\n\n" + "\n\n".join(matches)

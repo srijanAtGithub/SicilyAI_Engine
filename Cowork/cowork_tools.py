@@ -325,12 +325,22 @@ def read_file(path: str, head: int = 0, tail: int = 0) -> str:
         except Exception as e:
             return f"Could not read '{path}': {e}"
 
-    if head > 0:
-        return "".join(content.splitlines(keepends=True)[:head])
-    if tail > 0:
-        return "".join(content.splitlines(keepends=True)[-tail:])
+    total_lines = len(content.splitlines())
 
-    return content
+    if head > 0:
+        shown = content.splitlines(keepends=True)[:head]
+        shown_count = len(shown)
+        header = f"[{path} | showing first {shown_count} of {total_lines} lines (head={head})]\n"
+        return header + "".join(shown)
+
+    if tail > 0:
+        shown = content.splitlines(keepends=True)[-tail:]
+        shown_count = len(shown)
+        header = f"[{path} | showing last {shown_count} of {total_lines} lines (tail={tail})]\n"
+        return header + "".join(shown)
+
+    header = f"[{path} | full file, {total_lines} lines]\n"
+    return header + content
 
 
 @tool
