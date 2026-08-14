@@ -37,6 +37,8 @@ import uuid
 from pathlib import Path
 from typing import Annotated, TypedDict
 
+from Agent.agent import content_to_text
+
 import structlog
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
@@ -457,34 +459,8 @@ async def run_local_session():
 
 
 # ── Terminal I/O helpers ──────────────────────────────────────────────────────
-def _content_to_text(content) -> str:
-    """Extract displayable text from AIMessage.content (str or list of blocks)."""
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict):
-                # Prefer final text blocks; skip pure reasoning blocks
-                if block.get("type") == "text" and block.get("text"):
-                    parts.append(block["text"])
-                elif block.get("type") == "output_text" and block.get("text"):
-                    parts.append(block["text"])
-                # Optional: include reasoning summary if you ever want it
-                # elif block.get("type") == "reasoning" and block.get("summary"):
-                #     parts.append(...)
-            elif hasattr(block, "text"):  # some LangChain content objects
-                parts.append(getattr(block, "text") or "")
-        return "\n".join(p for p in parts if p).strip()
-    return str(content)
-
-
 def print_ai(text: str):
-    text = _content_to_text(text)
+    text = content_to_text(text)
     if not text:
         text = "(No response)"
     md = Markdown(text)

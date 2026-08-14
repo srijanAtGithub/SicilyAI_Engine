@@ -89,7 +89,11 @@ def load_config() -> None:
 
 
 def get_main_llm(tools=None):
-    llm = ChatOpenAI(model="gpt-5.4-mini")
+    llm = ChatOpenAI(
+        model="gpt-5.6-luna",
+        use_responses_api=True,
+        reasoning_effort="high",
+    )
 
     if tools:
         return llm.bind_tools(tools, parallel_tool_calls=False)

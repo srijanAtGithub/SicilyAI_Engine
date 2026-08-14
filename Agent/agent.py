@@ -107,9 +107,9 @@ async def initialize_agent():
         #          returns only tools clearing the similarity threshold
         user_preferences = await get_relevant_preferences(
             " ".join(
-                m.content
+                content_to_text(m.content)
                 for m in state["messages"][-8:]
-                if isinstance(m, (HumanMessage, AIMessage)) and isinstance(m.content, str)
+                if isinstance(m, (HumanMessage, AIMessage)) and m.content
             )
         )
 
@@ -559,7 +559,7 @@ async def send(message: str, thread_id: str, status_callback=None, cancel_check=
     latest_ai_message = None
     for msg in reversed(messages):
         if isinstance(msg, AIMessage) and msg.content:
-            latest_ai_message = msg.content
+            latest_ai_message = content_to_text(msg.content)  # was: msg.content
             break
 
     # ── Interrupt check ───────────────────────────────────────
@@ -596,7 +596,7 @@ def count_tokens(messages) -> int:
 def message_to_text(m) -> str:
 
     msg_type = type(m).__name__
-    content = getattr(m, "content", "")
+    content = content_to_text(getattr(m, "content", ""))
 
     # Tool calls
     if hasattr(m, "tool_calls") and m.tool_calls:
@@ -828,3 +828,37 @@ async def log_latest_message(config):
     # Normal content
     if getattr(last, "content", None):
         log.info("Latest message content", content=last.content)
+
+
+def content_to_text(content) -> str:
+    """
+    Normalize AIMessage.content (str | list of blocks) to plain text.
+ 
+    Message content from LangChain/LLM providers can show up as:
+      - a plain string
+      - a list of blocks, where each block is either:
+          - a raw string
+          - a dict with a "type" of "text" or "output_text" and a "text" key
+          - an object with a `.text` attribute (some LangChain content types)
+ 
+    Anything else (e.g. pure tool-call or reasoning-only blocks) is skipped.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                # Prefer final text blocks; skip pure reasoning/tool blocks.
+                if block.get("type") in ("text", "output_text") and block.get("text"):
+                    parts.append(block["text"])
+            elif hasattr(block, "text"):
+                t = getattr(block, "text", None)
+                if t:
+                    parts.append(t)
+        return "\n".join(p for p in parts if p).strip()
+    return str(content)
