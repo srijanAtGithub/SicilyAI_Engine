@@ -141,14 +141,6 @@ def navigator_smart_llm(schema=None):
     return llm
 
 
-def navigator_general_llm(schema=None):
-    llm = ChatOpenAI(model="gpt-5.4-nano")
-    
-    if schema:
-        return llm.with_structured_output(schema, include_raw=False)
-    return llm
-
-
 def navigator_basic_llm(schema=None):
     llm = ChatOpenAI(model="gpt-5-nano")
     

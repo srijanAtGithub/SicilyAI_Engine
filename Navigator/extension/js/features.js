@@ -261,7 +261,7 @@ qaFontPlusBtn?.addEventListener("click", (e) => {
 });
 
 // ── Chat Capability Selector ─────────────────────────────────────────
-// Three pills (Basic / General / Smart) in the quick-actions menu that
+// Two pills (Basic / Smart) in the quick-actions menu that
 // let the user choose which LLM backs the chat. Stored here and read
 // by main.js via the exported getter so it can be included in every
 // WebSocket payload.
@@ -287,7 +287,7 @@ export function setCapability(cap) {
 try {
   chrome.storage?.local?.get([CAPABILITY_STORAGE_KEY], (result) => {
     const saved = result?.[CAPABILITY_STORAGE_KEY];
-    if (saved && ["basic", "general", "smart"].includes(saved)) {
+    if (saved && ["basic", "smart"].includes(saved)) {
       setCapability(saved);
     }
   });

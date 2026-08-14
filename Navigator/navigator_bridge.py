@@ -20,7 +20,7 @@ Design:
     with LLM configuration/ToolManagers in the future[cite: 3].
 
 Run:
-  uv run uvicorn Navigator.navigator_bridge:app --reload --port 8765[cite: 3]
+  uv run uvicorn Navigator.navigator_bridge:app --reload --port 8765
 """
 
 from langchain_core.messages import AIMessage, HumanMessage, BaseMessage

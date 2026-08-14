@@ -66,7 +66,7 @@ async def call_edit_model(
     surrounding_context: str = "",
     history: list[EditHistoryTurn] | None = None,
 ) -> str:
-    llm = configuration.navigator_general_llm(EditResult) 
+    llm = configuration.navigator_smart_llm(EditResult)
     
     # Branch the persona based on the button clicked
     if action_type == "ask":

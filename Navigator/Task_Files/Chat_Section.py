@@ -60,7 +60,6 @@ def _build_turn_text(user_text: str, snippets: list[str]) -> str:
 # Capability → LLM factory mapping
 _LLM_FACTORIES = {
     "basic":   configuration.navigator_basic_llm,
-    "general": configuration.navigator_general_llm,
     "smart":   configuration.navigator_smart_llm,
 }
 
