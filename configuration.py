@@ -134,8 +134,12 @@ def get_transcriber() -> AsyncOpenAI:
 
 
 def navigator_smart_llm(schema=None):
-    llm = ChatOpenAI(model="gpt-5.4-mini")
-    
+    llm = ChatOpenAI(
+        model="gpt-5.6-luna",
+        use_responses_api=True,
+        reasoning_effort="high",
+    )
+
     if schema:
         return llm.with_structured_output(schema, include_raw=False)
     return llm

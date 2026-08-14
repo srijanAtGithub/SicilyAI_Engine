@@ -37,7 +37,7 @@ import uuid
 from pathlib import Path
 from typing import Annotated, TypedDict
 
-from Agent.agent import content_to_text
+from shared_utils import content_to_text
 
 import structlog
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage

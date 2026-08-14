@@ -24,6 +24,7 @@ Run:
 """
 
 from langchain_core.messages import AIMessage, HumanMessage, BaseMessage
+from shared_utils import content_to_text
 
 import configuration
 configuration.load_config()
@@ -241,7 +242,7 @@ async def get_session(tab_id: str):
                 snippets = msg.additional_kwargs.get("context_snippets", [])
                 formatted_messages.append({"role": "user", "text": str(msg.content), "context_snippets": snippets})
             elif isinstance(msg, AIMessage):
-                formatted_messages.append({"role": "ai", "text": str(msg.content), "context_snippets": []})
+                formatted_messages.append({"role": "ai", "text": content_to_text(msg.content), "context_snippets": []})
                 
         return {"messages": formatted_messages}
 
@@ -338,7 +339,7 @@ async def websocket_endpoint(websocket: WebSocket, tab_id: str):
             reply_text = "(no response)"
             for msg in reversed(result["messages"]):
                 if isinstance(msg, AIMessage) and msg.content:
-                    reply_text = msg.content
+                    reply_text = content_to_text(msg.content)
                     break
 
             # Save to memory OR database depending on the session type
@@ -370,7 +371,7 @@ async def websocket_endpoint(websocket: WebSocket, tab_id: str):
                                 f"User: {user_text}\n\nAI: {reply_text}"
                             )
                             title_msg = await llm.ainvoke(prompt)
-                            title = title_msg.content.strip(' "')
+                            title = content_to_text(title_msg.content).strip(' "')
                             sessions.set_title(tab_id, title)
                             
                             # Record token usage for title generation
