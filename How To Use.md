@@ -1,10 +1,23 @@
 # How to Use
-
+ 
 ## Requirements
-
+ 
 - Python 3.11+
-- [`uv`](https://docs.astral.sh/uv/) (recommended) or pip
+- [`uv`](https://docs.astral.sh/uv/)
 
+
+`uv` will automatically fetch a compatible Python version for Sicily if you don't already have one — no separate Python install needed.
+
+## Install `uv`:
+ 
+```bash
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+ 
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+ 
 ## Installation
 
 ```bash
@@ -47,9 +60,10 @@ Opens `~/.sicily/` in your file manager. Fill in `settings.json` with your API k
 ```
 
 - All tokens are required to use the Agent mode:
-  - `TELEGRAM_BOT_TOKEN` is the token of the telegram bot
-  - Rest of the tokens are used for the respective connectors
-- For Sicily Cowork and Sicily Navigator, only `OPENAI_API_KEY` is needed.
+  - `TELEGRAM_BOT_TOKEN` is the token of the telegram bot.
+  - Rest of the tokens are used for the respective connectors.
+- For Sicily Cowork, only `OPENAI_API_KEY` is needed.
+- For Sicily Navigator, `OPENAI_API_KEY` is required, and `TAVILY_API_KEY` is required for research-backed features like "find more like this."
 
 ---
 
@@ -84,9 +98,23 @@ Type `exit` or `quit` to end the session.
 
 ### Sicily Navigator (Browser Extension)
 
-Navigator has two parts: a local backend server, and the Chrome extension itself.
+Navigator has two parts: a local backend server, and the Chrome extension itself. Set it up in this order — install the extension first, then start the backend.
 
-**1. Start the backend:**
+**1. Install the extension:**
+
+```bash
+sicily navigator --install
+```
+
+This copies the bundled `Navigator/extension` folder to your system's **Downloads** folder (as `sicily-navigator-extension`) and prints the destination path in your terminal — this works the same way on both Windows and macOS. Then follow the printed steps to load it into Chrome:
+
+1. Open Chrome and go to `chrome://extensions`
+2. Turn on **Developer mode** (top-right toggle)
+3. Click **Load unpacked**
+4. Select the folder printed by the command (`Downloads/sicily-navigator-extension`)
+5. The Sicily Navigator icon should now appear in your Chrome toolbar
+
+**2. Start the backend:**
 
 ```bash
 sicily navigator --start
@@ -101,7 +129,9 @@ sicily navigator --status   # check whether it's running
 sicily navigator --stop     # stop it
 ```
 
-**2. Load the extension in Chrome**, then use it in two ways:
+> **Important:** if you had tabs open *before* running `sicily navigator --start`, reload those tabs. Otherwise the right-click writing tools (the floating context-menu window) won't appear on them — they only attach to tabs loaded after the backend is up.
+
+**3. Use it** in two ways:
 
 - **Right-click any selected text** on any web page to get writing tools — rewrite, summarise, or ask a question about the selection.
 - **Open the side panel** for the chat bot, one-click page summarise, one-click tab organiser, "find more like this," the reading list, drag-and-drop snippets and collections, and `@`-tab / `#`-collection references.
@@ -117,7 +147,7 @@ sicily navigator --stop     # stop it
 | `sicily config`        | Opens the config folder in your file manager                                                    |
 | `sicily run`           | Starts the full Telegram agent (requires all API keys)                                          |
 | `sicily start`         | Starts a local terminal session sandboxed to the current directory (requires only OpenAI key)   |
-| `sicily navigator`     | Manages the Navigator backend for the browser extension — `--start`, `--stop`, `--status`       |
+| `sicily navigator`     | Manages the Navigator extension and backend — `--install`, `--start`, `--stop`, `--status`       |
 | `sicily usage`         | Shows token usage and estimated cost — `--session`, `--day`, `--week`                           |
 | `sicily update`        | Updates Sicily to the latest published version                                                  |
 | `sicily reset`         | Resets all config, Souls, Context, and file index back to defaults                              |
