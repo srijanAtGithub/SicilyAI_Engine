@@ -207,14 +207,66 @@ def _run_navigator_server():
     )
 
 
+def _get_downloads_dir() -> Path:
+    """Resolve the system Downloads folder, cross-platform (Windows, macOS, Linux)."""
+    home = Path.home()
+    downloads = home / "Downloads"
+
+    if sys.platform == "win32":
+        # Downloads isn't always under %USERPROFILE% (e.g. OneDrive-redirected
+        # folders) — ask the shell via the registry-backed known-folder API.
+        try:
+            import ctypes
+            from ctypes import windll, wintypes
+
+            FOLDERID_Downloads = "{374DE290-123F-4565-9164-39C4925E467B}"
+            buf = ctypes.c_wchar_p()
+            guid = ctypes.create_unicode_buffer(FOLDERID_Downloads)
+            # SHGetKnownFolderPath needs a GUID struct, not a string; fall back
+            # cleanly if anything about this isn't available.
+            import uuid
+            class GUID(ctypes.Structure):
+                _fields_ = [
+                    ("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                    ("Data3", wintypes.WORD), ("Data4", ctypes.c_byte * 8),
+                ]
+            rfid = GUID()
+            u = uuid.UUID(FOLDERID_Downloads)
+            rfid.Data1, rfid.Data2, rfid.Data3 = u.time_low, u.time_mid, u.time_hi_version
+            rest = u.bytes[8:]
+            for i, b in enumerate(rest):
+                rfid.Data4[i] = b
+            windll.shell32.SHGetKnownFolderPath(ctypes.byref(rfid), 0, 0, ctypes.byref(buf))
+            if buf.value:
+                downloads = Path(buf.value)
+        except Exception:
+            pass  # fall back to home / "Downloads" set above
+
+    return downloads
+
+
+def _find_navigator_extension_source() -> Path | None:
+    """Locate the bundled Navigator/extension folder relative to the package."""
+    package_dir = Path(__file__).resolve().parent
+    candidates = [
+        package_dir / "Navigator" / "extension",
+        package_dir.parent / "Navigator" / "extension",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 @main_cli.command(context_settings={"ignore_unknown_options": True})
 @click.option("--start", "do_start", is_flag=True, help="Start the Navigator backend in the background.")
 @click.option("--stop", "do_stop", is_flag=True, help="Stop the running Navigator backend.")
 @click.option("--status", "do_status", is_flag=True, help="Check whether the Navigator backend is running.")
+@click.option("--install", "do_install", is_flag=True, help="Copy the Navigator extension folder locally and show Chrome load-unpacked steps.")
 @click.option("--foreground", "_foreground", is_flag=True, hidden=True,
               help="Internal: run the server in this process (used by --start's child process).")
-def navigator(do_start, do_stop, do_status, _foreground):
-    """Manage the Sicily Navigator backend for the browser extension."""
+def navigator(do_start, do_stop, do_status, do_install, _foreground):
+    """Manage the Sicily Navigator backend and browser extension."""
 
     # Internal re-entry point: the detached background process calls itself
     # with this hidden flag so uvicorn actually runs somewhere.
@@ -223,14 +275,52 @@ def navigator(do_start, do_stop, do_status, _foreground):
         _run_navigator_server()
         return
 
-    flags_set = sum([do_start, do_stop, do_status])
+    flags_set = sum([do_start, do_stop, do_status, do_install])
     if flags_set == 0:
-        click.secho("  Specify one of: --start, --stop, --status", fg="yellow", bold=True)
-        click.echo("  e.g.  sicily navigator --start")
+        click.secho("  Specify one of: --install, --start, --stop, --status", fg="yellow", bold=True)
+        click.echo("  e.g.  sicily navigator --install")
         return
     if flags_set > 1:
-        click.secho("  Please pass only one of --start / --stop / --status at a time.", fg="red")
+        click.secho("  Please pass only one of --install / --start / --stop / --status at a time.", fg="red")
         raise click.Abort()
+
+    if do_install:
+        src = _find_navigator_extension_source()
+        if src is None:
+            click.secho("  ✗ Could not find the Navigator/extension folder in the package.", fg="red", bold=True)
+            click.echo("  Your Sicily install may be corrupted — try `sicily update`.")
+            raise click.Abort()
+
+        downloads_dir = _get_downloads_dir()
+        try:
+            downloads_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            downloads_dir = Path.home() / "Downloads"
+            downloads_dir.mkdir(parents=True, exist_ok=True)
+
+        dest = downloads_dir / "sicily-navigator-extension"
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(src, dest)
+
+        click.secho("\n  ✓ Navigator extension copied to:", fg="green", bold=True)
+        click.secho(f"    {dest}", fg="cyan")
+
+        click.echo("\n  Now load it into Chrome:")
+        click.echo("    1. Open Chrome and go to  chrome://extensions")
+        click.echo("    2. Turn on 'Developer mode' (top-right toggle)")
+        click.echo("    3. Click 'Load unpacked'")
+        click.echo(f"    4. Select this folder:  {dest}")
+        click.echo("    5. The Sicily Navigator icon should now appear in your Chrome toolbar")
+
+        click.echo("\n  Then start the backend if it isn't already running:")
+        click.secho("    sicily navigator --start\n", fg="cyan")
+
+        click.secho("  Note:", fg="yellow", bold=True)
+        click.echo("  If you had tabs open BEFORE running `sicily navigator --start`,")
+        click.echo("  reload those tabs — otherwise the right-click writing tools")
+        click.echo("  (the floating context-menu window) won't appear on them.\n")
+        return
 
     if do_status:
         pid = _read_navigator_pid()
@@ -401,6 +491,26 @@ def update():
         return
 
     click.echo("  Checking for updates...")
+
+    if sys.platform == "win32":
+        # On Windows, `sicily.exe` cannot overwrite itself while it's the
+        # running process — the file is locked by the OS. Detach `uv` into
+        # an independent process and exit immediately so the lock is
+        # released before uv tries to replace the launcher.
+        click.echo("  Relaunching the update in the background so sicily.exe can be replaced...")
+        log_path = SICILY_HOME / "update.log"
+        SICILY_HOME.mkdir(exist_ok=True)
+        log_fh = open(log_path, "a")
+        subprocess.Popen(
+            [uv_path, "tool", "install", "--reinstall", "sicily"],
+            stdout=log_fh, stderr=log_fh, stdin=subprocess.DEVNULL,
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+        click.secho("  ✓ Update started in the background.", fg="green", bold=True)
+        click.echo(f"  Check progress / errors in: {log_path}")
+        click.echo("  Run `sicily --version` in a new terminal in a few seconds to confirm.")
+        return
+
     result = subprocess.run(
         [uv_path, "tool", "install", "--reinstall", "sicily"],
         capture_output=True,
@@ -411,6 +521,8 @@ def update():
     else:
         click.secho("  ✗ Update failed. Try running manually:", fg="red")
         click.secho("      uv tool install --reinstall sicily", fg="cyan")
+        if result.stdout:
+            click.echo(f"  uv output: {result.stdout.strip()}")
         if result.stderr:
             click.echo(f"  uv error: {result.stderr.strip()}")
 
@@ -536,7 +648,7 @@ def help():
     click.echo("  run           - Run the agent")
     click.echo("  start         - Start a local terminal session")
     click.echo("  navigator     - Manage the browser extension backend")
-    click.echo("                    --start / --stop / --status")
+    click.echo("                    --install / --start / --stop / --status")
     click.echo("  usage         - Show token usage and estimated cost")
     click.echo("  update        - Update Sicily to the latest version")
     click.echo("  reset         - Reset all config and indexes back to default")

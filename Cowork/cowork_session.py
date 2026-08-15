@@ -60,7 +60,7 @@ from Cowork.debug_log import reset_step_counter, log_tool_call, log_llm_tokens, 
 log = structlog.get_logger()
 
 BANNER = """
-╔═════════════ Sicily v3.0.0 ══════════════╦════════════ What Sicily Cowork Can Do ═════════════╗
+╔═════════════ Sicily v3.1.0 ══════════════╦════════════ What Sicily Cowork Can Do ═════════════╗
 ║                                          ║                                                    ║
 ║                                          ║    Sicily can search, inspect, read, organize,     ║
 ║  Files are sandboxed to this directory.  ║    and safely modify the contents of your          ║
