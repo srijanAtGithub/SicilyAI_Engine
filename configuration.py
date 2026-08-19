@@ -108,6 +108,7 @@ def get_cowork_llm(tools=None):
         model="gpt-5.6-luna",
         use_responses_api=True,          # enables tools + reasoning together
         reasoning_effort="max",          # default is medium
+        max_retries=0,                   # let _ainvoke_with_retry own all retry/backoff
     )
 
     if tools:

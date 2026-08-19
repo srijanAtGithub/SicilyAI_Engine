@@ -3,18 +3,6 @@ cowork_session.py
 ----------------
 A self-contained terminal chat session for `sicily start`.
 
-Completely independent of:
-  - Telegram
-  - FastAPI / uvicorn
-  - session_store (SQLite)
-  - recurring tasks
-
-Uses:
-  - LangGraph (same as the main agent, but a fresh minimal graph)
-  - cowork_tools.py  (sandboxed file tools)
-  - configuration.py (reuses your existing LLM setup)
-  - memory_and_context.get_system_message  (reuses your Soul files)
-
 Use from:
   - uv build
   - uv pip install dist/sicily-0.2.3-py3-none-any.whl
@@ -33,6 +21,8 @@ _load_settings()
 
 import asyncio
 import operator
+import random
+import re
 import uuid
 from pathlib import Path
 from typing import Annotated, TypedDict
@@ -44,6 +34,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langgraph.errors import GraphRecursionError
+from openai import APIError
 
 from rich.console import Console
 from rich.panel import Panel
@@ -95,6 +86,90 @@ summarizer_llm = configuration.get_summarizer_llm()
 # ── Agent state ───────────────────────────────────────────────────────────────
 class LocalState(TypedDict):
     messages: Annotated[list, operator.add]
+
+
+_RATE_LIMIT_MSG_RE = re.compile(r"rate.?limit", re.IGNORECASE)
+
+
+def _is_rate_limit_error(e: APIError) -> bool:
+    """
+    True if e is a rate limit, whether it arrived as a proper HTTP 429
+    (RateLimitError, has .response / .status_code) or as a mid-stream SSE
+    error event. The Responses/Assistants streaming path raises a bare
+    APIError with no .response at all in that second case (see
+    openai/_streaming.py), so status_code isn't always available and we
+    fall back to checking the message/body for a rate-limit signature.
+    """
+    status_code = getattr(e, "status_code", None)
+    if status_code is not None:
+        return status_code == 429
+
+    haystack = " ".join(
+        str(part) for part in (getattr(e, "message", None), getattr(e, "body", None)) if part
+    )
+    return bool(_RATE_LIMIT_MSG_RE.search(haystack))
+
+
+async def _ainvoke_with_retry(llm, messages, max_retries=5, on_retry=None):
+    """
+    Call llm.ainvoke(messages), retrying on rate limits.
+
+    Honors the provider's own retry-after / retry-after-ms header when
+    present (this is what the API tells us to wait, so we trust it over
+    a guess), and falls back to exponential backoff with jitter otherwise
+    — including the streaming-API case, where a rate limit arrives as a
+    bare APIError with no HTTP response/headers attached at all.
+
+    on_retry, if given, is called with (attempt, wait_seconds, max_retries)
+    right before each sleep, so callers can surface progress to the user
+    (e.g. updating a status spinner) without this helper knowing about UI.
+    """
+    attempt = 0
+    while True:
+        try:
+            return await llm.ainvoke(messages)
+        except APIError as e:
+            if not _is_rate_limit_error(e):
+                raise
+
+            attempt += 1
+            if attempt > max_retries:
+                raise
+
+            wait_s = None
+            response = getattr(e, "response", None)
+            headers = getattr(response, "headers", None) if response else None
+            if headers:
+                retry_after_ms = headers.get("retry-after-ms")
+                retry_after = headers.get("retry-after")
+                if retry_after_ms is not None:
+                    try:
+                        wait_s = float(retry_after_ms) / 1000
+                    except (TypeError, ValueError):
+                        wait_s = None
+                elif retry_after is not None:
+                    try:
+                        wait_s = float(retry_after)
+                    except (TypeError, ValueError):
+                        wait_s = None
+
+            if wait_s is None:
+                # No usable hint from the server (always true for the
+                # streaming SSE path) — back off exponentially, with
+                # jitter so concurrent callers don't retry in lockstep.
+                wait_s = min(2 ** attempt, 30) + random.uniform(0, 1)
+
+            log.warning(
+                "Rate limited, retrying",
+                attempt=attempt,
+                max_retries=max_retries,
+                wait_seconds=round(wait_s, 2),
+            )
+
+            if on_retry:
+                on_retry(attempt, wait_s, max_retries)
+
+            await asyncio.sleep(wait_s)
 
 
 # ── Build a minimal LangGraph for local use ───────────────────────────────────
@@ -159,7 +234,7 @@ def build_local_graph():
         # it — losing the exact evidence the model just gathered mid
         # investigation. Summarization instead happens once, in
         # run_local_session, right when a fresh user message arrives.
-        response = await main_llm.ainvoke([
+        response = await _ainvoke_with_retry(main_llm, [
             SystemMessage(content=system_message + sandbox_notice),
             *state["messages"],
         ])
@@ -452,6 +527,18 @@ async def run_local_session():
                     "wrap up cleanly. Try breaking your question into smaller "
                     "steps, or ask me to continue from where I left off."
                 )
+
+        except APIError as e:
+            if _is_rate_limit_error(e):
+                log.warning("Rate limit exhausted after retries", error=str(e))
+                print_ai(
+                    "I'm being rate-limited by the model provider right now. "
+                    "I retried a few times but it hasn't cleared up yet. "
+                    "Wait a moment and try your message again."
+                )
+            else:
+                log.exception("Local session error")
+                print_ai(f"Something went wrong: {e}")
 
         except Exception as e:
             log.exception("Local session error")
