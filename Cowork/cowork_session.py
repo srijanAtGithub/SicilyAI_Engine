@@ -22,6 +22,7 @@ Use from:
   - sicily start
 """
 
+from Cowork.debug_log import DEBUG
 from pathlib import Path
 
 def _load_settings():
@@ -55,7 +56,7 @@ import configuration
 console = Console()
 from Cowork.cowork_tools import LOCAL_TOOLS, set_sandbox_root, get_friendly_tool_message
 from Agent.agent import maybe_summarize
-from Cowork.debug_log import reset_step_counter, log_tool_call, log_llm_tokens, log_turn_summary
+from Cowork.debug_log import reset_step_counter, log_tool_call, log_llm_tokens, log_turn_summary, log_error
 
 log = structlog.get_logger()
 
@@ -378,7 +379,9 @@ async def run_local_session():
                     elif event["event"] == "on_tool_error":
                         tool_name = event.get("name", "tool")
                         error = event.get("data", {}).get("error", "unknown error")
-                        status.update(f"[yellow]{tool_name} hit an error: {error}[/yellow]")
+                        log_error(f"Tool {tool_name} error", error)
+                        if DEBUG:
+                            status.update(f"[yellow]{tool_name} hit an error: {error}[/yellow]")
                     
                     # 4. Capture the final state when the main graph finishes
                     elif event["event"] == "on_chain_end" and event.get("run_id") == root_run_id:
@@ -445,8 +448,8 @@ async def run_local_session():
                         log.warning("record_usage failed for cowork recursion fallback", error=str(rec_err))
                 messages.append(final)
                 print_ai(final.content or "(No response)")
-            except Exception:
-                log.exception("Recursion-limit fallback also failed")
+            except Exception as e:
+                log_error("Recursion-limit fallback failed", e)
                 print_ai(
                     "I ran out of tool-call budget digging into this and couldn't "
                     "wrap up cleanly. Try breaking your question into smaller "
@@ -454,8 +457,11 @@ async def run_local_session():
                 )
 
         except Exception as e:
-            log.exception("Local session error")
-            print_ai(f"Something went wrong: {e}")
+            log_error("Local session error", e)
+            if DEBUG:
+                print_ai(f"Something went wrong: {e}")
+            else:
+                print_ai("An unexpected error occurred. Please try again later")
 
 
 # ── Terminal I/O helpers ──────────────────────────────────────────────────────
