@@ -13,7 +13,7 @@ Usage
 # ── The switch ───────────────────────────────────────────────────────────────
 # Flip this by hand. True  = print tool/token debug lines.
 #                    False = production behaviour, nothing extra printed.
-DEBUG = False
+DEBUG = True
 
 _step = 0  # running counter so you can see call order across a whole turn
 

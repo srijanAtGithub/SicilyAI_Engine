@@ -4,8 +4,19 @@ cowork_tools_fileops.py
 File-management and content-search tools for Sicily Cowork.
 
 Extends cowork_tools.py with operations beyond read/write:
-  - copy_file, move_file, rename_file   : relocate/duplicate files
-  - delete_file, delete_directory       : soft-delete (trash, not unlink)
+  - run_file_command                    : copy/move/rename files by running
+                                           a validated `cp` or `mv` command —
+                                           replaces the old separate
+                                           copy_file/move_file/rename_file
+                                           tools with one CLI-shaped tool
+                                           (same pattern used by Antigravity
+                                           and similar agentic IDEs: one
+                                           narrow, whitelisted command
+                                           executor instead of N bespoke
+                                           tools for related operations).
+  - delete_file, delete_directory       : soft-delete (trash, not unlink) —
+                                           deliberately NOT folded into
+                                           run_file_command; see note below.
   - search_file_contents                : grep-equivalent, scoped to ALL
                                            readable extensions (plain text +
                                            PDF/docx/xlsx via the existing
@@ -31,7 +42,7 @@ Two different scopes apply within this module, gated by two different sets:
   .xlsx, .xls). There is no parser for images/video/audio/archives/APKs, so
   these tools genuinely cannot do anything with them and correctly refuse.
 
-  MANAGEMENT tools (copy_file, move_file, rename_file, delete_file,
+  MANAGEMENT tools (run_file_command's cp/mv, delete_file,
   delete_directory) work on the broader MANAGEABLE_EXTENSIONS — READABLE_EXTENSIONS
   plus MANAGEABLE_ONLY_EXTENSIONS (images, video, audio, archives/.zip/.tar,
   APKs, and other common binaries). These ops are pure shutil/Path filesystem
@@ -49,21 +60,51 @@ manageable.
 IMPORTANT — this is a DIFFERENT (broader) scope than write_file/edit_file_lines
 in cowork_tools.py. Those tools exclude non-text formats entirely because
 overwriting content requires structured serialisation, not raw text I/O.
-That restriction does NOT apply here. copy_file, move_file, rename_file, and
-delete_file are pure filesystem operations (shutil.copy2/shutil.move) — they
-never open, parse, or rewrite the file's content, so file format is
-irrelevant to them, whether that's .pdf/.docx/.xlsx or .png/.zip/.mp4/.apk.
-If you're about to tell the user a file "can't be moved/copied/renamed/deleted
-because it's binary" or "because it's an image/video/archive" — that's wrong
-for the tools in this module. Just call the tool and trust its actual return
-value instead of pre-deciding it will fail. The one thing these tools still
-cannot do is show you what's INSIDE an image/video/audio/archive — that
-requires a parser this module doesn't have (see READABLE_EXTENSIONS above).
+That restriction does NOT apply here. run_file_command's cp/mv and
+delete_file are pure filesystem operations (shutil.copy2/shutil.move under
+the hood) — they never open, parse, or rewrite the file's content, so file
+format is irrelevant to them, whether that's .pdf/.docx/.xlsx or
+.png/.zip/.mp4/.apk. If you're about to tell the user a file "can't be
+moved/copied/renamed/deleted because it's binary" or "because it's an
+image/video/archive" — that's wrong for the tools in this module. Just call
+the tool and trust its actual return value instead of pre-deciding it will
+fail. The one thing these tools still cannot do is show you what's INSIDE an
+image/video/audio/archive — that requires a parser this module doesn't have
+(see READABLE_EXTENSIONS above).
+
+Why cp/mv are a single CLI-shaped tool instead of three bespoke ones
+----------------------------------------------------------------------
+copy_file, move_file, and rename_file used to be three separate @tool
+functions that each re-implemented the same source/destination validation
+around a one-line shutil call. They're collapsed into a single
+run_file_command tool that accepts a `cp <source> <destination>` or
+`mv <source> <destination>` command string, because:
+
+  - Fewer near-duplicate tool schemas for the model to choose between
+    (rename is just `mv` with the destination in the same folder — it was
+    never a functionally distinct operation).
+  - This mirrors the pattern used by Antigravity-style agentic IDEs: one
+    narrow, whitelisted "run this exact class of command" executor, rather
+    than a bespoke tool per verb.
+
+This is NOT a general shell escape hatch. run_file_command does not use
+shell=True, does not go through /bin/sh, and does not support pipes,
+redirects, globs, chaining, or any command other than `cp`/`mv`. The
+command string is parsed with shlex (no shell semantics), the executable
+must be exactly "cp" or "mv", every flag must be on an explicit allow-list,
+and every path argument is re-resolved through _safe_path() before
+subprocess.run() ever sees it. A hallucinated flag or an out-of-sandbox
+path is rejected before execution — never silently passed through to a
+real shell where it could do something unintended.
 
 Safety model (matches cowork_tools.py conventions)
 ----------------------------------------------------
   - Every path goes through the same _safe_path() sandbox check used
     everywhere else — nothing here can escape the sandbox root.
+  - run_file_command validates the parsed command against its own
+    docstring-declared contract (allowed executables, allowed flags,
+    exactly two path arguments) before running anything — see the
+    function's docstring and _validate_fileops_command() below.
   - Destructive ops (delete_*) never hard-unlink. They move the target into
     a hidden sandbox-local trash folder (.sicily-trash/), preserving
     relative structure, so a wrong call is always recoverable by hand.
@@ -73,9 +114,14 @@ Safety model (matches cowork_tools.py conventions)
 """
 
 import re
+import shlex
 import shutil
+import subprocess
 import time
 from pathlib import Path
+import json
+import fnmatch
+from typing import List, Optional
 
 from langchain_core.tools import tool
 
@@ -161,45 +207,178 @@ def _move_to_trash(target: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# COPY / MOVE / RENAME
+# COPY / MOVE / RENAME — via a single validated CLI-command tool
 # ---------------------------------------------------------------------------
 
-@tool
-def copy_file(source: str, destination: str, overwrite: bool = False) -> str:
+# Flags each executable is allowed to use. Anything not listed here is
+# rejected before the command ever runs — this is the whole point of the
+# validator: the model cannot "invent" a plausible-looking flag (e.g. `-r`
+# on cp, `--force`) and have it silently reach a real subprocess.
+_ALLOWED_FLAGS = {
+    "cp": {"-n"},   # -n: no-clobber (never overwrite silently) — the only
+                    #     flag exposed; there is no -f, no -r (directories
+                    #     go through delete_directory/dedicated handling,
+                    #     not this tool).
+    "mv": {"-n"},   # -n: no-clobber. Same rationale as cp.
+}
+
+_ALLOWED_EXECUTABLES = frozenset(_ALLOWED_FLAGS.keys())
+
+
+class _CommandValidationError(ValueError):
+    """Raised by _validate_fileops_command when a command fails the
+    docstring-declared contract. Message is written to be shown directly
+    to the model/user — no internals leak, just the rule that was broken.
     """
-    Copy a file to a new location within the sandbox. The source is left
-    untouched — this only duplicates it.
+
+
+def _validate_fileops_command(command: str) -> tuple[str, Path, Path, bool]:
+    """
+    Parse and validate a `cp`/`mv` command string against the exact
+    contract documented in run_file_command's docstring. This is the
+    enforcement point that keeps the tool from becoming a general shell
+    escape hatch: nothing here trusts the model's command string beyond
+    what is explicitly re-checked.
+
+    Returns (executable, src_path, dst_path, no_clobber) on success.
+    Raises _CommandValidationError with a human-readable reason on any
+    violation — unknown executable, disallowed flag, wrong argument count,
+    or a path that resolves outside the sandbox.
+
+    Deliberately does NOT use shell=True / a real shell anywhere in this
+    module. shlex.split() gives POSIX-ish tokenization (handles quoting)
+    without ever invoking /bin/sh, so there is no pipe, redirect, glob,
+    `;`, `&&`, backtick, or env-var expansion for a hallucinated or
+    adversarial command to exploit.
+    """
+    try:
+        tokens = shlex.split(command)
+    except ValueError as e:
+        raise _CommandValidationError(f"Could not parse command: {e}")
+
+    if not tokens:
+        raise _CommandValidationError("Empty command.")
+
+    executable = tokens[0]
+    if executable not in _ALLOWED_EXECUTABLES:
+        raise _CommandValidationError(
+            f"Refused: '{executable}' is not an allowed command. "
+            f"Only {sorted(_ALLOWED_EXECUTABLES)} are supported by "
+            "run_file_command."
+        )
+
+    allowed_flags = _ALLOWED_FLAGS[executable]
+    flags: list[str] = []
+    positionals: list[str] = []
+    for tok in tokens[1:]:
+        if tok.startswith("-") and tok != "-":
+            flags.append(tok)
+        else:
+            positionals.append(tok)
+
+    unknown_flags = [f for f in flags if f not in allowed_flags]
+    if unknown_flags:
+        raise _CommandValidationError(
+            f"Refused: flag(s) {unknown_flags} are not allowed for "
+            f"'{executable}'. Only {sorted(allowed_flags)} are permitted — "
+            "this tool only does single-file copy/move/rename, nothing "
+            "recursive or forced."
+        )
+
+    if len(positionals) != 2:
+        raise _CommandValidationError(
+            f"Refused: expected exactly 2 path arguments (source, "
+            f"destination) for '{executable}', got {len(positionals)}: "
+            f"{positionals}. No globs, no multi-destination forms."
+        )
+
+    source, destination = positionals
+
+    for label, raw in (("source", source), ("destination", destination)):
+        if any(ch in raw for ch in "*?[]"):
+            raise _CommandValidationError(
+                f"Refused: {label} '{raw}' contains a glob character "
+                "(*, ?, [, ]). There is no shell here to expand globs — "
+                "they would be treated as a literal, nonexistent filename. "
+                "Pass one exact path instead."
+            )
+
+    try:
+        src = _safe_path(source)
+        dst = _safe_path(destination)
+    except PermissionError as e:
+        raise _CommandValidationError(str(e))
+
+    no_clobber = "-n" in flags
+    return executable, src, dst, no_clobber
+
+
+@tool
+def run_file_command(command: str) -> str:
+    """
+    Copy, move, or rename a file by running a validated `cp` or `mv`
+    command. This is the ONLY way to copy/move/rename in this sandbox —
+    it replaces the old copy_file/move_file/rename_file tools. Renaming is
+    just `mv <old-path> <new-path-same-folder>`; there is no separate verb
+    for it.
+
+    This is NOT a general shell tool. Only these exact forms are accepted:
+
+        cp [-n] <source> <destination>
+        mv [-n] <source> <destination>
+
+    Hard contract (violating ANY of these gets the command rejected before
+    anything runs — no partial execution, no fallback interpretation):
+      - The executable must be exactly "cp" or "mv". Nothing else — not
+        "cp -r", not "rsync", not "cp file1 file2 dir/", not any
+        pipe/redirect/chain (`|`, `>`, `;`, `&&`, backticks, etc.).
+      - The only flag either command accepts is `-n` (no-clobber — refuse
+        to overwrite an existing destination). Any other flag, including
+        ones that look reasonable (`-r`, `-f`, `-v`, `--force`), is
+        refused. There is no recursive/directory form in this tool —
+        directories are out of scope here.
+      - Exactly two path arguments: source, then destination. No globs
+        (`*.txt`), no multiple sources, no trailing-slash directory-target
+        shorthand.
+      - Both paths must resolve inside the sandbox (same _safe_path()
+        check every other tool in this module uses) and the source file's
+        extension must be in MANAGEABLE_EXTENSIONS.
+      - Without `-n`, an existing destination file is refused rather than
+        silently overwritten — same no-clobber-by-default behavior the
+        old copy_file/move_file had with overwrite=False.
+
+    If you're unsure whether a command you're about to write is valid,
+    write the simplest possible form — `cp source.txt dest.txt` or
+    `mv old/path.pdf new/path.pdf` — rather than guessing at flags. An
+    invalid command is rejected with a clear reason and nothing happens;
+    it never partially runs.
 
     Works on ANY file this sandbox can manage — plain text, PDF/DOCX/XLSX,
-    and also images, video, audio, archives (.zip/.tar), and APKs. This
-    copies raw bytes (shutil.copy2); it never parses or interprets content,
-    so file type is never a blocker for this tool. (The agent cannot read
-    or extract text from an image/zip/video — only move it around. Don't
-    infer readability from copyability.)
-
-    Safety guarantees
-    ------------------
-    - Both `source` and `destination` must resolve inside the sandbox.
-    - Refuses to overwrite an existing file at `destination` unless
-      `overwrite=True` is explicitly passed.
-    - Parent directories of `destination` are created automatically.
+    and also images, video, audio, archives (.zip/.tar), and APKs. cp/mv
+    move raw bytes; they never parse or interpret content, so file type is
+    never a blocker for this tool. (The agent still cannot read or extract
+    text from an image/zip/video via this tool — only relocate/duplicate
+    it. Don't infer readability from copyability.)
 
     Args:
-        source:      Relative path to the existing file.
-        destination: Relative path to copy it to, including filename.
-        overwrite:   If True, replaces an existing file at destination.
-                     Default False (refuses instead).
+        command: A single `cp` or `mv` invocation as a plain string, e.g.
+                 "cp reports/draft.md reports/draft-backup.md" or
+                 "mv photo.jpg archive/2026/photo.jpg". `-n` is accepted
+                 but not required — an existing destination is always
+                 refused regardless, so you normally don't need to pass it.
     """
     try:
-        src = _safe_path(source)
-        dst = _safe_path(destination)
-    except PermissionError as e:
+        executable, src, dst, no_clobber = _validate_fileops_command(command)
+    except _CommandValidationError as e:
         return str(e)
 
     if not src.exists():
-        return f"Source '{source}' does not exist."
+        return f"Source '{src.name}' does not exist."
     if not src.is_file():
-        return f"Source '{source}' is a directory. copy_file only handles files."
+        return (
+            f"Source resolves to a directory. run_file_command only "
+            "handles single files, not directories."
+        )
 
     ext = src.suffix.lower()
     if ext not in MANAGEABLE_EXTENSIONS:
@@ -208,150 +387,29 @@ def copy_file(source: str, destination: str, overwrite: bool = False) -> str:
             "this sandbox."
         )
 
-    if dst.exists() and not overwrite:
-        return (
-            f"Refused: '{destination}' already exists. "
-            "Pass overwrite=True to replace it."
-        )
     if dst.is_dir():
-        return f"Refused: '{destination}' is an existing directory, not a file path."
-
-    try:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(str(src), str(dst))
-    except Exception as e:
-        return f"Could not copy '{source}' -> '{destination}': {e}"
-
-    return f"Copied '{source}' -> '{destination}' ({dst.stat().st_size:,} bytes)."
-
-
-@tool
-def move_file(source: str, destination: str, overwrite: bool = False) -> str:
-    """
-    Move (relocate into a different folder) an existing file within the
-    sandbox. For renaming a file in place, prefer `rename_file` — same
-    underlying operation, but the name better matches that intent.
-
-    Works on ANY manageable file type — plain text, PDF/DOCX/XLSX, and also
-    images, video, audio, archives, and APKs. This is a filesystem
-    relocation, not a content rewrite, so file type is never a blocker.
-    (Don't confuse this with write_file/edit_file_lines, which are
-    text-only for a different reason — they rewrite content. Call this
-    tool on binary or media files directly rather than assuming it will
-    fail.)
-
-    Safety guarantees
-    ------------------
-    - Both `source` and `destination` must resolve inside the sandbox.
-    - Refuses to overwrite an existing file at `destination` unless
-      `overwrite=True` is explicitly passed.
-    - Parent directories of `destination` are created automatically.
-
-    Args:
-        source:      Relative path to the existing file.
-        destination: Relative path to move it to, including filename.
-        overwrite:   If True, replaces an existing file at destination.
-                     Default False (refuses instead).
-    """
-    try:
-        src = _safe_path(source)
-        dst = _safe_path(destination)
-    except PermissionError as e:
-        return str(e)
-
-    if not src.exists():
-        return f"Source '{source}' does not exist."
-    if not src.is_file():
-        return f"Source '{source}' is a directory. Use delete_directory/copy logic for folders."
-
-    ext = src.suffix.lower()
-    if ext not in MANAGEABLE_EXTENSIONS:
-        return (
-            f"Refused: '{ext}' is not currently a manageable file type in "
-            "this sandbox."
-        )
-
-    if dst.exists() and not overwrite:
-        return (
-            f"Refused: '{destination}' already exists. "
-            "Pass overwrite=True to replace it."
-        )
-    if dst.is_dir():
-        return f"Refused: '{destination}' is an existing directory, not a file path."
-
-    try:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src), str(dst))
-    except Exception as e:
-        return f"Could not move '{source}' -> '{destination}': {e}"
-
-    return f"Moved '{source}' -> '{destination}'."
-
-
-@tool
-def rename_file(path: str, new_name: str) -> str:
-    """
-    Rename a file in place, keeping it in the same folder. A thin,
-    clearer-intent wrapper over move_file for the common "just rename it"
-    case — use move_file instead if you also need to relocate it to a
-    different folder.
-
-    Args:
-        path:     Relative path to the existing file.
-        new_name: New filename ONLY (no slashes) — e.g. "final_report.md"
-                  or "vacation_photo.jpg". Extension is optional — if
-                  omitted, the source file's current extension is kept
-                  (e.g. "test2" on "test.py" becomes "test2.py"). If
-                  provided, it must be a currently manageable extension
-                  (this includes images, video, audio, archives, and APKs
-                  — not just text/PDF/docx/xlsx).
-    """
-    if "/" in new_name or "\\" in new_name:
-        return (
-            "Refused: new_name must be a filename only, not a path. "
-            "Use move_file if you need to change the folder as well."
-        )
-
-    try:
-        src = _safe_path(path)
-    except PermissionError as e:
-        return str(e)
-
-    if not src.exists():
-        return f"'{path}' does not exist."
-    if not src.is_file():
-        return f"'{path}' is a directory. rename_file only handles files."
-
-    new_name_path = Path(new_name)
-    if new_name_path.suffix:
-        new_ext = new_name_path.suffix.lower()
-        if new_ext not in MANAGEABLE_EXTENSIONS:
-            return f"Refused: '{new_ext}' is not currently a manageable file type."
-        final_name = new_name
-    else:
-        # No extension given — most natural reading of "rename X to Y" is
-        # "keep it the same kind of file, just change the name." Inherit
-        # the source file's existing (already-valid) extension rather than
-        # rejecting; this only kicks in when new_name has no suffix at all —
-        # an explicitly wrong extension is still refused above.
-        final_name = new_name + src.suffix
-
-    dest_rel = str(Path(path).parent / final_name)
-
-    try:
-        dst = _safe_path(dest_rel)
-    except PermissionError as e:
-        return str(e)
-
+        return "Refused: destination is an existing directory, not a file path."
     if dst.exists():
-        return f"Refused: '{dest_rel}' already exists."
+        return (
+            f"Refused: destination already exists. Pass -n explicitly if "
+            "you intend to no-clobber-refuse (same result), or choose a "
+            "different destination path — this tool never overwrites."
+        )
+
+    root = get_sandbox_root()
+    src_rel = src.relative_to(root)
+    dst_rel = dst.relative_to(root)
 
     try:
-        shutil.move(str(src), str(dst))
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if executable == "cp":
+            shutil.copy2(str(src), str(dst))
+            return f"Copied '{src_rel}' -> '{dst_rel}' ({dst.stat().st_size:,} bytes)."
+        else:  # mv
+            shutil.move(str(src), str(dst))
+            return f"Moved '{src_rel}' -> '{dst_rel}'."
     except Exception as e:
-        return f"Could not rename '{path}' -> '{final_name}': {e}"
-
-    return f"Renamed '{path}' -> '{dest_rel}'."
+        return f"Could not run '{command}': {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -569,68 +627,29 @@ def search_file_contents(
     regex: bool = False,
     case_sensitive: bool = False,
     context_lines: int = 0,
+    match_per_line: bool = True,
+    includes: Optional[List[str]] = None,
     max_results: int = 50,
+    return_json: bool = False,
 ) -> str:
     """
     STEP 2 of file discovery — grep-equivalent EXACT/PATTERN search INSIDE
-    file content. This is a literal text/regex matcher, NOT semantic search.
+    file content (powered by literal/regex matching).
 
-    Searches every readable file under `path` — plain text/code files
-    directly, plus PDF/docx/xlsx via the same extraction read_file uses.
-    This is the key difference from search_index: search_index only covers
-    the narrower set of file types embedded into the RAG index at startup
-    (general documents), and answers conceptual/meaning-based questions.
-    This tool answers "does this exact string/pattern appear anywhere",
-    across EVERY readable file type — including source code, .json, .log,
-    and other extensions search_index intentionally skips.
-
-    WHEN TO USE WHICH SEARCH TOOL
-    --------------------------------
-      "What does the contract say about termination?"   -> search_index
-      "Find the function that calculates shipping cost" -> search_file_contents
-                                                              (try "shipping" plain,
-                                                              or regex="def.*shipping")
-      "Is there a file mentioning invoice INV-2291?"     -> search_file_contents
-                                                              (exact ID -> literal match)
-      "Is there a bill for around ₹15,000?"              -> NEITHER tool reliably
-                                                              finds this alone —
-                                                              see escalation path below.
-
-    ESCALATION PATH for vague / fuzzy / numeric queries
-    --------------------------------------------------------
-    A literal pattern has zero recall on phrasing that can't be predicted
-    exactly (e.g. "₹15,000" vs "Rs. 14,850" vs "fifteen thousand", or a
-    scanned PDF where the number isn't extractable text at all). When a
-    query is inherently fuzzy, don't just retry the same literal pattern —
-    work through this in order:
-      1. Try a handful of LIKELY literal variants in one or two calls
-         (e.g. "15000", "15,000", "15k" — or with regex=True a range like
-         "1[45][0-9]{3}" for "around 15000").
-      2. If that turns up nothing, narrow the candidate set structurally
-         first — use find_files_by_name on filenames/folders that
-         plausibly relate (e.g. "*invoice*", "*bill*", a "Receipts"
-         folder) rather than scanning the whole sandbox blindly.
-      3. Pass that shortlist to preview_files_for_review and reason over
-         the actual content yourself — this is the only way to catch
-         paraphrased amounts, rounded figures, or non-numeral phrasing.
-      4. If the shortlist is still too large to read (dozens+ of
-         candidates) and you're not converging, it is more honest and
-         cheaper to ask the user a clarifying question (rough date,
-         vendor, folder) than to brute-force read everything.
+    Searches readable files under `path` — plain text/code files directly,
+    plus PDF/docx/xlsx via standard text extraction.
 
     Args:
-        pattern:        Text to search for. Treated as a literal substring
-                         unless regex=True.
-        path:           Directory to search under (relative). Defaults to
-                         the sandbox root.
-        regex:          If True, `pattern` is compiled as a regular
-                         expression instead of matched literally.
-        case_sensitive: Default False (matches grep -i, usually what's
-                         wanted for natural-language-ish queries).
-        context_lines:  Lines of surrounding context above/below each
-                         match (like grep -C). Default 0.
-        max_results:    Stop after this many matches, to avoid flooding
-                         context on a common pattern. Default 50.
+        pattern:        Text or regex pattern to search for.
+        path:           Directory to search under (relative or absolute). Defaults to ".".
+        regex:          If True, `pattern` is treated as a regular expression.
+        case_sensitive: If False (default), performs case-insensitive matching.
+        context_lines:  Lines of context above/below each match (default 0).
+        match_per_line: If True (default), returns matching lines and line numbers.
+                        If False, returns only matching file paths (like git grep -l).
+        includes:       Optional list of glob patterns to filter files (e.g. ["*.py", "!**/node_modules/*"]).
+        max_results:    Stop after this many matches (default 50).
+        return_json:    If True, outputs raw JSON objects like grep_search API.
     """
     try:
         start = _safe_path(path)
@@ -642,16 +661,34 @@ def search_file_contents(
     if not start.is_dir():
         return f"'{path}' is a file, not a directory. Pass a directory to search."
 
+    # Compile regex pattern
     flags = 0 if case_sensitive else re.IGNORECASE
     try:
-        compiled = re.compile(pattern if regex else re.escape(pattern), flags)
+        search_regex = re.compile(pattern if regex else re.escape(pattern), flags)
     except re.error as e:
         return f"Invalid regex pattern: {e}"
 
     root = get_sandbox_root()
-    matches: list[str] = []
+    matches = []
+    matching_files = set()
     files_scanned = 0
-    files_skipped: list[str] = []
+    files_skipped = []
+
+    # Common directory excludes to keep search fast
+    DEFAULT_IGNORE_DIRS = {".git", ".vs", ".vscode", "node_modules", "__pycache__", "dist", "build", ".venv"}
+
+    def _should_include(file_rel_path: str) -> bool:
+        if not includes:
+            return True
+        included = False
+        for inc in includes:
+            if inc.startswith("!"):
+                if fnmatch.fnmatch(file_rel_path, inc[1:]):
+                    return False
+            else:
+                if fnmatch.fnmatch(file_rel_path, inc):
+                    included = True
+        return included if any(not inc.startswith("!") for inc in includes) else True
 
     def _iter_files(directory: Path):
         try:
@@ -659,11 +696,13 @@ def search_file_contents(
         except PermissionError:
             return
         for child in children:
-            if _is_skipped(child):
-                continue
             if child.is_dir():
+                if child.name in DEFAULT_IGNORE_DIRS or _is_skipped(child):
+                    continue
                 yield from _iter_files(child)
             elif child.is_file():
+                if _is_skipped(child):
+                    continue
                 yield child
 
     for file_path in _iter_files(start):
@@ -675,12 +714,20 @@ def search_file_contents(
             continue
 
         try:
+            rel_str = str(file_path.relative_to(root)).replace("\\", "/")
+        except ValueError:
+            rel_str = str(file_path).replace("\\", "/")
+
+        if not _should_include(rel_str):
+            continue
+
+        try:
             if ext in _BINARY_EXTENSIONS:
                 text = _read_binary(file_path)
             else:
                 text = file_path.read_text(encoding="utf-8", errors="replace")
         except Exception:
-            files_skipped.append(str(file_path.relative_to(root)))
+            files_skipped.append(rel_str)
             continue
 
         files_scanned += 1
@@ -689,16 +736,36 @@ def search_file_contents(
         for i, line in enumerate(lines):
             if len(matches) >= max_results:
                 break
-            if compiled.search(line):
-                rel = file_path.relative_to(root)
-                lo = max(0, i - context_lines)
-                hi = min(len(lines), i + context_lines + 1)
-                snippet_lines = lines[lo:hi]
-                snippet = "\n".join(
-                    f"{'>' if lo + j == i else ' '} {lo + j + 1:>5}  {l}"
-                    for j, l in enumerate(snippet_lines)
-                )
-                matches.append(f"[{rel}]\n{snippet}")
+
+            if search_regex.search(line):
+                matching_files.add(rel_str)
+
+                # If only file listing requested (git grep -l behavior)
+                if not match_per_line:
+                    if rel_str not in matches:
+                        matches.append(rel_str)
+                    break
+
+                line_num = i + 1
+
+                if return_json:
+                    matches.append({
+                        "Filename": rel_str,
+                        "LineNumber": line_num,
+                        "LineContent": line.strip()
+                    })
+                else:
+                    if context_lines > 0:
+                        lo = max(0, i - context_lines)
+                        hi = min(len(lines), i + context_lines + 1)
+                        snippet_lines = lines[lo:hi]
+                        snippet = "\n".join(
+                            f"{'>' if lo + j == i else ' '} {lo + j + 1:>5}  {l}"
+                            for j, l in enumerate(snippet_lines)
+                        )
+                        matches.append(f"[{rel_str}]\n{snippet}")
+                    else:
+                        matches.append(f"[{rel_str}:{line_num}]  {line.strip()}")
 
     search_desc = (
         f"Searched for {'regex' if regex else 'literal'} pattern '{pattern}' "
@@ -709,16 +776,16 @@ def search_file_contents(
         note = f" ({len(files_skipped)} file(s) could not be read)" if files_skipped else ""
         return (
             f"{search_desc}\n"
-            f"No matches across {files_scanned} readable file(s){note}.\n"
-            "If this query is vague, numeric, or paraphrased, see the "
-            "ESCALATION PATH in this tool's description — try "
-            "find_files_by_name to narrow candidates, then "
-            "preview_files_for_review."
+            f"No matches across {files_scanned} readable file(s){note}."
         )
 
-    header = f"{search_desc}\nFound {len(matches)} match(es) across {files_scanned} file(s) scanned"
+    if return_json:
+        return json.dumps(matches, indent=2)
+
+    header = f"{search_desc}\nFound {len(matches)} match(es) across {len(matching_files)} file(s) ({files_scanned} scanned)"
     if len(matches) >= max_results:
-        header += f" (capped at max_results={max_results}, there may be more)"
+        header += f" (capped at max_results={max_results})"
+    
     return header + ":\n\n" + "\n\n".join(matches)
 
 
@@ -812,10 +879,9 @@ FILEOPS_TOOLS = [
     search_file_contents,
     preview_files_for_review,
 
-    # Copy / move / rename (safe-ish — no-clobber by default)
-    copy_file,
-    move_file,
-    rename_file,
+    # Copy / move / rename — one validated cp/mv command tool (no-clobber
+    # by default, replaces copy_file/move_file/rename_file)
+    run_file_command,
 
     # Delete (soft — trash, dry_run by default)
     delete_file,
@@ -835,17 +901,8 @@ FILEOPS_TOOL_STATUS_MAP = {
     "preview_files_for_review": lambda args: (
         f"Opening {len(args.get('paths', []))} candidate file(s) for review"
     ),
-    "copy_file": lambda args: (
-        f"Copying [white]'{args.get('source')}'[/white] -> "
-        f"[white]'{args.get('destination')}'[/white]"
-    ),
-    "move_file": lambda args: (
-        f"Moving [white]'{args.get('source')}'[/white] -> "
-        f"[white]'{args.get('destination')}'[/white]"
-    ),
-    "rename_file": lambda args: (
-        f"Renaming [white]'{args.get('path')}'[/white] -> "
-        f"[white]'{args.get('new_name')}'[/white]"
+    "run_file_command": lambda args: (
+        f"Running [white]'{args.get('command')}'[/white]"
     ),
     "delete_file": lambda args: (
         f"Previewing delete of [white]'{args.get('path')}'[/white]"
