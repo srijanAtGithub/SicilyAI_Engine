@@ -116,7 +116,6 @@ Safety model (matches cowork_tools.py conventions)
 import re
 import shlex
 import shutil
-import subprocess
 import time
 from pathlib import Path
 import json
@@ -789,95 +788,10 @@ def search_file_contents(
     return header + ":\n\n" + "\n\n".join(matches)
 
 
-@tool
-def preview_files_for_review(paths: list[str], max_lines_each: int = 40) -> str:
-    """
-    STEP 3 (last resort) of file discovery — open several candidate files
-    at once and return their content so YOU can reason over it directly.
-
-    Use this only after both search_index and search_file_contents have
-    failed to find what the user wants — typically because the query is
-    vague, numeric, paraphrased, or about a file type outside the RAG
-    index. This is the fallback that catches things literal/semantic
-    search both miss: "a bill for around ₹15,000" might actually say
-    "Rs. 14,850" or "fourteen thousand eight hundred fifty" — no pattern
-    match or embedding reliably surfaces that, but reading the actual text
-    will.
-
-    This batches up to ~15 files into ONE call (vs. N separate read_file
-    calls), each truncated to max_lines_each, so multiple candidates can
-    be compared in a single reasoning pass instead of paying a full round
-    trip per file.
-
-    Keep the candidate list as SMALL and well-justified as possible — this
-    is the most expensive search tool in token terms. Narrow with
-    find_files_by_name first (filename hints, folder, extension) rather
-    than passing an unfiltered directory listing. If the candidates can't
-    reasonably be narrowed below a manageable shortlist (dozens+), it is
-    cheaper and more reliable to ask the user a clarifying question
-    (rough date, vendor, folder) than to brute-force preview everything.
-
-    Args:
-        paths:          Relative paths to preview, recommended 3-15 files.
-        max_lines_each: Max lines read per file (default 40). Raise this
-                         only for the one or two files most suspected.
-    """
-    if not paths:
-        return "No paths provided."
-    if len(paths) > 20:
-        return (
-            f"Refused: {len(paths)} files requested in one call — too many "
-            "to reason over reliably. Narrow the candidate list first (e.g. "
-            "with find_files_by_name) and pass 15 or fewer."
-        )
-
-    sections = []
-
-    for p in paths:
-        try:
-            target = _safe_path(p)
-        except PermissionError as e:
-            sections.append(f"[{p}]\n  {e}")
-            continue
-
-        if not target.exists():
-            sections.append(f"[{p}]\n  (does not exist)")
-            continue
-        if not target.is_file():
-            sections.append(f"[{p}]\n  (is a directory, skipped)")
-            continue
-
-        ext = target.suffix.lower()
-        if ext not in READABLE_EXTENSIONS:
-            sections.append(f"[{p}]\n  (extension '{ext}' not yet supported, skipped)")
-            continue
-
-        try:
-            if ext in _BINARY_EXTENSIONS:
-                text = _read_binary(target)
-            else:
-                text = target.read_text(encoding="utf-8", errors="replace")
-        except Exception as e:
-            sections.append(f"[{p}]\n  (could not read: {e})")
-            continue
-
-        lines = text.splitlines()
-        preview = "\n".join(lines[:max_lines_each])
-        truncated_note = (
-            f"\n  ... ({len(lines) - max_lines_each} more line(s) — use "
-            "read_file for the full content if this looks like the match)"
-            if len(lines) > max_lines_each else ""
-        )
-        sections.append(f"[{p}] ({len(lines)} lines)\n{preview}{truncated_note}")
-
-    return "\n\n---\n\n".join(sections)
-
-
 FILEOPS_TOOLS = [
     # Search tier (escalating cost — see docstrings for the strategy)
     find_files_by_name,
     search_file_contents,
-    preview_files_for_review,
 
     # Copy / move / rename — one validated cp/mv command tool (no-clobber
     # by default, replaces copy_file/move_file/rename_file)
@@ -897,9 +811,6 @@ FILEOPS_TOOL_STATUS_MAP = {
     "search_file_contents": lambda args: (
         f"Searching for [white]'{args.get('pattern')}'[/white] "
         f"under [white]'{args.get('path', '.')}'[/white]"
-    ),
-    "preview_files_for_review": lambda args: (
-        f"Opening {len(args.get('paths', []))} candidate file(s) for review"
     ),
     "run_file_command": lambda args: (
         f"Running [white]'{args.get('command')}'[/white]"

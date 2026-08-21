@@ -578,17 +578,6 @@ def get_file_info(path: str) -> str:
     ])
 
 
-@tool
-def list_allowed_directories() -> str:
-    """
-    List all directories the agent is allowed to access.
-    Returns the sandbox root that was locked in when `sicily start` was invoked.
-    No input required.
-    """
-    root = get_sandbox_root()
-    return f"Allowed directories:\n  {root}"
-
-
 # PATH PIN TOOLS — survive context summarisation
 @tool
 def pin_path(alias: str, path: str) -> str:
@@ -617,39 +606,43 @@ def pin_path(alias: str, path: str) -> str:
 
 
 @tool
-def recall_path(alias: str) -> str:
+def recall_path(alias: str = "", show_all: bool = True) -> str:
     """
-    Retrieve a previously pinned file path by its alias.
+    Retrieve pinned file path(s) saved earlier with pin_path.
+
+    Pass an alias to look up one specific path.
 
     Use this whenever you need to act on a file but cannot be certain its
     path is still in your active context (it may have been summarised away).
 
     Args:
-        alias: The alias used when pin_path was called.
+        alias:    Alias to look up. Leave empty to list all pins.
+        show_all: If an alias is given and other pins exist, also list them
+                  below the match (default True) — set False to see only
+                  the requested alias.
     """
+    if not _PATH_PINS:
+        return "No paths are currently pinned. Use pin_path to save file locations."
+
+    if not alias:
+        lines = [f"  {a:20s} → {p}" for a, p in _PATH_PINS.items()]
+        return "📌 Pinned paths:\n" + "\n".join(lines)
+
     if alias not in _PATH_PINS:
-        all_pins = ", ".join(f"'{k}'" for k in _PATH_PINS) if _PATH_PINS else "none"
+        all_pins = ", ".join(f"'{k}'" for k in _PATH_PINS)
         return (
             f"No path pinned under alias '{alias}'. "
             f"Available pins: {all_pins}. "
             "If you have not pinned this path yet, use find_files_by_name to locate it first."
         )
-    return f"📌 '{alias}' → '{_PATH_PINS[alias]}'"
 
-
-@tool
-def recall_all_pins() -> str:
-    """
-    List every currently pinned path.
-
-    Call this at the start of any multi-step task to remind yourself what
-    files you have already located, or after a long chain of tool calls
-    to re-orient before taking a write action.
-    """
-    if not _PATH_PINS:
-        return "No paths are currently pinned. Use pin_path to save file locations."
-    lines = [f"  {alias:20s} → {path}" for alias, path in _PATH_PINS.items()]
-    return "📌 Pinned paths:\n" + "\n".join(lines)
+    result = f"📌 '{alias}' → '{_PATH_PINS[alias]}'"
+    if show_all:
+        others = {a: p for a, p in _PATH_PINS.items() if a != alias}
+        if others:
+            other_lines = "\n".join(f"  {a:20s} → {p}" for a, p in others.items())
+            result += "\n\nOther pinned paths:\n" + other_lines
+    return result
 
 
 # WRITE TOOLS
@@ -924,12 +917,10 @@ LOCAL_TOOLS = [
     list_directory,
     file_tree_shallow,
     get_file_info,
-    list_allowed_directories,
 
     # Path pins (process memory — survive summarisation)
     pin_path,
     recall_path,
-    recall_all_pins,
 
     # Write (safe-ish)
     create_text_file,
@@ -962,14 +953,12 @@ TOOL_STATUS_MAP = {
     "get_file_info": lambda args: (
         f"Inspecting metadata for [white]'{args.get('path')}'[/white]"
     ),
-    "list_allowed_directories": lambda args: "Checking sandbox boundary",
     "pin_path": lambda args: (
         f"Pinning [white]'{args.get('path')}'[/white] as [white]'{args.get('alias')}'[/white]"
     ),
     "recall_path": lambda args: (
         f"Recalling pinned path [white]'{args.get('alias')}'[/white]"
     ),
-    "recall_all_pins": lambda args: "Checking all pinned paths",
     "create_text_file": lambda args: (
         f"Creating [white]'{args.get('path')}'[/white]"
     ),
