@@ -4,16 +4,18 @@ cowork_tools_fileops.py
 File-management and content-search tools for Sicily Cowork.
 
 Extends cowork_tools.py with operations beyond read/write:
-  - run_file_command                    : copy/move/rename files by running
-                                           a validated `cp` or `mv` command —
-                                           replaces the old separate
-                                           copy_file/move_file/rename_file
-                                           tools with one CLI-shaped tool
-                                           (same pattern used by Antigravity
-                                           and similar agentic IDEs: one
-                                           narrow, whitelisted command
-                                           executor instead of N bespoke
-                                           tools for related operations).
+  - run_file_command                    : copy/move/rename files, and create
+                                           directories, by running a
+                                           validated `cp`, `mv`, or `mkdir`
+                                           command — replaces the old
+                                           separate copy_file/move_file/
+                                           rename_file/make_directory tools
+                                           with one CLI-shaped tool (same
+                                           pattern used by Antigravity and
+                                           similar agentic IDEs: one narrow,
+                                           whitelisted command executor
+                                           instead of N bespoke tools for
+                                           related operations).
   - delete_file, delete_directory       : soft-delete (trash, not unlink) —
                                            deliberately NOT folded into
                                            run_file_command; see note below.
@@ -72,30 +74,31 @@ fail. The one thing these tools still cannot do is show you what's INSIDE an
 image/video/audio/archive — that requires a parser this module doesn't have
 (see READABLE_EXTENSIONS above).
 
-Why cp/mv are a single CLI-shaped tool instead of three bespoke ones
+Why cp/mv/mkdir are a single CLI-shaped tool instead of four bespoke ones
 ----------------------------------------------------------------------
-copy_file, move_file, and rename_file used to be three separate @tool
-functions that each re-implemented the same source/destination validation
-around a one-line shutil call. They're collapsed into a single
-run_file_command tool that accepts a `cp <source> <destination>` or
-`mv <source> <destination>` command string, because:
+copy_file, move_file, rename_file, and make_directory used to be separate
+@tool functions that each re-implemented the same path validation around a
+one-line shutil/Path call. They're collapsed into a single run_file_command
+tool that accepts a `cp <src> <dst>`, `mv <src> <dst>`, or `mkdir <path>`
+command string, because:
 
   - Fewer near-duplicate tool schemas for the model to choose between
     (rename is just `mv` with the destination in the same folder — it was
-    never a functionally distinct operation).
+    never a functionally distinct operation; mkdir needs the same sandbox
+    path-validation plumbing as cp/mv and nothing more).
   - This mirrors the pattern used by Antigravity-style agentic IDEs: one
     narrow, whitelisted "run this exact class of command" executor, rather
     than a bespoke tool per verb.
 
 This is NOT a general shell escape hatch. run_file_command does not use
 shell=True, does not go through /bin/sh, and does not support pipes,
-redirects, globs, chaining, or any command other than `cp`/`mv`. The
-command string is parsed with shlex (no shell semantics), the executable
-must be exactly "cp" or "mv", every flag must be on an explicit allow-list,
-and every path argument is re-resolved through _safe_path() before
-subprocess.run() ever sees it. A hallucinated flag or an out-of-sandbox
-path is rejected before execution — never silently passed through to a
-real shell where it could do something unintended.
+redirects, globs, chaining, or any command other than `cp`/`mv`/`mkdir`.
+The command string is parsed with shlex (no shell semantics), the
+executable must be exactly one of those three, every flag must be on an
+explicit allow-list, and every path argument is re-resolved through
+_safe_path() before any filesystem call is made. A hallucinated flag or an
+out-of-sandbox path is rejected before execution — never silently passed
+through to a real shell where it could do something unintended.
 
 Safety model (matches cowork_tools.py conventions)
 ----------------------------------------------------
@@ -124,6 +127,7 @@ from typing import List, Optional
 
 from langchain_core.tools import tool
 
+from Cowork.cowork_rag import SKIP_DIRS
 from Cowork.cowork_tools import (
     _safe_path,
     _is_skipped,
@@ -214,12 +218,19 @@ def _move_to_trash(target: Path) -> Path:
 # validator: the model cannot "invent" a plausible-looking flag (e.g. `-r`
 # on cp, `--force`) and have it silently reach a real subprocess.
 _ALLOWED_FLAGS = {
-    "cp": {"-n"},   # -n: no-clobber (never overwrite silently) — the only
-                    #     flag exposed; there is no -f, no -r (directories
-                    #     go through delete_directory/dedicated handling,
-                    #     not this tool).
-    "mv": {"-n"},   # -n: no-clobber. Same rationale as cp.
+    "cp": {"-n"},      # -n: no-clobber (never overwrite silently) — the
+                       #     only flag exposed; there is no -f, no -r
+                       #     (directories go through delete_directory,
+                       #     not this tool).
+    "mv": {"-n"},      # -n: no-clobber. Same rationale as cp.
+    "mkdir": {"-p"},   # -p: create intermediate parents. This is also the
+                       #     ALWAYS-ON behavior (see below) — accepted so a
+                       #     model-written `mkdir -p ...` isn't rejected,
+                       #     but a bare `mkdir dir` behaves identically.
 }
+
+# Number of required positional path arguments per executable.
+_POSITIONAL_COUNTS = {"cp": 2, "mv": 2, "mkdir": 1}
 
 _ALLOWED_EXECUTABLES = frozenset(_ALLOWED_FLAGS.keys())
 
@@ -231,18 +242,19 @@ class _CommandValidationError(ValueError):
     """
 
 
-def _validate_fileops_command(command: str) -> tuple[str, Path, Path, bool]:
+def _validate_fileops_command(command: str) -> tuple[str, list[Path], list[str]]:
     """
-    Parse and validate a `cp`/`mv` command string against the exact
+    Parse and validate a `cp`/`mv`/`mkdir` command string against the exact
     contract documented in run_file_command's docstring. This is the
     enforcement point that keeps the tool from becoming a general shell
     escape hatch: nothing here trusts the model's command string beyond
     what is explicitly re-checked.
 
-    Returns (executable, src_path, dst_path, no_clobber) on success.
-    Raises _CommandValidationError with a human-readable reason on any
-    violation — unknown executable, disallowed flag, wrong argument count,
-    or a path that resolves outside the sandbox.
+    Returns (executable, resolved_paths, flags) on success — resolved_paths
+    is [src, dst] for cp/mv or [target] for mkdir. Raises
+    _CommandValidationError with a human-readable reason on any violation —
+    unknown executable, disallowed flag, wrong argument count, or a path
+    that resolves outside the sandbox.
 
     Deliberately does NOT use shell=True / a real shell anywhere in this
     module. shlex.split() gives POSIX-ish tokenization (handles quoting)
@@ -279,21 +291,19 @@ def _validate_fileops_command(command: str) -> tuple[str, Path, Path, bool]:
     if unknown_flags:
         raise _CommandValidationError(
             f"Refused: flag(s) {unknown_flags} are not allowed for "
-            f"'{executable}'. Only {sorted(allowed_flags)} are permitted — "
-            "this tool only does single-file copy/move/rename, nothing "
-            "recursive or forced."
+            f"'{executable}'. Only {sorted(allowed_flags)} are permitted."
         )
 
-    if len(positionals) != 2:
+    expected = _POSITIONAL_COUNTS[executable]
+    if len(positionals) != expected:
+        noun = "path argument" if expected == 1 else "path arguments (source, destination)"
         raise _CommandValidationError(
-            f"Refused: expected exactly 2 path arguments (source, "
-            f"destination) for '{executable}', got {len(positionals)}: "
-            f"{positionals}. No globs, no multi-destination forms."
+            f"Refused: expected exactly {expected} {noun} for "
+            f"'{executable}', got {len(positionals)}: {positionals}. "
+            "No globs, no multi-destination forms."
         )
 
-    source, destination = positionals
-
-    for label, raw in (("source", source), ("destination", destination)):
+    for label, raw in zip(("source", "destination") if expected == 2 else ("path",), positionals):
         if any(ch in raw for ch in "*?[]"):
             raise _CommandValidationError(
                 f"Refused: {label} '{raw}' contains a glob character "
@@ -303,80 +313,100 @@ def _validate_fileops_command(command: str) -> tuple[str, Path, Path, bool]:
             )
 
     try:
-        src = _safe_path(source)
-        dst = _safe_path(destination)
+        resolved = [_safe_path(p) for p in positionals]
     except PermissionError as e:
         raise _CommandValidationError(str(e))
 
-    no_clobber = "-n" in flags
-    return executable, src, dst, no_clobber
+    return executable, resolved, flags
 
 
 @tool
 def run_file_command(command: str) -> str:
     """
-    Copy, move, or rename a file by running a validated `cp` or `mv`
-    command. This is the ONLY way to copy/move/rename in this sandbox —
-    it replaces the old copy_file/move_file/rename_file tools. Renaming is
-    just `mv <old-path> <new-path-same-folder>`; there is no separate verb
-    for it.
+    Copy, move, rename, or create a directory by running a validated `cp`,
+    `mv`, or `mkdir` command. This is the ONLY way to do these things in
+    this sandbox — it replaces the old copy_file/move_file/rename_file/
+    make_directory tools. Renaming is just `mv <old-path> <new-path-same-
+    folder>`; there is no separate verb for it.
 
     This is NOT a general shell tool. Only these exact forms are accepted:
 
         cp [-n] <source> <destination>
         mv [-n] <source> <destination>
+        mkdir [-p] <path>
 
     Hard contract (violating ANY of these gets the command rejected before
     anything runs — no partial execution, no fallback interpretation):
-      - The executable must be exactly "cp" or "mv". Nothing else — not
-        "cp -r", not "rsync", not "cp file1 file2 dir/", not any
-        pipe/redirect/chain (`|`, `>`, `;`, `&&`, backticks, etc.).
-      - The only flag either command accepts is `-n` (no-clobber — refuse
-        to overwrite an existing destination). Any other flag, including
-        ones that look reasonable (`-r`, `-f`, `-v`, `--force`), is
-        refused. There is no recursive/directory form in this tool —
-        directories are out of scope here.
-      - Exactly two path arguments: source, then destination. No globs
-        (`*.txt`), no multiple sources, no trailing-slash directory-target
-        shorthand.
-      - Both paths must resolve inside the sandbox (same _safe_path()
-        check every other tool in this module uses) and the source file's
-        extension must be in MANAGEABLE_EXTENSIONS.
-      - Without `-n`, an existing destination file is refused rather than
-        silently overwritten — same no-clobber-by-default behavior the
-        old copy_file/move_file had with overwrite=False.
+      - The executable must be exactly "cp", "mv", or "mkdir". Nothing
+        else — not "cp -r", not "rsync", not "rm", not any pipe/redirect/
+        chain (`|`, `>`, `;`, `&&`, backticks, etc.).
+      - cp/mv accept only `-n` (no-clobber). mkdir accepts only `-p`
+        (create missing parents — already the default behavior, see
+        below). Any other flag (`-r`, `-f`, `-v`, `--force`) is refused.
+        cp/mv have no recursive/directory form — directories other than
+        via mkdir are out of scope for this tool.
+      - cp/mv take exactly two path arguments (source, destination); mkdir
+        takes exactly one. No globs (`*.txt`), no multiple sources.
+      - Every path must resolve inside the sandbox (same _safe_path()
+        check every other tool in this module uses); for cp/mv the source
+        file's extension must be in MANAGEABLE_EXTENSIONS.
+      - cp/mv without `-n`: an existing destination file is refused rather
+        than silently overwritten. mkdir is always idempotent — an
+        already-existing directory at that path is a no-op success either
+        way, and missing intermediate parents are always created, whether
+        or not `-p` is passed.
 
     If you're unsure whether a command you're about to write is valid,
-    write the simplest possible form — `cp source.txt dest.txt` or
-    `mv old/path.pdf new/path.pdf` — rather than guessing at flags. An
-    invalid command is rejected with a clear reason and nothing happens;
-    it never partially runs.
+    write the simplest possible form — `cp source.txt dest.txt`,
+    `mv old/path.pdf new/path.pdf`, or `mkdir reports/q3` — rather than
+    guessing at flags. An invalid command is rejected with a clear reason
+    and nothing happens; it never partially runs.
 
-    Works on ANY file this sandbox can manage — plain text, PDF/DOCX/XLSX,
-    and also images, video, audio, archives (.zip/.tar), and APKs. cp/mv
-    move raw bytes; they never parse or interpret content, so file type is
-    never a blocker for this tool. (The agent still cannot read or extract
-    text from an image/zip/video via this tool — only relocate/duplicate
-    it. Don't infer readability from copyability.)
+    cp/mv work on ANY file this sandbox can manage — plain text,
+    PDF/DOCX/XLSX, and also images, video, audio, archives (.zip/.tar), and
+    APKs. They move raw bytes and never parse or interpret content, so file
+    type is never a blocker. (The agent still cannot read or extract text
+    from an image/zip/video via this tool — only relocate/duplicate it.
+    Don't infer readability from copyability.)
 
     Args:
-        command: A single `cp` or `mv` invocation as a plain string, e.g.
-                 "cp reports/draft.md reports/draft-backup.md" or
-                 "mv photo.jpg archive/2026/photo.jpg". `-n` is accepted
-                 but not required — an existing destination is always
-                 refused regardless, so you normally don't need to pass it.
+        command: A single `cp`, `mv`, or `mkdir` invocation as a plain
+                 string, e.g. "cp reports/draft.md reports/draft-backup.md",
+                 "mv photo.jpg archive/2026/photo.jpg", or
+                 "mkdir reports/q3". `-n`/`-p` are accepted but rarely
+                 needed — their behavior is already the default.
     """
     try:
-        executable, src, dst, no_clobber = _validate_fileops_command(command)
+        executable, paths, flags = _validate_fileops_command(command)
     except _CommandValidationError as e:
         return str(e)
+
+    root = get_sandbox_root()
+
+    if executable == "mkdir":
+        target = paths[0]
+        if target.is_file():
+            return (
+                f"Refused: '{target.relative_to(root)}' already exists as "
+                "a file. Cannot create a directory at that path."
+            )
+        if target.is_dir():
+            return f"Directory '{target.relative_to(root)}' already exists — nothing to do."
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return f"Could not create directory '{target.relative_to(root)}': {e}"
+        return f"Directory '{target.relative_to(root)}' created."
+
+    # cp / mv
+    src, dst = paths
 
     if not src.exists():
         return f"Source '{src.name}' does not exist."
     if not src.is_file():
         return (
             f"Source resolves to a directory. run_file_command only "
-            "handles single files, not directories."
+            "handles single files for cp/mv, not directories."
         )
 
     ext = src.suffix.lower()
@@ -395,7 +425,6 @@ def run_file_command(command: str) -> str:
             "different destination path — this tool never overwrites."
         )
 
-    root = get_sandbox_root()
     src_rel = src.relative_to(root)
     dst_rel = dst.relative_to(root)
 
@@ -674,7 +703,7 @@ def search_file_contents(
     files_skipped = []
 
     # Common directory excludes to keep search fast
-    DEFAULT_IGNORE_DIRS = {".git", ".vs", ".vscode", "node_modules", "__pycache__", "dist", "build", ".venv"}
+    DEFAULT_IGNORE_DIRS = SKIP_DIRS
 
     def _should_include(file_rel_path: str) -> bool:
         if not includes:
