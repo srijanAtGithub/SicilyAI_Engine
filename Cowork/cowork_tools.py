@@ -1,25 +1,11 @@
 """
 cowork_tools.py
 --------------
-Sandboxed filesystem tools for `sicily start`.
+Sandboxed filesystem tools for `sicily start`. Pure-Python re-implementation
+of the @modelcontextprotocol/server-filesystem interface.
 
-Mirrors the @modelcontextprotocol/server-filesystem interface,
-re-implemented in pure Python with zero extra dependencies.
-
-ALL tools are locked to a single root directory (the cwd where
-`sicily start` was invoked). No path can escape that root.
-
-Tool tiers
-----------
-Read-only tools  — safe:      read_file (full or line-range), list_directory,
-                              file_tree_shallow, get_file_info, list_allowed_directories
-Write tools      — safe-ish: write_file (mode="create" for new files,
-                  mode="edit" for line-range replacement in existing ones)
-                  Guarantee: never delete existing content.
-                  write_file's edit mode requires dry_run=False to apply changes.
-Path pins        — memory:   pin_path, recall_path, recall_all_pins
-                  Survive context summarisation — stored in process memory,
-                  not in the message list.
+All tools are locked to a single root directory (the cwd `sicily start` was
+invoked from); no path can escape it.
 """
 
 import datetime
@@ -226,21 +212,13 @@ def _read_binary(path: Path) -> str:
 @tool
 def search_index(query: str) -> str:
     """
-    Search the local RAG index for content relevant to a query.
- 
-    This is the FIRST tool to call for any question that involves finding
-    information inside files — before reading any file directly.
- 
-    The index covers all text-based files in the sandbox:
-    .txt, .md, .pdf, .docx, .xlsx, .py, .json, .csv, and more.
- 
-    Returns the top matching snippets with their file path and position.
-    If a snippet looks relevant, use read_file with start_line/end_line to
-    read more context around it in the original file.
- 
+    Semantic search over the sandbox's RAG index (.txt, .md, .pdf, .docx,
+    .xlsx, .py, .json, .csv, and more). Returns top matching snippets with
+    file path and position.
+
     Args:
-        query: Plain-language description of what you are looking for.
-               e.g. "quarterly budget figures" or "meeting notes from January"
+        query: Plain-language description of what you're looking for,
+               e.g. "quarterly budget figures".
     """
     from Cowork.cowork_rag import get_rag   # adjust import path to match your project
     rag = get_rag()
@@ -253,48 +231,20 @@ def search_index(query: str) -> str:
 @tool
 def read_file(path: str, start_line: int = 0, end_line: int = 0) -> str:
     """
-    Read a file's contents as plain text — either in full or a specific
-    line range.
+    Read a file as plain text, in full or by line range.
 
-    NOT THE DEFAULT FIRST MOVE. Before reaching for this tool, ask whether
-    search_file_contents or search_index would get you a line number instead.
-    Blindly reading a file you haven't searched yet is a common source of
-    wasted calls (you're guessing where the answer lives instead of letting
-    a search tell you).
+    start_line/end_line=0 (default): full file. Otherwise: that 1-indexed,
+    inclusive line range, numbered, max 500 lines/call — text files only;
+    binary documents always return in full regardless of range.
 
-    Two modes, chosen by whether you pass start_line/end_line:
-
-    FULL READ (start_line=0, end_line=0 — the default)
-      Returns the entire file. Only use this for small-to-medium files or
-      when the complete content is genuinely required (summarizing a short
-      file, reviewing a small script). Avoid on large files (logs, big
-      CSVs, long source files) — use the ranged mode instead.
-
-    RANGED READ (start_line=N, end_line=M, both 1-indexed, inclusive)
-      Returns only that line range, each line numbered. Max 500 lines per
-      call. Use this after a search gives you a real line number to anchor
-      on — do not guess a range speculatively ("probably around line 400");
-      search for the line first, then read exactly around it. This is also
-      the required first step before write_file's edit mode, to confirm
-      you're targeting the correct lines.
-
-    Handles two file categories transparently:
-      Text-based (.txt .md .py .json .csv .yaml .html etc.) — raw UTF-8.
-      Binary documents — .pdf (text per page, labelled [Page N]),
-      .docx (paragraph text in order), .xlsx/.xls (each sheet as a
-      tab-separated table, labelled [Sheet: name]). Ranged reads are
-      text-file only; binary documents always return in full.
-
-    Typical workflow
-    ----------------
-    1. search_file_contents(pattern, ...)     — get a real line number
-    2. read_file(path, N, M)                  — confirm exact target lines
-    3. write_file(path, mode="edit", ...)     — make the surgical change
+    Handles text (.txt .md .py .json .csv .yaml .html etc. — raw UTF-8) and
+    binary documents (.pdf per-page as [Page N], .docx paragraphs in order,
+    .xlsx/.xls per-sheet tab-separated as [Sheet: name]).
 
     Args:
         path:       Relative path to the file.
-        start_line: First line to read (1-indexed). Leave at 0 for a full read.
-        end_line:   Last line to read (inclusive). Leave at 0 for a full read.
+        start_line: First line to read (1-indexed). 0 for a full read.
+        end_line:   Last line to read (inclusive). 0 for a full read.
     """
     ranged = start_line > 0 or end_line > 0
     if ranged:
@@ -452,38 +402,17 @@ def write_file(
     dry_run: bool = True,
 ) -> str:
     """
-    Create a new text file, or edit a line range in an existing one. This is
-    the only tool for writing file content — choose the mode with `mode`.
+    Create a new text file, or replace a line range in an existing one.
 
-    mode="create" (default) — make a NEW file
-      Writes `content` to `path`. Refuses if anything already exists there
-      (use mode="edit" to modify an existing file instead). Parent
-      directories are created automatically when create_parents=True
-      (default). Ignores dry_run/start_line/end_line.
+    mode="create" (default): writes `content` to `path`; refuses if the
+    path already exists. Parent dirs auto-created when create_parents=True.
 
-    mode="edit" — replace a line range in an EXISTING file
-      Replaces lines [start_line, end_line] inclusive (1-indexed) with
-      `content`; surrounding lines are untouched. Pass content="" to delete
-      the range without inserting anything. The file must already exist.
-      dry_run=True (default) previews the change as a diff without writing;
-      call again with dry_run=False once the preview looks right.
+    mode="edit": replaces lines [start_line, end_line] (1-indexed,
+    inclusive) with `content` ("" to delete the range); file must already
+    exist. dry_run=True (default) previews as a diff; dry_run=False applies.
 
-    Both modes only accept text-based extensions:
-      Documents/notes : .txt .md .markdown .rst .org .tex
-      Config/data     : .json .jsonl .ndjson .yaml .yml .toml .ini .cfg .conf .env
-      Web/markup      : .html .htm .css .scss .sass .xml .svg
-      Source code     : .py .pyi .js .mjs .cjs .ts .tsx .jsx .sh .bash .zsh .fish
-                        .rb .go .rs .java .kt .scala .c .cpp .cc .h .hpp .cs .fs
-                        .php .lua .r .sql
-      Data/logs       : .csv .tsv .log
-      Misc text       : .diff .patch .gitignore .editorconfig
-
-    Typical edit workflow
-    ---------------------
-    1. read_file(path, N, M)                                   — confirm target lines
-    2. write_file(path, new, mode="edit", start_line=N,
-                   end_line=M, dry_run=True)                   — preview
-    3. write_file(..., dry_run=False)                          — apply once confirmed
+    Text-based extensions only (code, config, docs, csv/tsv/log, etc. — not
+    binary formats like .pdf/.docx/.xlsx).
 
     Args:
         path:           Relative path to the file.

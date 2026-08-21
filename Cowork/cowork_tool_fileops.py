@@ -1,119 +1,27 @@
 """
 cowork_tools_fileops.py
 ------------------------
-File-management and content-search tools for Sicily Cowork.
+File-management and content-search tools for Sicily Cowork. Extends
+cowork_tools.py with: run_file_command (validated cp/mv/mkdir), delete_file
+/ delete_directory (soft-delete to trash), search_file_contents (grep over
+readable extensions), find_files_by_name (glob match), and
+preview_files_for_review (batched multi-file preview).
 
-Extends cowork_tools.py with operations beyond read/write:
-  - run_file_command                    : copy/move/rename files, and create
-                                           directories, by running a
-                                           validated `cp`, `mv`, or `mkdir`
-                                           command — replaces the old
-                                           separate copy_file/move_file/
-                                           rename_file/make_directory tools
-                                           with one CLI-shaped tool (same
-                                           pattern used by Antigravity and
-                                           similar agentic IDEs: one narrow,
-                                           whitelisted command executor
-                                           instead of N bespoke tools for
-                                           related operations).
-  - delete_file, delete_directory       : soft-delete (trash, not unlink) —
-                                           deliberately NOT folded into
-                                           run_file_command; see note below.
-  - search_file_contents                : grep-equivalent, scoped to ALL
-                                           readable extensions (plain text +
-                                           PDF/docx/xlsx via the existing
-                                           binary parsers) — not just the
-                                           narrower RAG-indexed subset.
-  - find_files_by_name                  : renamed `search_files` from
-                                           cowork_tools.py (filename/glob
-                                           match only, no content reading).
-  - preview_files_for_review            : batched multi-file preview — the
-                                           deliberate fallback step for
-                                           vague/fuzzy queries that neither
-                                           search_index nor
-                                           search_file_contents can resolve
-                                           on their own.
+Scope: content tools (search_file_contents, preview_files_for_review) only
+work on READABLE_EXTENSIONS (text + PDF/docx/xlsx via existing parsers).
+Management tools (run_file_command's cp/mv, delete_file, delete_directory)
+work on the broader MANAGEABLE_EXTENSIONS (READABLE_EXTENSIONS plus images/
+video/audio/archives/APKs/etc.) since these are pure filesystem ops that
+never open or interpret content — file type is not a blocker for them.
+delete_directory has no extension gate at all.
 
-Scope (intentional)
---------------------
-Two different scopes apply within this module, gated by two different sets:
+run_file_command is a single validated command tool (not a shell escape
+hatch) replacing separate copy/move/rename/mkdir tools — see its docstring
+for the exact contract.
 
-  CONTENT tools (search_file_contents, preview_files_for_review) only work
-  on READABLE_EXTENSIONS — the extensions in ALLOWED_WRITE_EXTENSIONS plus
-  the binary-but-parseable formats in _BINARY_EXTENSIONS (.pdf, .docx, .doc,
-  .xlsx, .xls). There is no parser for images/video/audio/archives/APKs, so
-  these tools genuinely cannot do anything with them and correctly refuse.
-
-  MANAGEMENT tools (run_file_command's cp/mv, delete_file,
-  delete_directory) work on the broader MANAGEABLE_EXTENSIONS — READABLE_EXTENSIONS
-  plus MANAGEABLE_ONLY_EXTENSIONS (images, video, audio, archives/.zip/.tar,
-  APKs, and other common binaries). These ops are pure shutil/Path filesystem
-  calls that never open or interpret file content, so there's no technical
-  reason to block them on file type. delete_directory never had an extension
-  gate at all (it moves whole trees, mixed contents and all).
-
-In short: the agent can organize (copy/move/rename/delete) any file in the
-sandbox, but can only read/search the content of text + PDF/docx/xlsx.
-Operations refuse on genuinely out-of-scope extensions (e.g. an unrecognized
-proprietary format) with a clear message rather than silently mishandling
-them — extend MANAGEABLE_ONLY_EXTENSIONS if a new type should become
-manageable.
-
-IMPORTANT — this is a DIFFERENT (broader) scope than write_file/edit_file_lines
-in cowork_tools.py. Those tools exclude non-text formats entirely because
-overwriting content requires structured serialisation, not raw text I/O.
-That restriction does NOT apply here. run_file_command's cp/mv and
-delete_file are pure filesystem operations (shutil.copy2/shutil.move under
-the hood) — they never open, parse, or rewrite the file's content, so file
-format is irrelevant to them, whether that's .pdf/.docx/.xlsx or
-.png/.zip/.mp4/.apk. If you're about to tell the user a file "can't be
-moved/copied/renamed/deleted because it's binary" or "because it's an
-image/video/archive" — that's wrong for the tools in this module. Just call
-the tool and trust its actual return value instead of pre-deciding it will
-fail. The one thing these tools still cannot do is show you what's INSIDE an
-image/video/audio/archive — that requires a parser this module doesn't have
-(see READABLE_EXTENSIONS above).
-
-Why cp/mv/mkdir are a single CLI-shaped tool instead of four bespoke ones
-----------------------------------------------------------------------
-copy_file, move_file, rename_file, and make_directory used to be separate
-@tool functions that each re-implemented the same path validation around a
-one-line shutil/Path call. They're collapsed into a single run_file_command
-tool that accepts a `cp <src> <dst>`, `mv <src> <dst>`, or `mkdir <path>`
-command string, because:
-
-  - Fewer near-duplicate tool schemas for the model to choose between
-    (rename is just `mv` with the destination in the same folder — it was
-    never a functionally distinct operation; mkdir needs the same sandbox
-    path-validation plumbing as cp/mv and nothing more).
-  - This mirrors the pattern used by Antigravity-style agentic IDEs: one
-    narrow, whitelisted "run this exact class of command" executor, rather
-    than a bespoke tool per verb.
-
-This is NOT a general shell escape hatch. run_file_command does not use
-shell=True, does not go through /bin/sh, and does not support pipes,
-redirects, globs, chaining, or any command other than `cp`/`mv`/`mkdir`.
-The command string is parsed with shlex (no shell semantics), the
-executable must be exactly one of those three, every flag must be on an
-explicit allow-list, and every path argument is re-resolved through
-_safe_path() before any filesystem call is made. A hallucinated flag or an
-out-of-sandbox path is rejected before execution — never silently passed
-through to a real shell where it could do something unintended.
-
-Safety model (matches cowork_tools.py conventions)
-----------------------------------------------------
-  - Every path goes through the same _safe_path() sandbox check used
-    everywhere else — nothing here can escape the sandbox root.
-  - run_file_command validates the parsed command against its own
-    docstring-declared contract (allowed executables, allowed flags,
-    exactly two path arguments) before running anything — see the
-    function's docstring and _validate_fileops_command() below.
-  - Destructive ops (delete_*) never hard-unlink. They move the target into
-    a hidden sandbox-local trash folder (.sicily-trash/), preserving
-    relative structure, so a wrong call is always recoverable by hand.
-  - Destructive and relocating-into-existing-path ops follow the same
-    dry_run=True-by-default pattern as edit_file_lines: preview first,
-    apply only once the caller explicitly passes dry_run=False.
+Safety: every path goes through _safe_path(). Destructive ops move to
+.sicily-trash/ rather than unlinking. Destructive/overwriting ops default
+to dry_run=True.
 """
 
 import re
@@ -244,23 +152,13 @@ class _CommandValidationError(ValueError):
 
 def _validate_fileops_command(command: str) -> tuple[str, list[Path], list[str]]:
     """
-    Parse and validate a `cp`/`mv`/`mkdir` command string against the exact
-    contract documented in run_file_command's docstring. This is the
-    enforcement point that keeps the tool from becoming a general shell
-    escape hatch: nothing here trusts the model's command string beyond
-    what is explicitly re-checked.
+    Parse and validate a `cp`/`mv`/`mkdir` command string against the
+    contract in run_file_command's docstring. Returns (executable,
+    resolved_paths, flags) on success — resolved_paths is [src, dst] for
+    cp/mv or [target] for mkdir. Raises _CommandValidationError otherwise.
 
-    Returns (executable, resolved_paths, flags) on success — resolved_paths
-    is [src, dst] for cp/mv or [target] for mkdir. Raises
-    _CommandValidationError with a human-readable reason on any violation —
-    unknown executable, disallowed flag, wrong argument count, or a path
-    that resolves outside the sandbox.
-
-    Deliberately does NOT use shell=True / a real shell anywhere in this
-    module. shlex.split() gives POSIX-ish tokenization (handles quoting)
-    without ever invoking /bin/sh, so there is no pipe, redirect, glob,
-    `;`, `&&`, backtick, or env-var expansion for a hallucinated or
-    adversarial command to exploit.
+    Uses shlex.split (no shell=True, no /bin/sh) — no pipes, redirects,
+    globs, or chaining possible.
     """
     try:
         tokens = shlex.split(command)
@@ -447,19 +345,9 @@ def run_file_command(command: str) -> str:
 @tool
 def delete_file(path: str, dry_run: bool = True) -> str:
     """
-    Delete a file. This NEVER permanently destroys data — the file is moved
-    into a hidden sandbox-local trash folder (.sicily-trash/), not unlinked.
-    It can always be recovered by hand afterward.
-
-    Works on ANY manageable file type, including images, video, audio,
-    archives, and APKs — not just text/PDF/docx/xlsx. This is a filesystem
-    move (shutil.move into trash), never a content operation.
-
-    Safety design (matches edit_file_lines)
-    ----------------------------------------
-    - dry_run=True (default): reports what WOULD happen, writes nothing.
-    - dry_run=False: actually moves the file to trash. Only use after the
-      user has confirmed the dry-run preview is what they want.
+    Delete a file — soft delete, moved to .sicily-trash/, never unlinked.
+    Works on any manageable file type (not just text/PDF/docx/xlsx).
+    dry_run=True (default) previews only; dry_run=False applies.
 
     Args:
         path:    Relative path to the file to delete.
@@ -501,17 +389,9 @@ def delete_file(path: str, dry_run: bool = True) -> str:
 @tool
 def delete_directory(path: str, recursive: bool = False, dry_run: bool = True) -> str:
     """
-    Delete a directory. Like delete_file, this is non-destructive — the
-    whole directory is moved into .sicily-trash/, not unlinked.
-
-    Safety design
-    --------------
-    - Refuses on a non-empty directory unless `recursive=True` is passed —
-      a separate, louder guard from dry_run, so an accidental "delete this
-      folder" can't silently wipe out more than the caller expected.
-    - dry_run=True (default): lists what's inside and what would happen,
-      writes nothing.
-    - dry_run=False: actually moves the directory to trash.
+    Delete a directory — soft delete, moved to .sicily-trash/, not unlinked.
+    Refuses on a non-empty directory unless recursive=True. dry_run=True
+    (default) previews contents and effect; dry_run=False applies.
 
     Args:
         path:      Relative path to the directory to delete.
@@ -574,26 +454,8 @@ def delete_directory(path: str, recursive: bool = False, dry_run: bool = True) -
 @tool
 def find_files_by_name(path: str, pattern: str, exclude_patterns: list[str] = []) -> str:
     """
-    STEP 1 of file discovery — find files by NAME/GLOB, not content.
-    Recursively matches filenames against a glob pattern (e.g. "*.py",
-    "invoice_*", "*.pdf"). Returns relative paths only — never opens or
-    reads file content.
-
-    Use this first whenever there's any hint about filename, folder naming
-    convention, or extension (e.g. "find anything that looks like an
-    invoice" -> pattern="*invoice*" or "*receipt*"). It's the cheapest
-    possible search: cost is proportional to match count, not tree size.
-
-    How this fits with the other search tools
-    --------------------------------------------
-      search_index             -> meaning/concepts, INDEXED types only
-                                   (.txt .md .pdf .docx .xlsx .csv ...)
-      find_files_by_name (this)-> filename/glob match, ALL file types,
-                                   reads no content
-      search_file_contents     -> exact/regex match INSIDE file content,
-                                   ALL readable types incl. code
-      preview_files_for_review -> last resort: open a shortlist of files
-                                   and reason over their content directly
+    Recursively find files by NAME/GLOB (e.g. "*.py", "invoice_*"), not
+    content. Returns relative paths only — reads no file content.
 
     Args:
         path:             Starting directory (relative path).
@@ -661,11 +523,8 @@ def search_file_contents(
     return_json: bool = False,
 ) -> str:
     """
-    STEP 2 of file discovery — grep-equivalent EXACT/PATTERN search INSIDE
-    file content (powered by literal/regex matching).
-
-    Searches readable files under `path` — plain text/code files directly,
-    plus PDF/docx/xlsx via standard text extraction.
+    Grep-equivalent literal/regex search inside file content, under `path`
+    — plain text/code directly, plus PDF/docx/xlsx via text extraction.
 
     Args:
         pattern:        Text or regex pattern to search for.
