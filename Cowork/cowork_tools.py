@@ -1,286 +1,36 @@
 """
 cowork_tools.py
 --------------
-Sandboxed filesystem tools for `sicily start`. Pure-Python re-implementation
-of the @modelcontextprotocol/server-filesystem interface.
+Sandboxed filesystem tools for `sicily start`.
 
-All tools are locked to a single root directory (the cwd `sicily start` was
-invoked from); no path can escape it.
+All tools are locked to a single root directory (the cwd `sicily start` was invoked from); no path can escape it.
 """
 
-import datetime
-import stat
+import re
+import shutil
 from pathlib import Path
-from typing import Optional
-import importlib
+import json
+import fnmatch
+from typing import List, Optional
 
 from langchain_core.tools import tool
-
-# Noise directories — skipped in trees and searches
-_SKIP_DIRS = {
-    ".venv", "venv", "env", ".env",
-    "node_modules",
-    "__pycache__",
-    ".git",
-    ".mypy_cache", ".pytest_cache", ".ruff_cache",
-    "dist", "build", ".eggs",
-    ".tox", ".nox",
-    ".idea", ".vscode",
-    ".sicily-trash",
-}
-
-
-# Allowed extensions for text-based file CONTENT reads/writes only
-# (write_file, in THIS file).
-# Binary formats (.docx, .xlsx, .pdf, …) are intentionally excluded from
-# these content write operations — they require structured serialisation,
-# not raw text I/O.
-#
-# NOTE: this restriction is scoped to reading/writing file CONTENT. It does
-# NOT apply to filesystem operations like move/copy/rename/delete, which
-# never touch content — see cowork_tool_fileops.py's READABLE_EXTENSIONS,
-# which deliberately includes .pdf/.docx/.xlsx/.xls/.doc for exactly that
-# reason. Don't infer from this set alone that binary files are unsupported
-# sandbox-wide.
-_ALLOWED_WRITE_EXTENSIONS: frozenset[str] = frozenset({
-    # Documents & notes
-    ".txt", ".md", ".markdown", ".rst", ".org", ".tex",
-    # Config & data interchange
-    ".json", ".jsonl", ".ndjson",
-    ".yaml", ".yml", ".toml",
-    ".ini", ".cfg", ".conf", ".env",
-    # Web & markup
-    ".html", ".htm", ".css", ".scss", ".sass", ".xml", ".svg",
-    # Source code — common languages
-    ".py", ".pyi",
-    ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
-    ".sh", ".bash", ".zsh", ".fish",
-    ".rb", ".go", ".rs",
-    ".java", ".kt", ".scala",
-    ".c", ".cpp", ".cc", ".h", ".hpp",
-    ".cs", ".fs",
-    ".php", ".lua", ".r", ".sql",
-    # Data & logs
-    ".csv", ".tsv", ".log",
-    # Misc text
-    ".diff", ".patch", ".gitignore", ".editorconfig",
-})
-
-
-# Sandbox root
-_SANDBOX_ROOT: Optional[Path] = None
-
-
-def _set_sandbox_root(path: Path) -> None:
-    global _SANDBOX_ROOT
-    _SANDBOX_ROOT = path.resolve()
-
-
-def _get_sandbox_root() -> Path:
-    if _SANDBOX_ROOT is None:
-        raise RuntimeError("Sandbox root has not been set. Call set_sandbox_root() first.")
-    return _SANDBOX_ROOT
-
-
-# Path pin store — survives context summarisation
-# Stored in process memory, not in the message list, so the summariser
-# cannot compress it away.
-_PATH_PINS: dict[str, str] = {}
-
-
-# Internal helpers
-def _safe_path(relative: str) -> Path:
-    """
-    Resolve a user/AI-supplied path against the sandbox root.
-    Raises PermissionError if the resolved path would escape the root.
-    """
-    root = _get_sandbox_root()
-    candidate = root / relative
-    try:
-        resolved = candidate.resolve()
-    except OSError:
-        # On Windows, resolve() can raise FileNotFoundError for paths
-        # that don't exist yet. Fall back to normpath-based resolution,
-        # which works for non-existent paths.
-        import os
-        resolved = Path(os.path.normpath(candidate))
-
-    if not resolved.is_relative_to(root):
-        raise PermissionError(
-            f"Access denied: '{relative}' resolves outside the allowed directory."
-        )
-    return resolved
-
-
-def _is_skipped(path: Path) -> bool:
-    """True if this is a noise directory that should be excluded."""
-    return path.is_dir() and path.name in _SKIP_DIRS
-
-
-def _fmt_ts(ts: float) -> str:
-    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _fmt_permissions(mode: int) -> str:
-    """Convert a stat st_mode integer to a human-readable 'rwxrwxrwx' string."""
-    result = []
-    for who in ("USR", "GRP", "OTH"):
-        for perm, letter in (("R", "r"), ("W", "w"), ("X", "x")):
-            flag = getattr(stat, f"S_I{perm}{who}")
-            result.append(letter if mode & flag else "-")
-    return "".join(result)
-
-
-# Extensions that require binary parsing rather than UTF-8 text reads
-_BINARY_EXTENSIONS = frozenset({".pdf", ".xlsx", ".xls", ".docx", ".doc"})
-
-
-def _read_binary(path: Path) -> str:
-    """
-    Extract human-readable text from binary file formats.
-    Dispatches to the appropriate parser based on file extension.
-    Raises ImportError with an install hint if the required library is missing.
-    Raises ValueError for unsupported binary extensions.
-    """
-    ext = path.suffix.lower()
-
-    if ext == ".pdf":
-        if importlib.util.find_spec("pypdf") is None:
-            raise ImportError("pip install pypdf")
-
-        from pypdf import PdfReader
-
-        reader = PdfReader(path)
-        text_output = ""
-
-        # 1. Extract text page by page
-        for i, page in enumerate(reader.pages):
-            page_text = page.extract_text() or ""
-            if page_text.strip():
-                text_output += f"[Page {i+1}]\n{page_text.strip()}\n\n"
-
-        # 2. Extract form fields (AcroForm)
-        try:
-            fields = reader.get_fields()
-            if fields:
-                field_lines = []
-                for name, field in fields.items():
-                    value = field.value
-                    if value is not None:
-                        field_lines.append(f"{name}: {value}")
-                    else:
-                        # Optional: show field name even if empty
-                        field_lines.append(f"{name}: [empty]")
-                if field_lines:
-                    text_output += "[Form Field Values]\n" + "\n".join(field_lines)
-        except Exception as e:
-            text_output += f"\n[Form Field Extraction Failed: {e}]"
-
-        return text_output.strip()
-
-    if ext in {".xlsx", ".xls"}:
-        if importlib.util.find_spec("openpyxl") is None:
-            raise ImportError("pip install openpyxl")
-        import openpyxl
-        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-        sheets = []
-        for name in wb.sheetnames:
-            ws = wb[name]
-            rows = [
-                "\t".join("" if cell.value is None else str(cell.value) for cell in row)
-                for row in ws.iter_rows()
-            ]
-            sheets.append(f"[Sheet: {name}]\n" + "\n".join(rows))
-        wb.close()
-        return "\n\n".join(sheets)
-
-    if ext in {".docx", ".doc"}:
-        if importlib.util.find_spec("docx") is None:
-            raise ImportError("pip install python-docx")
-        from docx import Document
-        doc = Document(path)
-        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-
-    raise ValueError(
-        f"No binary reader available for '{ext}'. "
-        "For plain text files this tool reads UTF-8 directly. "
-        "For other binary formats, a dedicated tool may be needed."
-    )
-
-
-# NOTE: list_directory and get_file_info used to be standalone @tool
-# entries. They're now folded into run_file_command (cowork_tool_fileops.py)
-# as the `ls` / `info` sub-commands, so the model can target several
-# paths in one call instead of one directory/file per round-trip. The
-# logic lives here as plain helpers — _list_directory_entries() and
-# _describe_path() — and is imported by cowork_tool_fileops.py rather
-# than duplicated. They are intentionally NOT decorated with @tool
-# anymore; do not re-register them directly.
-
-def _list_directory_entries(target: Path, path_label: str) -> str:
-    """
-    List the immediate contents of a directory. Each entry is prefixed
-    with [FILE] or [DIR]. Does NOT recurse into subdirectories.
-    `target` must already be a validated, existing directory Path;
-    `path_label` is the original relative path string, used for messages.
-    """
-    if not target.exists():
-        return f"Directory '{path_label}' does not exist."
-    if not target.is_dir():
-        return f"'{path_label}' is a file, not a directory."
-
-    try:
-        entries = sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name))
-    except PermissionError:
-        return f"Permission denied: cannot list '{path_label}'."
-
-    if not entries:
-        return "Directory is empty."
-
-    lines = []
-    for entry in entries:
-        tag = "[DIR] " if entry.is_dir() else "[FILE]"
-        note = "  [skipped — noise dir]" if _is_skipped(entry) else ""
-        lines.append(f"{tag} {entry.name}{note}")
-
-    return "\n".join(lines)
-
-
-def _describe_path(target: Path, path_label: str) -> str:
-    """
-    Get detailed metadata about a file or directory: name, type, size,
-    permissions, created, modified, and accessed times.
-    `target` must already be a validated Path; `path_label` is the
-    original relative path string, used for messages.
-    """
-    if not target.exists():
-        return f"'{path_label}' does not exist."
-
-    try:
-        s = target.stat()
-    except PermissionError:
-        return f"Permission denied: cannot stat '{path_label}'."
-
-    kind = "Directory" if target.is_dir() else "File"
-    size = f"{s.st_size:,} bytes" if target.is_file() else "—"
-    permissions = _fmt_permissions(s.st_mode)
-
-    # Creation time:
-    #   macOS  → st_birthtime (real creation time)
-    #   Windows→ st_ctime     (real creation time)
-    #   Linux  → st_ctime     (last metadata change; true birthtime not exposed by Python)
-    created = _fmt_ts(getattr(s, "st_birthtime", s.st_ctime))
-
-    return "\n".join([
-        f"Name:        {target.name}",
-        f"Type:        {kind}",
-        f"Size:        {size}",
-        f"Permissions: {permissions}",
-        f"Created:     {created}",
-        f"Modified:    {_fmt_ts(s.st_mtime)}",
-        f"Accessed:    {_fmt_ts(s.st_atime)}",
-        f"Path:        {path_label}",
-    ])
+from Cowork.cowork_helpers import (
+    _safe_path,
+    _read_binary,
+    _get_sandbox_root,
+    _is_skipped,
+    _list_directory_entries,
+    _describe_path,
+    _validate_fileops_command,
+    _move_to_trash,
+    _SKIP_DIRS,
+    _BINARY_EXTENSIONS,
+    _ALLOWED_WRITE_EXTENSIONS,
+    MANAGEABLE_EXTENSIONS,
+    TRASH_DIR_NAME,
+    READABLE_EXTENSIONS,
+    CommandValidationError
+)
 
 
 # READ-ONLY TOOLS
@@ -547,6 +297,516 @@ def write_file(
     )
 
 
+@tool
+def run_file_command(command: str) -> str:
+    """
+    Run a filesystem command inside the sandbox: `cp`, `mv`, `mkdir`, `ls`,
+    or `info` — for copying, moving/renaming, creating directories, listing
+    directory contents, and reading file/folder metadata. Supports multiple
+    paths per call (e.g. `ls reports/q3 reports/q4`, `info a.pdf b.md`) —
+    batch paths together rather than calling this once per path.
+
+    Not a general shell: only these five commands, limited flags (`-n`/`-r`/
+    `-p`), no globs, no piping/chaining. Since it's still a command line,
+    feel free to write the exact invocation for what you need rather than
+    defaulting to a generic one — precise flags/paths get you a more
+    targeted result and less to filter through.
+
+    Args:
+        command: A single cp/mv/mkdir/ls/info invocation, e.g.
+                "cp reports/draft.md reports/draft-backup.md",
+                "mv -r old_project new_project",
+                "mkdir reports/q3 reports/q4",
+                "ls reports/q3 reports/q4",
+                "info report.pdf notes.md archive/2026".
+    """
+    try:
+        executable, paths, flags = _validate_fileops_command(command)
+    except CommandValidationError as e:
+        return str(e)
+
+    root = _get_sandbox_root()
+    no_clobber = "-n" in flags
+
+    if executable == "ls":
+        sections = []
+        for target in paths:
+            label = str(target.relative_to(root)) if target.is_relative_to(root) else str(target)
+            body = _list_directory_entries(target, label)
+            sections.append(f"[{label}]\n{body}" if len(paths) > 1 else body)
+        return "\n\n".join(sections)
+
+    if executable == "info":
+        if not paths:
+            return "Refused: 'info' needs at least one path argument."
+        sections = []
+        for target in paths:
+            label = str(target.relative_to(root)) if target.is_relative_to(root) else str(target)
+            sections.append(_describe_path(target, label))
+        return "\n\n".join(sections)
+
+    if executable == "mkdir":
+        results = []
+        for target in paths:
+            if target.is_file():
+                results.append(f"'{target.relative_to(root)}': refused — already exists as a file.")
+                continue
+            if target.is_dir():
+                results.append(f"'{target.relative_to(root)}': already exists — nothing to do.")
+                continue
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+                results.append(f"'{target.relative_to(root)}': created.")
+            except Exception as e:
+                results.append(f"'{target.relative_to(root)}': could not create — {e}.")
+        return "\n".join(results)
+
+    # cp / mv — one or more sources, last positional is the destination.
+    *sources, dst = paths
+    multi_source = len(sources) > 1
+
+    # With 2+ sources, the destination must be a directory (create it if it doesn't exist yet, same as real cp/mv). With exactly 1 source,
+    # dst may be either a directory (item goes inside it) or a new path (item is placed/renamed at that exact path).
+    if multi_source:
+        if dst.exists() and not dst.is_dir():
+            return (
+                f"Refused: with multiple sources the destination "
+                f"'{dst.relative_to(root)}' must be a directory."
+            )
+        try:
+            dst.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return f"Could not create destination directory '{dst.relative_to(root)}': {e}"
+
+    results = []
+    for src in sources:
+        if not src.exists():
+            results.append(f"'{src.name}': source does not exist.")
+            continue
+
+        is_dir = src.is_dir()
+        if is_dir and executable == "cp" and "-r" not in flags:
+            results.append(
+                f"'{src.relative_to(root)}': is a directory — pass -r to copy it "
+                "(e.g. \"cp -r folder dest\")."
+            )
+            continue
+        if not is_dir:
+            ext = src.suffix.lower()
+            if ext not in MANAGEABLE_EXTENSIONS:
+                results.append(f"'{src.relative_to(root)}': refused — '{ext}' is not a manageable file type.")
+                continue
+
+        # Resolve final destination path for this item.
+        item_dst = (dst / src.name) if (multi_source or dst.is_dir()) else dst
+
+        if item_dst.exists():
+            if no_clobber:
+                results.append(f"'{src.relative_to(root)}': skipped (destination exists, -n set).")
+                continue
+            results.append(
+                f"'{src.relative_to(root)}': refused — destination "
+                f"'{item_dst.relative_to(root)}' already exists (this tool never overwrites)."
+            )
+            continue
+
+        src_rel = src.relative_to(root)
+        try:
+            item_dst.parent.mkdir(parents=True, exist_ok=True)
+            if executable == "cp":
+                if is_dir:
+                    shutil.copytree(str(src), str(item_dst))
+                    results.append(f"Copied '{src_rel}' -> '{item_dst.relative_to(root)}' (directory).")
+                else:
+                    shutil.copy2(str(src), str(item_dst))
+                    results.append(f"Copied '{src_rel}' -> '{item_dst.relative_to(root)}' ({item_dst.stat().st_size:,} bytes).")
+            else:  # mv
+                shutil.move(str(src), str(item_dst))
+                results.append(f"Moved '{src_rel}' -> '{item_dst.relative_to(root)}'.")
+        except Exception as e:
+            results.append(f"'{src_rel}': could not {executable} — {e}")
+
+    return "\n".join(results)
+
+
+# ---------------------------------------------------------------------------
+# DELETE (soft — trash, never unlink)
+# ---------------------------------------------------------------------------
+
+@tool
+def delete_file(path: str, dry_run: bool = True) -> str:
+    """
+    Delete a file — soft delete, moved to .sicily-trash/, never unlinked.
+    Works on any manageable file type (not just text/PDF/docx/xlsx).
+    dry_run=True (default) previews only; dry_run=False applies.
+
+    Args:
+        path:    Relative path to the file to delete.
+        dry_run: If True (default), preview only.
+    """
+    try:
+        target = _safe_path(path)
+    except PermissionError as e:
+        return str(e)
+
+    if not target.exists():
+        return f"'{path}' does not exist."
+    if not target.is_file():
+        return f"'{path}' is a directory. Use delete_directory instead."
+
+    ext = target.suffix.lower()
+    if ext not in MANAGEABLE_EXTENSIONS:
+        return (
+            f"Refused: '{ext}' is not currently a manageable file type in "
+            "this sandbox."
+        )
+
+    if dry_run:
+        return (
+            f"[DRY RUN — nothing deleted]\n"
+            f"Would move '{path}' to {TRASH_DIR_NAME}/.\n"
+            "Call again with dry_run=False to apply."
+        )
+
+    try:
+        trashed = _move_to_trash(target)
+    except Exception as e:
+        return f"Could not delete '{path}': {e}"
+
+    rel_trashed = trashed.relative_to(_get_sandbox_root())
+    return f"Deleted '{path}' (moved to '{rel_trashed}')."
+
+
+@tool
+def delete_directory(path: str, recursive: bool = False, dry_run: bool = True) -> str:
+    """
+    Delete a directory — soft delete, moved to .sicily-trash/, not unlinked.
+    Refuses on a non-empty directory unless recursive=True. dry_run=True
+    (default) previews contents and effect; dry_run=False applies.
+
+    Args:
+        path:      Relative path to the directory to delete.
+        recursive: Must be True to delete a non-empty directory.
+        dry_run:   If True (default), preview only.
+    """
+    try:
+        target = _safe_path(path)
+    except PermissionError as e:
+        return str(e)
+
+    if not target.exists():
+        return f"'{path}' does not exist."
+    if not target.is_dir():
+        return f"'{path}' is a file. Use delete_file instead."
+    if target == _get_sandbox_root():
+        return "Refused: cannot delete the sandbox root itself."
+
+    contents = list(target.rglob("*"))
+    file_count = sum(1 for p in contents if p.is_file())
+    dir_count = sum(1 for p in contents if p.is_dir())
+
+    if contents and not recursive:
+        return (
+            f"Refused: '{path}' is not empty "
+            f"({file_count} file(s), {dir_count} subfolder(s)). "
+            "Pass recursive=True to confirm you want to delete it all."
+        )
+
+    if dry_run:
+        root = _get_sandbox_root()
+        preview = "\n".join(f"  - {p.relative_to(root)}" for p in contents[:30])
+        more = f"\n  ... and {len(contents) - 30} more" if len(contents) > 30 else ""
+        return (
+            f"[DRY RUN — nothing deleted]\n"
+            f"Would move '{path}' and its contents "
+            f"({file_count} file(s), {dir_count} subfolder(s)) to {TRASH_DIR_NAME}/.\n\n"
+            f"{preview}{more}\n\n"
+            "Call again with dry_run=False to apply."
+        )
+
+    try:
+        trashed = _move_to_trash(target)
+    except Exception as e:
+        return f"Could not delete '{path}': {e}"
+
+    rel_trashed = trashed.relative_to(_get_sandbox_root())
+    return (
+        f"Deleted '{path}' and its contents "
+        f"({file_count} file(s), {dir_count} subfolder(s)) — moved to '{rel_trashed}'."
+    )
+
+
+# ---------------------------------------------------------------------------
+# SEARCH — three tiers, escalating cost, with the strategy baked into the
+# docstrings themselves so the model follows it without being separately prompted each time.
+# ---------------------------------------------------------------------------
+
+@tool
+def find_files_by_name(path: str, pattern: str, exclude_patterns: list[str] = []) -> str:
+    """
+    Recursively find files by NAME/GLOB (e.g. "*.py", "invoice_*"), not
+    content. Returns relative paths only — reads no file content.
+
+    Args:
+        path:             Starting directory (relative path).
+        pattern:          Glob pattern matched against each entry's name.
+        exclude_patterns: Optional glob patterns to exclude, matched
+                          against both the entry name and relative path.
+    """
+    import fnmatch
+
+    try:
+        start = _safe_path(path)
+    except PermissionError as e:
+        return str(e)
+
+    if not start.exists():
+        return f"Directory '{path}' does not exist."
+    if not start.is_dir():
+        return f"'{path}' is not a directory."
+
+    root = _get_sandbox_root()
+    matches: list[str] = []
+
+    def _walk(directory: Path) -> None:
+        try:
+            children = sorted(directory.iterdir(), key=lambda p: (p.is_file(), p.name))
+        except PermissionError:
+            return
+
+        for child in children:
+            if _is_skipped(child):
+                continue
+
+            rel = str(child.relative_to(root))
+
+            if any(
+                fnmatch.fnmatch(child.name, xp) or fnmatch.fnmatch(rel, xp)
+                for xp in exclude_patterns
+            ):
+                continue
+
+            if fnmatch.fnmatch(child.name, pattern):
+                matches.append(rel)
+
+            if child.is_dir():
+                _walk(child)
+
+    _walk(start)
+
+    if not matches:
+        return f"No files matching '{pattern}' found under '{path}'."
+
+    return f"Found {len(matches)} match(es):\n" + "\n".join(matches)
+
+
+# Hard server-side ceilings — independent of whatever the caller passes.
+# These exist because an unscoped search_file_contents call (broad path, no includes, high max_results) can otherwise walk and return a large
+# fraction of a monorepo in one call. Args are clamped, not rejected, so a call never fails — it just can't blow the budget.
+_MAX_RESULTS_CEILING = 40
+_MAX_FILES_SCANNED = 400          # stop walking after this many readable files, matches or not
+_MAX_CONTEXT_LINES = 4
+_MAX_OUTPUT_CHARS = 6_000         # hard cap on the returned string; truncated with a note past this
+
+
+@tool
+def search_file_contents(
+    pattern: str,
+    path: str = ".",
+    regex: bool = False,
+    case_sensitive: bool = False,
+    context_lines: int = 0,
+    match_per_line: bool = True,
+    includes: Optional[List[str]] = None,
+    max_results: int = 20,
+    return_json: bool = False,
+) -> str:
+    """
+    Grep-equivalent literal/regex search inside file content, under `path`
+    — plain text/code directly, plus PDF/docx/xlsx via text extraction.
+
+    Scope this tightly: pass the narrowest `path` and `includes` the
+    evidence supports, rather than searching the whole tree with a wide
+    alternation pattern. Results, files scanned, and context are all
+    capped server-side (max_results<=40, ~400 files walked, context<=4
+    lines, output truncated past ~6000 chars) — an unscoped call will be
+    clamped and truncated rather than returning everything, so a narrow
+    query is the only way to get complete results back. If a first
+    targeted search comes up empty, widen path/pattern deliberately on
+    the next call rather than starting broad.
+
+    Args:
+        pattern:        Text or regex pattern to search for.
+        path:           Directory to search under (relative or absolute). Defaults to ".".
+        regex:          If True, `pattern` is treated as a regular expression.
+        case_sensitive: If False (default), performs case-insensitive matching.
+        context_lines:  Lines of context above/below each match (default 0, max 4).
+        match_per_line: If True (default), returns matching lines and line numbers.
+                        If False, returns only matching file paths (like git grep -l) — cheaper,
+                        prefer this to locate candidate files before requesting line content.
+        includes:       Optional list of glob patterns to filter files (e.g. ["*.py", "!**/node_modules/*"]).
+                        Strongly recommended whenever you have any hint about file type or area.
+        max_results:    Stop after this many matches (default 20, hard cap 40).
+        return_json:    If True, outputs raw JSON objects like grep_search API.
+    """
+    try:
+        start = _safe_path(path)
+    except PermissionError as e:
+        return str(e)
+
+    if not start.exists():
+        return f"'{path}' does not exist."
+    if not start.is_dir():
+        return f"'{path}' is a file, not a directory. Pass a directory to search."
+
+    # Clamp caller-supplied limits to server-side ceilings rather than
+    # trusting them — this is what actually bounds worst-case cost.
+    max_results = max(1, min(max_results, _MAX_RESULTS_CEILING))
+    context_lines = max(0, min(context_lines, _MAX_CONTEXT_LINES))
+
+    # Compile regex pattern
+    flags = 0 if case_sensitive else re.IGNORECASE
+    try:
+        search_regex = re.compile(pattern if regex else re.escape(pattern), flags)
+    except re.error as e:
+        return f"Invalid regex pattern: {e}"
+
+    root = _get_sandbox_root()
+    matches = []
+    matching_files = set()
+    files_scanned = 0
+    files_skipped = []
+    scan_capped = False
+
+    # Common directory excludes to keep search fast
+    DEFAULT_IGNORE_DIRS = _SKIP_DIRS
+
+    def _should_include(file_rel_path: str) -> bool:
+        if not includes:
+            return True
+        included = False
+        for inc in includes:
+            if inc.startswith("!"):
+                if fnmatch.fnmatch(file_rel_path, inc[1:]):
+                    return False
+            else:
+                if fnmatch.fnmatch(file_rel_path, inc):
+                    included = True
+        return included if any(not inc.startswith("!") for inc in includes) else True
+
+    def _iter_files(directory: Path):
+        try:
+            children = sorted(directory.iterdir(), key=lambda p: (p.is_file(), p.name))
+        except PermissionError:
+            return
+        for child in children:
+            if child.is_dir():
+                if child.name in DEFAULT_IGNORE_DIRS or _is_skipped(child):
+                    continue
+                yield from _iter_files(child)
+            elif child.is_file():
+                if _is_skipped(child):
+                    continue
+                yield child
+
+    for file_path in _iter_files(start):
+        if len(matches) >= max_results:
+            break
+        if files_scanned >= _MAX_FILES_SCANNED:
+            scan_capped = True
+            break
+
+        ext = file_path.suffix.lower()
+        if ext not in READABLE_EXTENSIONS:
+            continue
+
+        try:
+            rel_str = str(file_path.relative_to(root)).replace("\\", "/")
+        except ValueError:
+            rel_str = str(file_path).replace("\\", "/")
+
+        if not _should_include(rel_str):
+            continue
+
+        try:
+            if ext in _BINARY_EXTENSIONS:
+                text = _read_binary(file_path)
+            else:
+                text = file_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            files_skipped.append(rel_str)
+            continue
+
+        files_scanned += 1
+        lines = text.splitlines()
+
+        for i, line in enumerate(lines):
+            if len(matches) >= max_results:
+                break
+
+            if search_regex.search(line):
+                matching_files.add(rel_str)
+
+                # If only file listing requested (git grep -l behavior)
+                if not match_per_line:
+                    if rel_str not in matches:
+                        matches.append(rel_str)
+                    break
+
+                line_num = i + 1
+
+                if return_json:
+                    matches.append({
+                        "Filename": rel_str,
+                        "LineNumber": line_num,
+                        "LineContent": line.strip()
+                    })
+                else:
+                    if context_lines > 0:
+                        lo = max(0, i - context_lines)
+                        hi = min(len(lines), i + context_lines + 1)
+                        snippet_lines = lines[lo:hi]
+                        snippet = "\n".join(
+                            f"{'>' if lo + j == i else ' '} {lo + j + 1:>5}  {l}"
+                            for j, l in enumerate(snippet_lines)
+                        )
+                        matches.append(f"[{rel_str}]\n{snippet}")
+                    else:
+                        matches.append(f"[{rel_str}:{line_num}]  {line.strip()}")
+
+    search_desc = (
+        f"Searched for {'regex' if regex else 'literal'} pattern '{pattern}' "
+        f"({'case-sensitive' if case_sensitive else 'case-insensitive'}) under '{path}'"
+    )
+    cap_note = (
+        f" (stopped after scanning {_MAX_FILES_SCANNED} files — narrow `path`/`includes` "
+        "to search the rest)" if scan_capped else ""
+    )
+
+    if not matches:
+        note = f" ({len(files_skipped)} file(s) could not be read)" if files_skipped else ""
+        return (
+            f"{search_desc}\n"
+            f"No matches across {files_scanned} readable file(s){note}{cap_note}."
+        )
+
+    if return_json:
+        out = json.dumps(matches, indent=2)
+        if len(out) > _MAX_OUTPUT_CHARS:
+            out = out[:_MAX_OUTPUT_CHARS] + f"\n... [truncated at {_MAX_OUTPUT_CHARS} chars — narrow the query for full results]"
+        return out
+
+    header = f"{search_desc}\nFound {len(matches)} match(es) across {len(matching_files)} file(s) ({files_scanned} scanned{cap_note})"
+    if len(matches) >= max_results:
+        header += f" (capped at max_results={max_results})"
+
+    body = "\n\n".join(matches)
+    if len(body) > _MAX_OUTPUT_CHARS:
+        body = body[:_MAX_OUTPUT_CHARS] + f"\n... [truncated at {_MAX_OUTPUT_CHARS} chars — narrow `path`/`includes`/`pattern` for full results]"
+
+    return header + ":\n\n" + body
+
+
 # EXPORTED TOOL LIST
 # list_directory and get_file_info are no longer standalone tools — they're
 # available as the `ls` / `info` sub-commands of run_file_command (see
@@ -559,6 +819,17 @@ LOCAL_TOOLS = [
 
     # Write (safe-ish)
     write_file,
+
+    # Search tier (escalating cost — see docstrings for the strategy)
+    find_files_by_name,
+    search_file_contents,
+
+    # Copy / move / rename / mkdir / list / inspect — one validated command tool (no-clobber by default).
+    run_file_command,
+
+    # Delete (soft — trash, dry_run by default)
+    delete_file,
+    delete_directory,
 ]
 
 
@@ -584,11 +855,28 @@ TOOL_STATUS_MAP = {
                  f"(lines {args.get('start_line')}–{args.get('end_line')})"
         )
     ),
+    "find_files_by_name": lambda args: (
+        f"Searching filenames for [white]'{args.get('pattern')}'[/white] "
+        f"under [white]'{args.get('path')}'[/white]"
+    ),
+    "search_file_contents": lambda args: (
+        f"Searching for [white]'{args.get('pattern')}'[/white] "
+        f"under [white]'{args.get('path', '.')}'[/white]"
+    ),
+    "run_file_command": lambda args: (
+        f"Running [white]'{args.get('command')}'[/white]"
+    ),
+    "delete_file": lambda args: (
+        f"Previewing delete of [white]'{args.get('path')}'[/white]"
+        if args.get("dry_run", True)
+        else f"Deleting [white]'{args.get('path')}'[/white] (-> trash)"
+    ),
+    "delete_directory": lambda args: (
+        f"Previewing delete of [white]'{args.get('path')}'[/white]"
+        if args.get("dry_run", True)
+        else f"Deleting [white]'{args.get('path')}'[/white] (-> trash)"
+    ),
 }
-
-import Cowork.cowork_tool_fileops as fileops
-LOCAL_TOOLS.extend(fileops.FILEOPS_TOOLS)   # Merge fileops tools
-TOOL_STATUS_MAP.update(fileops.FILEOPS_TOOL_STATUS_MAP) # Merge status messages
 
 
 def get_friendly_tool_message(tool_call: dict) -> str:
