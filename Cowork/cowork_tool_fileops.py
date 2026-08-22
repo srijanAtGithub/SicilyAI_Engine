@@ -2,10 +2,13 @@
 cowork_tools_fileops.py
 ------------------------
 File-management and content-search tools for Sicily Cowork. Extends
-cowork_tools.py with: run_file_command (validated cp/mv/mkdir), delete_file
-/ delete_directory (soft-delete to trash), search_file_contents (grep over
-readable extensions), find_files_by_name (glob match), and
-preview_files_for_review (batched multi-file preview).
+cowork_tools.py with: run_file_command (validated cp/mv/mkdir, plus the
+ls/info sub-commands — folded in from cowork_tools.py's former standalone
+list_directory/get_file_info tools so the model can target several
+directories/files in a single call), delete_file / delete_directory
+(soft-delete to trash), search_file_contents (grep over readable
+extensions), find_files_by_name (glob match), and preview_files_for_review
+(batched multi-file preview).
 
 Scope: content tools (search_file_contents, preview_files_for_review) only
 work on READABLE_EXTENSIONS (text + PDF/docx/xlsx via existing parsers).
@@ -34,14 +37,16 @@ from typing import List, Optional
 
 from langchain_core.tools import tool
 
-from Cowork.cowork_rag import SKIP_DIRS
 from Cowork.cowork_tools import (
     _safe_path,
     _is_skipped,
     _read_binary,
     _BINARY_EXTENSIONS,
-    ALLOWED_WRITE_EXTENSIONS,
-    get_sandbox_root,
+    _ALLOWED_WRITE_EXTENSIONS,
+    _SKIP_DIRS,
+    _get_sandbox_root,
+    _list_directory_entries,
+    _describe_path,
 )
 
 
@@ -50,7 +55,7 @@ from Cowork.cowork_tools import (
 # is consumed by the CONTENT tools in this module — search_file_contents and
 # preview_files_for_review — which genuinely cannot do anything with an
 # extension outside it, since there's no parser for it.
-READABLE_EXTENSIONS: frozenset[str] = ALLOWED_WRITE_EXTENSIONS | _BINARY_EXTENSIONS
+READABLE_EXTENSIONS: frozenset[str] = _ALLOWED_WRITE_EXTENSIONS | _BINARY_EXTENSIONS
 
 # Extensions with no content parser, but that pure filesystem ops (copy/move/
 # rename/delete) can still handle safely — those ops never open or interpret
@@ -91,7 +96,7 @@ def _trash_root() -> Path:
     Lives INSIDE the sandbox root so it passes _safe_path() like everything
     else, and so trashed files survive a session restart for manual recovery.
     """
-    root = get_sandbox_root()
+    root = _get_sandbox_root()
     trash = root / TRASH_DIR_NAME
     trash.mkdir(exist_ok=True)
     return trash
@@ -103,7 +108,7 @@ def _move_to_trash(target: Path) -> Path:
     human can find and restore it by hand. Timestamps the leaf name on
     collision instead of overwriting a previously trashed item.
     """
-    root = get_sandbox_root()
+    root = _get_sandbox_root()
     rel = target.relative_to(root)
     dest = _trash_root() / rel
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -128,9 +133,17 @@ _ALLOWED_FLAGS = {
     "cp": {"-n", "-r"},
     "mv": {"-n"},
     "mkdir": {"-p"},
+    "ls": set(),
+    "info": set(),
 }
 
 _ALLOWED_EXECUTABLES = frozenset(_ALLOWED_FLAGS.keys())
+
+# Sub-commands that take zero or more path positionals (0 => defaults to
+# the sandbox root for `ls`, or is simply invalid for `info`, handled in
+# run_file_command itself). Kept separate from mkdir's "1+" rule because
+# `ls` alone (no args) is a legitimate, common call.
+_ZERO_OR_MORE_POSITIONAL_COMMANDS = frozenset({"ls", "info"})
 
 # Executables/keywords that must never reach this tool, checked explicitly
 # so a rejection names the real reason ("that's a shell/programming/VCS/
@@ -159,12 +172,14 @@ class _CommandValidationError(ValueError):
 
 def _validate_fileops_command(command: str) -> tuple[str, list[Path], list[str]]:
     """
-    Parse and validate a `cp`/`mv`/`mkdir` command string against the
-    contract in run_file_command's docstring. Returns (executable,
-    resolved_paths, flags) on success:
+    Parse and validate a `cp`/`mv`/`mkdir`/`ls`/`info` command string
+    against the contract in run_file_command's docstring. Returns
+    (executable, resolved_paths, flags) on success:
       - cp/mv: resolved_paths is [src1, src2, ..., dst] (2+ items —
         one or more sources, last item is the destination).
       - mkdir: resolved_paths is [path1, path2, ...] (1+ items).
+      - ls/info: resolved_paths is [path1, path2, ...] (0+ items — an
+        empty `ls` defaults to the sandbox root).
     Raises _CommandValidationError otherwise.
 
     Uses shlex.split (no shell=True, no /bin/sh) — no pipes, redirects,
@@ -187,7 +202,7 @@ def _validate_fileops_command(command: str) -> tuple[str, list[Path], list[str]]
         raise _CommandValidationError(
             f"Refused: '{executable}' is a shell, scripting, VCS, package-"
             "manager, or privilege-escalation command. run_file_command "
-            "only runs cp, mv, or mkdir."
+            "only runs cp, mv, mkdir, ls, or info."
         )
 
     if executable not in _ALLOWED_EXECUTABLES:
@@ -213,13 +228,24 @@ def _validate_fileops_command(command: str) -> tuple[str, list[Path], list[str]]
             f"'{executable}'. Only {sorted(allowed_flags)} are permitted."
         )
 
-    min_positionals = 1 if executable == "mkdir" else 2
+    if executable in _ZERO_OR_MORE_POSITIONAL_COMMANDS:
+        min_positionals = 0
+    elif executable == "mkdir":
+        min_positionals = 1
+    else:
+        min_positionals = 2
+
     if len(positionals) < min_positionals:
         noun = "path argument" if executable == "mkdir" else "path arguments (at least one source plus a destination)"
         raise _CommandValidationError(
             f"Refused: expected at least {min_positionals} {noun} for "
             f"'{executable}', got {len(positionals)}: {positionals}."
         )
+
+    # `ls` with zero arguments means "list the sandbox root" — give it an
+    # explicit "." so downstream resolution has something to work with.
+    if executable == "ls" and not positionals:
+        positionals = ["."]
 
     for raw in positionals:
         if any(ch in raw for ch in "*?[]"):
@@ -241,35 +267,50 @@ def _validate_fileops_command(command: str) -> tuple[str, list[Path], list[str]]
 @tool
 def run_file_command(command: str) -> str:
     """
-    Run a copy, move/rename, or create-directory command inside the
-    sandbox: `cp`, `mv`, or `mkdir`. Use this whenever the task is to
-    duplicate, relocate, rename, or organize files and folders.
+    Run a filesystem command inside the sandbox: `cp`, `mv`, `mkdir`, `ls`,
+    or `info` — for copying, moving/renaming, creating directories, listing
+    directory contents, and reading file/folder metadata. Supports multiple
+    paths per call (e.g. `ls reports/q3 reports/q4`, `info a.pdf b.md`) —
+    batch paths together rather than calling this once per path.
 
-    Handles single or multiple files, single or multiple folders (copied/
-    moved recursively), and multiple destinations for mkdir — same as the
-    real commands: `cp a.txt b.txt dest/` (2 sources -> a directory),
-    `cp -r folder1 folder2 archive/`, `mkdir a b c`. mkdir also accepts a
-    single path. Renaming is `mv <old> <new>` in the same folder.
-
-    This is not a general shell — only `cp`, `mv`, `mkdir` are supported,
-    no flags beyond `-n`/`-r`/`-p`, no globs (list exact paths instead of
-    `*.txt`), no piping or chaining. Every path must resolve inside the
-    sandbox.
+    Not a general shell: only these five commands, limited flags (`-n`/`-r`/
+    `-p`), no globs, no piping/chaining. Since it's still a command line,
+    feel free to write the exact invocation for what you need rather than
+    defaulting to a generic one — precise flags/paths get you a more
+    targeted result and less to filter through.
 
     Args:
-        command: A single cp/mv/mkdir invocation, e.g.
-                 "cp reports/draft.md reports/draft-backup.md",
-                 "cp report.pdf photo.jpg archive/2026/",
-                 "mv -r old_project new_project",
-                 "mkdir reports/q3 reports/q4".
+        command: A single cp/mv/mkdir/ls/info invocation, e.g.
+                "cp reports/draft.md reports/draft-backup.md",
+                "mv -r old_project new_project",
+                "mkdir reports/q3 reports/q4",
+                "ls reports/q3 reports/q4",
+                "info report.pdf notes.md archive/2026".
     """
     try:
         executable, paths, flags = _validate_fileops_command(command)
     except _CommandValidationError as e:
         return str(e)
 
-    root = get_sandbox_root()
+    root = _get_sandbox_root()
     no_clobber = "-n" in flags
+
+    if executable == "ls":
+        sections = []
+        for target in paths:
+            label = str(target.relative_to(root)) if target.is_relative_to(root) else str(target)
+            body = _list_directory_entries(target, label)
+            sections.append(f"[{label}]\n{body}" if len(paths) > 1 else body)
+        return "\n\n".join(sections)
+
+    if executable == "info":
+        if not paths:
+            return "Refused: 'info' needs at least one path argument."
+        sections = []
+        for target in paths:
+            label = str(target.relative_to(root)) if target.is_relative_to(root) else str(target)
+            sections.append(_describe_path(target, label))
+        return "\n\n".join(sections)
 
     if executable == "mkdir":
         results = []
@@ -401,7 +442,7 @@ def delete_file(path: str, dry_run: bool = True) -> str:
     except Exception as e:
         return f"Could not delete '{path}': {e}"
 
-    rel_trashed = trashed.relative_to(get_sandbox_root())
+    rel_trashed = trashed.relative_to(_get_sandbox_root())
     return f"Deleted '{path}' (moved to '{rel_trashed}')."
 
 
@@ -426,7 +467,7 @@ def delete_directory(path: str, recursive: bool = False, dry_run: bool = True) -
         return f"'{path}' does not exist."
     if not target.is_dir():
         return f"'{path}' is a file. Use delete_file instead."
-    if target == get_sandbox_root():
+    if target == _get_sandbox_root():
         return "Refused: cannot delete the sandbox root itself."
 
     contents = list(target.rglob("*"))
@@ -441,7 +482,7 @@ def delete_directory(path: str, recursive: bool = False, dry_run: bool = True) -
         )
 
     if dry_run:
-        root = get_sandbox_root()
+        root = _get_sandbox_root()
         preview = "\n".join(f"  - {p.relative_to(root)}" for p in contents[:30])
         more = f"\n  ... and {len(contents) - 30} more" if len(contents) > 30 else ""
         return (
@@ -457,7 +498,7 @@ def delete_directory(path: str, recursive: bool = False, dry_run: bool = True) -
     except Exception as e:
         return f"Could not delete '{path}': {e}"
 
-    rel_trashed = trashed.relative_to(get_sandbox_root())
+    rel_trashed = trashed.relative_to(_get_sandbox_root())
     return (
         f"Deleted '{path}' and its contents "
         f"({file_count} file(s), {dir_count} subfolder(s)) — moved to '{rel_trashed}'."
@@ -494,7 +535,7 @@ def find_files_by_name(path: str, pattern: str, exclude_patterns: list[str] = []
     if not start.is_dir():
         return f"'{path}' is not a directory."
 
-    root = get_sandbox_root()
+    root = _get_sandbox_root()
     matches: list[str] = []
 
     def _walk(directory: Path) -> None:
@@ -602,7 +643,7 @@ def search_file_contents(
     except re.error as e:
         return f"Invalid regex pattern: {e}"
 
-    root = get_sandbox_root()
+    root = _get_sandbox_root()
     matches = []
     matching_files = set()
     files_scanned = 0
@@ -610,7 +651,7 @@ def search_file_contents(
     scan_capped = False
 
     # Common directory excludes to keep search fast
-    DEFAULT_IGNORE_DIRS = SKIP_DIRS
+    DEFAULT_IGNORE_DIRS = _SKIP_DIRS
 
     def _should_include(file_rel_path: str) -> bool:
         if not includes:
@@ -743,8 +784,10 @@ FILEOPS_TOOLS = [
     find_files_by_name,
     search_file_contents,
 
-    # Copy / move / rename — one validated cp/mv command tool (no-clobber
-    # by default, replaces copy_file/move_file/rename_file)
+    # Copy / move / rename / mkdir / list / inspect — one validated
+    # command tool (no-clobber by default). Replaces copy_file/move_file/
+    # rename_file, and also absorbs the old standalone list_directory and
+    # get_file_info tools as its `ls`/`info` sub-commands.
     run_file_command,
 
     # Delete (soft — trash, dry_run by default)
@@ -762,6 +805,9 @@ FILEOPS_TOOL_STATUS_MAP = {
         f"Searching for [white]'{args.get('pattern')}'[/white] "
         f"under [white]'{args.get('path', '.')}'[/white]"
     ),
+    # Covers cp/mv/mkdir/ls/info — all run through run_file_command, so
+    # the status line is derived straight from the raw `command` string
+    # (e.g. "ls reports/q3 reports/q4", "info report.pdf").
     "run_file_command": lambda args: (
         f"Running [white]'{args.get('command')}'[/white]"
     ),

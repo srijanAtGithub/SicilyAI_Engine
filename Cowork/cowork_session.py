@@ -45,7 +45,7 @@ import configuration
 
 # Initialize the rich console for styling
 console = Console()
-from Cowork.cowork_tools import LOCAL_TOOLS, set_sandbox_root, get_friendly_tool_message
+from Cowork.cowork_tools import LOCAL_TOOLS, _set_sandbox_root, get_friendly_tool_message
 from Agent.agent import maybe_summarize
 from Cowork.debug_log import reset_step_counter, log_tool_call, log_llm_tokens, log_turn_summary, log_error
 
@@ -266,7 +266,7 @@ async def run_local_session():
 
     # 1. Lock the sandbox to wherever the command was run from
     cwd = Path.cwd().resolve()
-    set_sandbox_root(cwd)
+    _set_sandbox_root(cwd)
 
     console.print(f"[bold dark_orange]{BANNER}[/bold dark_orange]")
     print_info(f"Sandbox root: {cwd}")

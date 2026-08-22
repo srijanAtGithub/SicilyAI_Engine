@@ -17,7 +17,7 @@ import importlib
 from langchain_core.tools import tool
 
 # Noise directories — skipped in trees and searches
-SKIP_DIRS = {
+_SKIP_DIRS = {
     ".venv", "venv", "env", ".env",
     "node_modules",
     "__pycache__",
@@ -42,7 +42,7 @@ SKIP_DIRS = {
 # which deliberately includes .pdf/.docx/.xlsx/.xls/.doc for exactly that
 # reason. Don't infer from this set alone that binary files are unsupported
 # sandbox-wide.
-ALLOWED_WRITE_EXTENSIONS: frozenset[str] = frozenset({
+_ALLOWED_WRITE_EXTENSIONS: frozenset[str] = frozenset({
     # Documents & notes
     ".txt", ".md", ".markdown", ".rst", ".org", ".tex",
     # Config & data interchange
@@ -71,12 +71,12 @@ ALLOWED_WRITE_EXTENSIONS: frozenset[str] = frozenset({
 _SANDBOX_ROOT: Optional[Path] = None
 
 
-def set_sandbox_root(path: Path) -> None:
+def _set_sandbox_root(path: Path) -> None:
     global _SANDBOX_ROOT
     _SANDBOX_ROOT = path.resolve()
 
 
-def get_sandbox_root() -> Path:
+def _get_sandbox_root() -> Path:
     if _SANDBOX_ROOT is None:
         raise RuntimeError("Sandbox root has not been set. Call set_sandbox_root() first.")
     return _SANDBOX_ROOT
@@ -94,7 +94,7 @@ def _safe_path(relative: str) -> Path:
     Resolve a user/AI-supplied path against the sandbox root.
     Raises PermissionError if the resolved path would escape the root.
     """
-    root = get_sandbox_root()
+    root = _get_sandbox_root()
     candidate = root / relative
     try:
         resolved = candidate.resolve()
@@ -114,7 +114,7 @@ def _safe_path(relative: str) -> Path:
 
 def _is_skipped(path: Path) -> bool:
     """True if this is a noise directory that should be excluded."""
-    return path.is_dir() and path.name in SKIP_DIRS
+    return path.is_dir() and path.name in _SKIP_DIRS
 
 
 def _fmt_ts(ts: float) -> str:
@@ -206,6 +206,81 @@ def _read_binary(path: Path) -> str:
         "For plain text files this tool reads UTF-8 directly. "
         "For other binary formats, a dedicated tool may be needed."
     )
+
+
+# NOTE: list_directory and get_file_info used to be standalone @tool
+# entries. They're now folded into run_file_command (cowork_tool_fileops.py)
+# as the `ls` / `info` sub-commands, so the model can target several
+# paths in one call instead of one directory/file per round-trip. The
+# logic lives here as plain helpers — _list_directory_entries() and
+# _describe_path() — and is imported by cowork_tool_fileops.py rather
+# than duplicated. They are intentionally NOT decorated with @tool
+# anymore; do not re-register them directly.
+
+def _list_directory_entries(target: Path, path_label: str) -> str:
+    """
+    List the immediate contents of a directory. Each entry is prefixed
+    with [FILE] or [DIR]. Does NOT recurse into subdirectories.
+    `target` must already be a validated, existing directory Path;
+    `path_label` is the original relative path string, used for messages.
+    """
+    if not target.exists():
+        return f"Directory '{path_label}' does not exist."
+    if not target.is_dir():
+        return f"'{path_label}' is a file, not a directory."
+
+    try:
+        entries = sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name))
+    except PermissionError:
+        return f"Permission denied: cannot list '{path_label}'."
+
+    if not entries:
+        return "Directory is empty."
+
+    lines = []
+    for entry in entries:
+        tag = "[DIR] " if entry.is_dir() else "[FILE]"
+        note = "  [skipped — noise dir]" if _is_skipped(entry) else ""
+        lines.append(f"{tag} {entry.name}{note}")
+
+    return "\n".join(lines)
+
+
+def _describe_path(target: Path, path_label: str) -> str:
+    """
+    Get detailed metadata about a file or directory: name, type, size,
+    permissions, created, modified, and accessed times.
+    `target` must already be a validated Path; `path_label` is the
+    original relative path string, used for messages.
+    """
+    if not target.exists():
+        return f"'{path_label}' does not exist."
+
+    try:
+        s = target.stat()
+    except PermissionError:
+        return f"Permission denied: cannot stat '{path_label}'."
+
+    kind = "Directory" if target.is_dir() else "File"
+    size = f"{s.st_size:,} bytes" if target.is_file() else "—"
+    permissions = _fmt_permissions(s.st_mode)
+
+    # Creation time:
+    #   macOS  → st_birthtime (real creation time)
+    #   Windows→ st_ctime     (real creation time)
+    #   Linux  → st_ctime     (last metadata change; true birthtime not exposed by Python)
+    created = _fmt_ts(getattr(s, "st_birthtime", s.st_ctime))
+
+    return "\n".join([
+        f"Name:        {target.name}",
+        f"Type:        {kind}",
+        f"Size:        {size}",
+        f"Permissions: {permissions}",
+        f"Created:     {created}",
+        f"Modified:    {_fmt_ts(s.st_mtime)}",
+        f"Accessed:    {_fmt_ts(s.st_atime)}",
+        f"Path:        {path_label}",
+    ])
 
 
 # READ-ONLY TOOLS
@@ -309,87 +384,6 @@ def read_file(path: str, start_line: int = 0, end_line: int = 0) -> str:
     return header + content
 
 
-@tool
-def list_directory(path: str = ".") -> str:
-    """
-    List the immediate contents of a directory.
-    Each entry is prefixed with [FILE] or [DIR].
-    Does NOT recurse into subdirectories.
-
-    Args:
-        path: Relative path to the directory. Defaults to "." (sandbox root).
-    """
-    try:
-        target = _safe_path(path)
-    except PermissionError as e:
-        return str(e)
-
-    if not target.exists():
-        return f"Directory '{path}' does not exist."
-    if not target.is_dir():
-        return f"'{path}' is a file, not a directory."
-
-    try:
-        entries = sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name))
-    except PermissionError:
-        return f"Permission denied: cannot list '{path}'."
-
-    if not entries:
-        return "Directory is empty."
-
-    lines = []
-    for entry in entries:
-        tag = "[DIR] " if entry.is_dir() else "[FILE]"
-        note = "  [skipped — noise dir]" if _is_skipped(entry) else ""
-        lines.append(f"{tag} {entry.name}{note}")
-
-    return "\n".join(lines)
-
-
-@tool
-def get_file_info(path: str) -> str:
-    """
-    Get detailed metadata about a file or directory.
-    Returns: name, type, size, permissions, created, modified, and accessed times.
-
-    Args:
-        path: Relative path to the file or directory.
-    """
-    try:
-        target = _safe_path(path)
-    except PermissionError as e:
-        return str(e)
-
-    if not target.exists():
-        return f"'{path}' does not exist."
-
-    try:
-        s = target.stat()
-    except PermissionError:
-        return f"Permission denied: cannot stat '{path}'."
-
-    kind = "Directory" if target.is_dir() else "File"
-    size = f"{s.st_size:,} bytes" if target.is_file() else "—"
-    permissions = _fmt_permissions(s.st_mode)
-
-    # Creation time:
-    #   macOS  → st_birthtime (real creation time)
-    #   Windows→ st_ctime     (real creation time)
-    #   Linux  → st_ctime     (last metadata change; true birthtime not exposed by Python)
-    created = _fmt_ts(getattr(s, "st_birthtime", s.st_ctime))
-
-    return "\n".join([
-        f"Name:        {target.name}",
-        f"Type:        {kind}",
-        f"Size:        {size}",
-        f"Permissions: {permissions}",
-        f"Created:     {created}",
-        f"Modified:    {_fmt_ts(s.st_mtime)}",
-        f"Accessed:    {_fmt_ts(s.st_atime)}",
-        f"Path:        {path}",
-    ])
-
-
 # WRITE TOOLS
 @tool
 def write_file(
@@ -450,8 +444,8 @@ def write_file(
                 f"Refused: '{path}' has no file extension. "
                 "Please include one (e.g. report.md, config.yaml)."
             )
-        if ext not in ALLOWED_WRITE_EXTENSIONS:
-            allowed_str = "  " + "\n  ".join(sorted(ALLOWED_WRITE_EXTENSIONS))
+        if ext not in _ALLOWED_WRITE_EXTENSIONS:
+            allowed_str = "  " + "\n  ".join(sorted(_ALLOWED_WRITE_EXTENSIONS))
             return (
                 f"Refused: extension '{ext}' is not in the allowed list.\n"
                 f"Supported extensions:\n{allowed_str}"
@@ -460,7 +454,7 @@ def write_file(
         parent = target.parent
         if not parent.exists():
             if not create_parents:
-                rel_parent = parent.relative_to(get_sandbox_root())
+                rel_parent = parent.relative_to(_get_sandbox_root())
                 return (
                     f"Error: parent directory '{rel_parent}' does not exist. "
                     "Pass create_parents=True to create it automatically, "
@@ -489,7 +483,7 @@ def write_file(
         return f"File '{path}' does not exist. Use mode=\"create\" to make new files."
     if not target.is_file():
         return f"'{path}' is a directory, not a file."
-    if ext not in ALLOWED_WRITE_EXTENSIONS:
+    if ext not in _ALLOWED_WRITE_EXTENSIONS:
         return (
             f"Refused: extension '{ext}' is not in the allowed list for editing. "
             "Only text-based files can be edited."
@@ -554,12 +548,14 @@ def write_file(
 
 
 # EXPORTED TOOL LIST
+# list_directory and get_file_info are no longer standalone tools — they're
+# available as the `ls` / `info` sub-commands of run_file_command (see
+# cowork_tool_fileops.py), which lets the model target several paths per
+# call instead of one per round-trip.
 LOCAL_TOOLS = [
     # Read-only (safe)
     search_index,
     read_file,
-    list_directory,
-    get_file_info,
 
     # Write (safe-ish)
     write_file,
@@ -576,12 +572,6 @@ TOOL_STATUS_MAP = {
         f"[white]'{args.get('path')}'[/white]"
         if args.get("start_line") or args.get("end_line")
         else f"Reading file [white]'{args.get('path')}'[/white]"
-    ),
-    "list_directory": lambda args: (
-        f"Listing contents of [white]'{args.get('path', '.')}'[/white]"
-    ),
-    "get_file_info": lambda args: (
-        f"Inspecting metadata for [white]'{args.get('path')}'[/white]"
     ),
     "write_file": lambda args: (
         f"Creating [white]'{args.get('path')}'[/white]"
