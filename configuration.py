@@ -135,11 +135,11 @@ def get_intent_llm(schema):
 
 
 def get_eval_llm():
-    return ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    return ChatOpenAI(model="gpt-5-nano", temperature=0)
 
 
 def get_summarizer_llm():
-    return ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    return ChatOpenAI(model="gpt-5-nano", temperature=0)
 
 
 def get_transcriber() -> AsyncOpenAI:
