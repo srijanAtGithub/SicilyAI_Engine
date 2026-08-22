@@ -32,7 +32,10 @@ from Cowork.cowork_helpers import (
     MANAGEABLE_EXTENSIONS,
     TRASH_DIR_NAME,
     READABLE_EXTENSIONS,
-    CommandValidationError
+    CommandValidationError,
+    build_binary_file,
+    _format_script_library_status,
+    _SCRIPTED_BINARY_OUTPUT_NAME,
 )
 
 
@@ -218,6 +221,36 @@ def read_file(
 
 # WRITE TOOLS
 @tool
+def check_binary_write_libraries() -> str:
+    """
+    Report which Python libraries (and pandoc) are actually importable in
+    THIS sandbox right now, for building .docx/.pptx/.xlsx/.xls/.pdf files
+    via write_file's binary-script mode.
+
+    Call this ONCE, before writing your first binary-build script this
+    session — it tells you which library to reach for without guessing or
+    discovering a missing import from a failed run. The result is valid
+    for the rest of the session (nothing installs/uninstalls itself
+    mid-session), so there's no need to call this again per file.
+
+    Takes no arguments and does not touch the filesystem.
+    """
+    lines = ["Library availability for binary file creation in this sandbox:\n"]
+    for ext in (".docx", ".pptx", ".xlsx", ".xls", ".pdf"):
+        lines.append(f"{ext}:")
+        lines.append(_format_script_library_status(ext))
+        lines.append("")
+    lines.append(
+        "Any library shown as NOT available can still be installed from "
+        "inside your build script (e.g. `subprocess.check_call([sys.executable, "
+        "'-m', 'pip', 'install', 'PACKAGE', '--break-system-packages'])` "
+        "before importing it) — but preferring an already-available library "
+        "avoids that extra install step and its runtime cost."
+    )
+    return "\n".join(lines)
+
+
+@tool
 def write_file(
     path: str,
     content: str = "",
@@ -228,7 +261,7 @@ def write_file(
     dry_run: bool = True,
 ) -> str:
     """
-    Create a new text file, or replace a line range in an existing one.
+    Create a new file, or replace a line range in an existing text file.
 
     mode="create" (default): writes `content` to `path`; refuses if the
     path already exists. Parent dirs auto-created when create_parents=True.
@@ -236,17 +269,51 @@ def write_file(
     mode="edit": replaces lines [start_line, end_line] (1-indexed,
     inclusive) with `content` ("" to delete the range); file must already
     exist. dry_run=True (default) previews as a diff; dry_run=False applies.
+    Text-based extensions only — mode="edit" does not support binary
+    formats; surgically editing an existing .docx/.xlsx/.pptx/.pdf needs a
+    different tool.
 
-    Text-based extensions only (code, config, docs, csv/tsv/log, etc. — not
-    binary formats like .pdf/.docx/.xlsx).
+    --- Creating BINARY files (.docx, .xlsx, .xls, .pptx, .pdf) ---
+
+    For these extensions, mode="create" treats `content` differently: it is
+    not written to disk verbatim. Instead it must be the full source of a
+    standalone Python 3 script that BUILDS the file — write it exactly as
+    you would if asked to save this as a local .py file and run it
+    yourself. Decide the structure, layout, and library calls freely; there
+    is no fixed template or schema to fill in.
+
+    Two rules the script must follow, everything else is your call:
+      1. Assume nothing else exists in the script's working directory —
+         don't read from or reference any other path; only produce output.
+      2. Save the finished file to exactly this filename, relative, in the
+         current working directory (no folders, no absolute path):
+           .docx -> "__cowork_output__.docx"
+           .pptx -> "__cowork_output__.pptx"
+           .xlsx -> "__cowork_output__.xlsx"
+           .xls  -> "__cowork_output__.xls"
+           .pdf  -> "__cowork_output__.pdf"
+         That exact file is copied to `path` afterward; anything else the
+         script writes is discarded. A script that errors, times out, or
+         never produces that file will fail with its own stdout/stderr
+         returned to you — fix the script and call write_file again.
+
+    BEFORE writing a binary-build script, call check_binary_write_libraries()
+    once — it reports exactly which libraries are actually importable in
+    THIS sandbox right now, so you can pick a library you know will work on
+    the first try instead of discovering it's missing from a failed run.
+    That tool's result stays valid for the rest of this session (libraries
+    don't appear/disappear mid-session) — no need to call it again per file.
 
     Args:
         path:           Relative path to the file.
-        content:        For mode="create": the full file content. For
-                        mode="edit": the replacement text for the line
-                        range (pass "" to delete the range).
+        content:        For mode="create" on a text extension: the full
+                        file content, written verbatim. For mode="create"
+                        on a binary extension: a Python script that builds
+                        the file (see above). For mode="edit": the
+                        replacement text for the line range (pass "" to
+                        delete the range).
         mode:           "create" for a new file, "edit" to replace lines in
-                        an existing file.
+                        an existing text file.
         start_line:     mode="edit" only — first line to replace (1-indexed).
         end_line:       mode="edit" only — last line to replace (inclusive).
         create_parents: mode="create" only — auto-create missing parent
@@ -276,6 +343,40 @@ def write_file(
                 f"Refused: '{path}' has no file extension. "
                 "Please include one (e.g. report.md, config.yaml)."
             )
+
+        if ext in _BINARY_EXTENSIONS:
+            parent = target.parent
+            if not parent.exists():
+                if not create_parents:
+                    rel_parent = parent.relative_to(_get_sandbox_root())
+                    return (
+                        f"Error: parent directory '{rel_parent}' does not exist. "
+                        "Pass create_parents=True to create it automatically, "
+                        "or use run_file_command('mkdir ...') first."
+                    )
+                try:
+                    parent.mkdir(parents=True, exist_ok=True)
+                except Exception as e:
+                    return f"Could not create parent directories for '{path}': {e}"
+
+            if not content.strip():
+                status = _format_script_library_status(ext)
+                return (
+                    f"Refused: '{path}' is a '{ext}' file, which requires "
+                    f"`content` to be a Python script that builds it (see "
+                    f"write_file's docstring). Library availability in this "
+                    f"sandbox:\n{status}"
+                )
+
+            try:
+                size = build_binary_file(target, ext, content)
+            except ValueError as e:
+                return str(e)
+            except Exception as e:
+                return f"Could not build '{path}': {e}"
+
+            return f"Created '{path}'.\nSize: {size:,} bytes"
+
         if ext not in _ALLOWED_WRITE_EXTENSIONS:
             allowed_str = "  " + "\n  ".join(sorted(_ALLOWED_WRITE_EXTENSIONS))
             return (

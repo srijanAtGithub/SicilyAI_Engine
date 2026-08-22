@@ -1,12 +1,16 @@
 import datetime
 import stat
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable
 import importlib
 import importlib.util
 import time
 import shlex
 import shutil
+import subprocess
+import sys
+import tempfile
+import uuid
 
 
 # Noise directories — skipped in trees and searches
@@ -65,8 +69,12 @@ _SANDBOX_ROOT: Optional[Path] = None
 
 
 def _set_sandbox_root(path: Path) -> None:
-    global _SANDBOX_ROOT
+    global _SANDBOX_ROOT, _SCRIPT_LIBRARY_AVAILABILITY
     _SANDBOX_ROOT = path.resolve()
+    # Probe binary-build library availability exactly once, here, not per
+    # write_file call — the result cannot change mid-session and importing
+    # five modules on every tool invocation would be pure waste.
+    _SCRIPT_LIBRARY_AVAILABILITY = _probe_script_libraries()
 
 
 def _get_sandbox_root() -> Path:
@@ -536,6 +544,389 @@ def _read_binary(path: Path) -> str:
             text_output += f"\n[Form Field Extraction Failed: {e}]"
 
     return text_output.strip()
+
+
+# ---------------------------------------------------------------------------
+# BINARY FILE CREATION — scripted builders for .docx/.xlsx/.pptx/.pdf
+# ---------------------------------------------------------------------------
+#
+# Design intent (read before changing):
+#
+# write_file's `content` param is normally inert text — written verbatim,
+# never interpreted. For binary extensions there is no "verbatim bytes as a
+# string" equivalent, so `content` instead carries a Python script that
+# BUILDS the file. This mirrors the officially-documented approach in this
+# environment's own docx/pptx/xlsx/pdf skills, which all create new binary
+# files by writing a script against a real library (docx-js, pptxgenjs,
+# openpyxl, reportlab) rather than filling in a fixed template/schema — a
+# schema would cap the model's expressiveness below what these formats
+# actually support (styled runs, native charts, formulas, positional
+# layout, etc).
+#
+# This is deliberately NOT a generic "run arbitrary shell" escape hatch —
+# it is scoped the same way run_file_command's allowlist is scoped, just
+# with a different mechanism:
+#   - The script executes in its OWN throwaway temp directory, never the
+#     sandbox root. It cannot see, read, or write any other user file —
+#     there is nothing else present in its working directory.
+#   - The script's only sanctioned output is ONE file, at a fixed filename
+#     ("__cowork_output__<ext>") that WE choose, not the model. The model
+#     never controls a real filesystem path — only what bytes end up at
+#     that one throwaway name.
+#   - This tool (not the script) is what copies that single output file
+#     into the sandbox, through the same _safe_path() root-escape check
+#     every other write in this module goes through. A script that never
+#     produces that exact file simply produces no write, no matter what
+#     else it did in its own temp dir.
+#   - Non-zero exit, timeout, or a missing/empty output file all fail
+#     closed with the model's own stdout/stderr surfaced, so it can see
+#     and fix its own bug — the same self-correcting loop the skills rely
+#     on ("run validate.py, fix what it names").
+#
+# The model decides imports, structure, layout, and library calls freely.
+# It does not decide where output lands on disk.
+
+# Binary formats writable via a generated script, and the fixed, sandboxed
+# output filename each script must produce (extension baked in so the
+# library being called — which usually infers format from filename — does
+# the right thing without the model needing to know the trick).
+_SCRIPTED_BINARY_OUTPUT_NAME: dict[str, str] = {
+    ".docx": "__cowork_output__.docx",
+    ".pptx": "__cowork_output__.pptx",
+    ".xlsx": "__cowork_output__.xlsx",
+    ".xls":  "__cowork_output__.xls",
+    ".pdf":  "__cowork_output__.pdf",
+}
+
+# Candidate libraries per extension, in the order we'd recommend trying
+# them. `module` is what actually gets import-checked (may differ from the
+# pip/uv package name — e.g. "docx" vs "python-docx"). `install` is the
+# real install instruction shown when a library is missing, so a model
+# never has to guess the pip name or discover --break-system-packages the
+# hard way via a failed subprocess call.
+_SCRIPT_LIBRARY_CANDIDATES: dict[str, list[dict[str, str]]] = {
+    ".docx": [
+        {"module": "docx", "package": "python-docx",
+         "install": "pip install python-docx --break-system-packages"},
+        {"module": None, "package": "pandoc",
+         "install": "(system binary, not pip) apt-get install pandoc / brew install pandoc / winget install JohnMacFarlane.Pandoc",
+         "note": "Markdown -> docx via subprocess, no Python import needed"},
+    ],
+    ".pptx": [
+        {"module": "pptx", "package": "python-pptx",
+         "install": "pip install python-pptx --break-system-packages"},
+    ],
+    ".xlsx": [
+        {"module": "openpyxl", "package": "openpyxl",
+         "install": "pip install openpyxl --break-system-packages"},
+        {"module": "pandas", "package": "pandas",
+         "install": "pip install pandas --break-system-packages"},
+    ],
+    ".xls": [
+        {"module": "openpyxl", "package": "openpyxl",
+         "install": "pip install openpyxl --break-system-packages"},
+        {"module": "pandas", "package": "pandas",
+         "install": "pip install pandas --break-system-packages"},
+    ],
+    ".pdf": [
+        {"module": "reportlab", "package": "reportlab",
+         "install": "pip install reportlab --break-system-packages"},
+        {"module": "pypdf", "package": "pypdf",
+         "install": "pip install pypdf --break-system-packages"},
+    ],
+}
+
+# Populated once by _probe_script_libraries() at sandbox startup (called
+# from _set_sandbox_root — see below). None means "not probed yet"; if a
+# caller sees None it means _set_sandbox_root() hasn't run, which is
+# already a hard error everywhere else in this module.
+_SCRIPT_LIBRARY_AVAILABILITY: Optional[dict[str, bool]] = None
+
+
+def _probe_script_libraries() -> dict[str, bool]:
+    """
+    Actually import-check (not just importlib.util.find_spec — a real
+    import catches broken installs find_spec would miss) every candidate
+    module across all binary-writable extensions, ONCE. Returns a flat
+    {module_name: bool} map, e.g. {"docx": True, "pptx": False, ...}.
+
+    Deliberately does not check "pandoc" the binary here (module is None
+    for it) — that's a shutil.which() check done separately in the
+    formatter below, since it's not a Python import.
+
+    This runs a handful of import statements one time at sandbox startup.
+    It is NOT re-run per write_file call — that would waste a real import
+    (disk stat + bytecode load) on every single tool invocation for
+    information that cannot change mid-session.
+    """
+    modules = {
+        cand["module"]
+        for candidates in _SCRIPT_LIBRARY_CANDIDATES.values()
+        for cand in candidates
+        if cand["module"] is not None
+    }
+    result: dict[str, bool] = {}
+    for mod in modules:
+        try:
+            importlib.import_module(mod)
+            result[mod] = True
+        except Exception:
+            # Broad except is intentional: a library can be "installed"
+            # but fail to import for any number of environment reasons
+            # (missing shared lib, corrupt wheel, version mismatch) — all
+            # of those should read as "not available", not crash startup.
+            result[mod] = False
+    return result
+
+
+def _format_script_library_status(ext: str) -> str:
+    """
+    Human/model-readable line(s) for write_file's docstring, built from
+    the REAL probed availability for this extension — never a claim we
+    haven't actually verified in this sandbox. One line per candidate:
+
+        python-docx: available
+        pandoc: NOT available - (system binary, not pip) apt-get install pandoc / ...
+
+    If _SCRIPT_LIBRARY_AVAILABILITY is still None (probe never ran —
+    _set_sandbox_root wasn't called), says so plainly rather than
+    guessing, so the gap is visible instead of silently wrong.
+    """
+    if _SCRIPT_LIBRARY_AVAILABILITY is None:
+        return "  (library availability not yet probed for this sandbox)"
+
+    lines = []
+    for cand in _SCRIPT_LIBRARY_CANDIDATES.get(ext, []):
+        package = cand["package"]
+        if cand["module"] is None:
+            # System-binary candidate (pandoc) — checked via PATH, not import.
+            available = shutil.which(package) is not None
+        else:
+            available = _SCRIPT_LIBRARY_AVAILABILITY.get(cand["module"], False)
+
+        if available:
+            lines.append(f"  {package}: available")
+        else:
+            note = f" — {cand['note']}" if "note" in cand else ""
+            lines.append(f"  {package}: NOT available — install with: {cand['install']}{note}")
+    return "\n".join(lines) if lines else "  (no known library candidates for this extension)"
+
+
+_SCRIPT_TIMEOUT_SECONDS = 120
+
+
+def _run_binary_build_script(ext: str, script: str) -> Path:
+    """
+    Execute `script` (a Python source string, already written by the model)
+    in an isolated temp directory, and return the Path to the single
+    sanctioned output file it produced.
+
+    Raises ValueError (message is safe to show the model/user directly —
+    it's meant to drive a self-correcting retry, same as a failed
+    recalc.py/validate.py run in the skills) if:
+      - the script exits non-zero,
+      - the script exceeds _SCRIPT_TIMEOUT_SECONDS,
+      - the script exits 0 but never produced the expected output file,
+        or produced it empty.
+
+    Caller is responsible for copying the returned path to its real
+    sandbox destination and for cleaning up the temp directory afterward.
+    """
+    if ext not in _SCRIPTED_BINARY_OUTPUT_NAME:
+        raise ValueError(f"No scripted binary builder registered for '{ext}'.")
+
+    output_name = _SCRIPTED_BINARY_OUTPUT_NAME[ext]
+    workdir = Path(tempfile.mkdtemp(prefix="cowork_build_"))
+    script_path = workdir / f"build_{uuid.uuid4().hex}.py"
+    expected_output = workdir / output_name
+
+    try:
+        script_path.write_text(script, encoding="utf-8")
+
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(script_path)],
+                cwd=str(workdir),
+                capture_output=True,
+                text=True,
+                timeout=_SCRIPT_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            raise ValueError(
+                f"Build script for '{ext}' timed out after "
+                f"{_SCRIPT_TIMEOUT_SECONDS}s. Simplify the script or split "
+                "the work (e.g. fewer/lighter images, less data)."
+            )
+
+        if proc.returncode != 0:
+            raise ValueError(
+                f"Build script for '{ext}' failed (exit {proc.returncode}).\n\n"
+                f"--- stderr ---\n{proc.stderr.strip()[-4000:]}\n\n"
+                f"--- stdout ---\n{proc.stdout.strip()[-2000:]}\n\n"
+                f"Fix the script and call write_file again. The script must "
+                f"save its result to exactly '{output_name}' in its working "
+                "directory (relative path, no directories) — that is the "
+                "only file this tool will pick up."
+            )
+
+        if not expected_output.exists():
+            raise ValueError(
+                f"Build script for '{ext}' exited successfully but did not "
+                f"create '{output_name}' in its working directory. The "
+                "script must save/write its output to exactly that "
+                "filename (relative, not an absolute path) for the file to "
+                "be created.\n\n"
+                f"--- stdout ---\n{proc.stdout.strip()[-2000:]}"
+            )
+
+        if expected_output.stat().st_size == 0:
+            raise ValueError(
+                f"Build script for '{ext}' produced an empty '{output_name}'. "
+                "Nothing was written to disk — check the script actually "
+                "calls the library's save/write method."
+            )
+
+        return expected_output
+
+    except ValueError:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise
+    except Exception as e:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise ValueError(f"Could not run build script for '{ext}': {e}")
+
+
+def _validate_docx(path: Path) -> None:
+    """Raise ValueError with the real parser error if this isn't a valid docx."""
+    if importlib.util.find_spec("docx") is None:
+        return  # can't validate without the reader; not the model's fault
+    from docx import Document
+    Document(path)  # raises on malformed package/XML
+
+
+def _validate_pptx(path: Path) -> None:
+    if importlib.util.find_spec("pptx") is None:
+        return
+    from pptx import Presentation
+    prs = Presentation(path)
+    if len(prs.slides) == 0:
+        raise ValueError(
+            "The .pptx opened but contains zero slides. A presentation "
+            "needs at least one slide."
+        )
+
+
+def _validate_xlsx(path: Path) -> None:
+    if importlib.util.find_spec("openpyxl") is None:
+        return
+    import openpyxl
+    wb = openpyxl.load_workbook(path, read_only=True)
+    if not wb.sheetnames:
+        raise ValueError(
+            "The workbook opened but contains zero sheets. A workbook "
+            "needs at least one sheet."
+        )
+    wb.close()
+
+
+def _validate_pdf(path: Path) -> None:
+    if importlib.util.find_spec("pypdf") is None:
+        return
+    from pypdf import PdfReader
+    reader = PdfReader(path)
+    if len(reader.pages) == 0:
+        raise ValueError(
+            "The .pdf opened but contains zero pages. A PDF needs at "
+            "least one page."
+        )
+
+
+# One validator per binary-writable extension. Each opens the file with
+# the SAME reader library this module already trusts for the read side
+# (_read_binary_units etc) — so "valid" here means "the exact library this
+# codebase uses to read this format back can open it," not just "a zip/
+# file with the right extension exists." Deliberately format-agnostic
+# about how the file was BUILT: a script using python-pptx, pptxgenjs-
+# equivalent code, or raw zipfile/XML construction is validated the same
+# way, by whether the result actually opens — because a script constructing
+# OOXML by hand (an equally legitimate approach the model is free to take)
+# is exactly the case most likely to produce a file that "exists and is
+# non-empty" while still being structurally broken (wrong namespace,
+# missing relationship part, malformed content-types, etc) in a way no
+# amount of exit-code or file-size checking would ever catch.
+_BINARY_VALIDATORS: dict[str, Callable[[Path], None]] = {
+    ".docx": _validate_docx,
+    ".pptx": _validate_pptx,
+    ".xlsx": _validate_xlsx,
+    ".xls":  _validate_xlsx,
+    ".pdf":  _validate_pdf,
+}
+
+
+def _validate_binary_output(ext: str, path: Path) -> None:
+    """
+    Open the freshly-built file with the real reader library for `ext`
+    and confirm it's structurally valid — not just present and non-empty.
+    Raises ValueError with the underlying parser's own error message
+    (safe to hand back to the model verbatim — same self-correcting-retry
+    pattern as every other failure this module surfaces) if the file is
+    corrupt, malformed, or empty of content.
+
+    If the reader library itself isn't installed in this sandbox, this
+    silently skips validation rather than failing the build — an
+    unrelated missing dependency on the READ side shouldn't block a WRITE
+    that otherwise looks fine; check_binary_write_libraries() covers read-
+    side availability separately if that ever needs surfacing.
+    """
+    validator = _BINARY_VALIDATORS.get(ext)
+    if validator is None:
+        return
+    try:
+        validator(path)
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(
+            f"Build script for '{ext}' produced a file, but it failed "
+            f"validation — opening it with the same library this tool "
+            f"uses to read '{ext}' files raised:\n\n"
+            f"  {type(e).__name__}: {e}\n\n"
+            "This means the file is structurally invalid and would not "
+            "open correctly in the real application (Word/PowerPoint/"
+            "Excel/a PDF viewer), even though the build script exited "
+            "successfully. This is common when a script constructs the "
+            "file's internal XML/zip structure by hand rather than "
+            "through a library like python-docx/python-pptx/openpyxl/"
+            "reportlab, which handle that structure correctly for you — "
+            "switching to one of those libraries is the most reliable "
+            "fix. Nothing was written to the sandbox; fix the script and "
+            "call write_file again."
+        )
+
+
+def build_binary_file(target: Path, ext: str, script: str) -> int:
+    """
+    Run `script` to build a binary file of type `ext`, validate the
+    result actually opens with this format's real reader library, then
+    copy it to `target` (already validated/resolved by the caller via
+    _safe_path — this function does not re-check sandbox containment).
+
+    Returns the final file size in bytes. Raises ValueError on any build
+    OR validation failure — the message is safe to surface directly to
+    the model so it can retry. Nothing is copied into the sandbox unless
+    validation passes, so a structurally broken file is never delivered
+    as if it were a success.
+
+    Cleans up the build's temp directory in all cases, success or failure.
+    """
+    produced = _run_binary_build_script(ext, script)
+    try:
+        _validate_binary_output(ext, produced)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(produced, target)
+        return target.stat().st_size
+    finally:
+        shutil.rmtree(produced.parent, ignore_errors=True)
 
 
 def _list_directory_entries(target: Path, path_label: str) -> str:
