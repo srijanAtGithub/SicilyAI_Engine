@@ -9,6 +9,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 
+import logging
 import structlog
 log = structlog.get_logger()
 
@@ -365,7 +366,7 @@ async def process_user_reply(user_id: str, user_name: str, chat_id: int, text: s
                     state = await current_graph.aget_state({"configurable": {"thread_id": session_id}})
                     for msg in state.values.get("messages", []):
                         if hasattr(msg, "usage_metadata") and msg.usage_metadata:
-                            model_name = msg.response_metadata.get("model_name", "gpt-5.4-mini")
+                            model_name = msg.response_metadata.get("model_name", "gpt-5.6-luna")
                             msg_id = getattr(msg, "id", None)
                             
                             from usage_tracker import record_usage
@@ -791,16 +792,32 @@ async def send_to_telegram(text: str):
     return {"status": "sent", "text": text}
 
 
+def configure_logging():
+    """Sets the log level based on the LOG_LEVEL environment variable."""
+    # Default to WARNING if nothing is set, keeping production quiet by default
+    env_level = os.getenv("SICILY_AGENT_DEBUG_LEVEL", "WARNING").upper()
+    numeric_level = getattr(logging, env_level, logging.WARNING)
+    
+    structlog.configure(
+        wrapper_class=structlog.make_filtering_bound_logger(numeric_level),
+    )
+
+    '''
+    During local dev/testing, to see all logs:
+    
+    export SICILY_AGENT_DEBUG_LEVEL=DEBUG
+    uv run Agent/main.py
+    '''
+
+
 # Entry
 def main():
-    init_settings()
+    configure_logging()
+    
+    load_config()
+
     log.info("Sicily started successfully.")
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
-def init_settings():
-    """Deprecated — now handled by configuration.load_config()"""
-    pass
 
 
 if __name__ == "__main__":

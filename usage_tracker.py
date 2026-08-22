@@ -7,21 +7,6 @@ DB_PATH = SICILY_HOME / "Data" / "usage.db"
 
 # Prices per 1M tokens (including cached input where available)
 MODEL_PRICING = {
-    "gpt-4o-mini": {
-        "input": 0.15 / 1_000_000,
-        "cached_input": 0.075 / 1_000_000,
-        "output": 0.60 / 1_000_000
-    },
-    "gpt-5.4-mini": {
-        "input": 0.75 / 1_000_000,
-        "cached_input": 0.075 / 1_000_000,
-        "output": 4.50 / 1_000_000
-    },
-    "gpt-5.4-nano": {
-        "input": 0.20 / 1_000_000,
-        "cached_input": 0.020 / 1_000_000,
-        "output": 1.25 / 1_000_000
-    },
     "gpt-5.6-luna": {
         "input": 0.20 / 1_000_000,
         "cached_input": 0.020 / 1_000_000,
@@ -41,7 +26,7 @@ MODEL_PRICING = {
 
 def get_cost(model_name: str, input_tokens: int, output_tokens: int, cached_input_tokens: int = 0) -> float:
     """Calculate cost with support for cached input tokens."""
-    rates = MODEL_PRICING.get(model_name, MODEL_PRICING.get("gpt-5.4-mini", {}))
+    rates = MODEL_PRICING.get(model_name, MODEL_PRICING.get("gpt-5.6-luna", {}))
     
     input_cost = (input_tokens - cached_input_tokens) * rates.get("input", 0.75 / 1_000_000)
     cached_cost = cached_input_tokens * rates.get("cached_input", 0.075 / 1_000_000)

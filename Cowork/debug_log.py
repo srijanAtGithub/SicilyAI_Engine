@@ -10,10 +10,12 @@ Usage
     DEBUG = False  # production — completely silent, zero overhead
 """
 
+import os
+
 # ── The switch ───────────────────────────────────────────────────────────────
 # Flip this by hand. True  = print tool/token debug lines.
 #                    False = production behaviour, nothing extra printed.
-DEBUG = False
+DEBUG = os.getenv("SICILY_COWORK_DEBUG", "false").lower() in ("true", "1", "t", "yes")
 
 _step = 0  # running counter so you can see call order across a whole turn
 
@@ -66,3 +68,13 @@ def log_turn_summary(tool_calls: int, llm_calls: int, input_tokens: int, output_
         f"[DEBUG] === turn summary: {tool_calls} tool call(s), {llm_calls} llm call(s), "
         f"{input_tokens} input + {output_tokens} output = {total} tokens total ==="
     )
+
+
+def log_error(message: str, exc: Exception | str | None = None) -> None:
+    """Log error details only if DEBUG mode is active."""
+    if not DEBUG:
+        return
+    if exc:
+        print(f"[DEBUG] ERROR: {message} -> {exc}")
+    else:
+        print(f"[DEBUG] ERROR: {message}")

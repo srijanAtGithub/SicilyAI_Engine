@@ -107,7 +107,8 @@ def get_cowork_llm(tools=None):
     llm = ChatOpenAI(
         model="gpt-5.6-luna",
         use_responses_api=True,          # enables tools + reasoning together
-        reasoning_effort="max",          # default is medium
+        reasoning_effort="xhigh",        # default is medium
+        max_retries=0,                   # let _ainvoke_with_retry own all retry/backoff
     )
 
     if tools:
@@ -134,11 +135,11 @@ def get_intent_llm(schema):
 
 
 def get_eval_llm():
-    return ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    return ChatOpenAI(model="gpt-5-nano", temperature=0)
 
 
 def get_summarizer_llm():
-    return ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    return ChatOpenAI(model="gpt-5-nano", temperature=0)
 
 
 def get_transcriber() -> AsyncOpenAI:
