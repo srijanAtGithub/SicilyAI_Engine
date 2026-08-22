@@ -434,59 +434,22 @@ def run_file_command(command: str) -> str:
 # ---------------------------------------------------------------------------
 
 @tool
-def delete_file(path: str, dry_run: bool = True) -> str:
+def delete_path(path: str, recursive: bool = False, dry_run: bool = True) -> str:
     """
-    Delete a file — soft delete, moved to .sicily-trash/, never unlinked.
-    Works on any manageable file type (not just text/PDF/docx/xlsx).
-    dry_run=True (default) previews only; dry_run=False applies.
+    Delete a file or directory — soft delete, moved to .sicily-trash/, never
+    unlinked. Works on either a file or a directory; behavior branches on
+    what `path` actually is.
+
+    Files: must be a manageable file type. Directories: refuses a non-empty
+    directory unless recursive=True; the sandbox root itself is refused.
+
+    dry_run=True (default) previews the effect (and, for a non-empty
+    directory, its contents); dry_run=False applies.
 
     Args:
-        path:    Relative path to the file to delete.
-        dry_run: If True (default), preview only.
-    """
-    try:
-        target = _safe_path(path)
-    except PermissionError as e:
-        return str(e)
-
-    if not target.exists():
-        return f"'{path}' does not exist."
-    if not target.is_file():
-        return f"'{path}' is a directory. Use delete_directory instead."
-
-    ext = target.suffix.lower()
-    if ext not in MANAGEABLE_EXTENSIONS:
-        return (
-            f"Refused: '{ext}' is not currently a manageable file type in "
-            "this sandbox."
-        )
-
-    if dry_run:
-        return (
-            f"[DRY RUN — nothing deleted]\n"
-            f"Would move '{path}' to {TRASH_DIR_NAME}/.\n"
-            "Call again with dry_run=False to apply."
-        )
-
-    try:
-        trashed = _move_to_trash(target)
-    except Exception as e:
-        return f"Could not delete '{path}': {e}"
-
-    rel_trashed = trashed.relative_to(_get_sandbox_root())
-    return f"Deleted '{path}' (moved to '{rel_trashed}')."
-
-
-@tool
-def delete_directory(path: str, recursive: bool = False, dry_run: bool = True) -> str:
-    """
-    Delete a directory — soft delete, moved to .sicily-trash/, not unlinked.
-    Refuses on a non-empty directory unless recursive=True. dry_run=True
-    (default) previews contents and effect; dry_run=False applies.
-
-    Args:
-        path:      Relative path to the directory to delete.
-        recursive: Must be True to delete a non-empty directory.
+        path:      Relative path to the file or directory to delete.
+        recursive: Directories only — must be True to delete a non-empty one.
+                   Ignored for files.
         dry_run:   If True (default), preview only.
     """
     try:
@@ -496,8 +459,31 @@ def delete_directory(path: str, recursive: bool = False, dry_run: bool = True) -
 
     if not target.exists():
         return f"'{path}' does not exist."
-    if not target.is_dir():
-        return f"'{path}' is a file. Use delete_file instead."
+
+    if target.is_file():
+        ext = target.suffix.lower()
+        if ext not in MANAGEABLE_EXTENSIONS:
+            return (
+                f"Refused: '{ext}' is not currently a manageable file type in "
+                "this sandbox."
+            )
+
+        if dry_run:
+            return (
+                f"[DRY RUN — nothing deleted]\n"
+                f"Would move '{path}' to {TRASH_DIR_NAME}/.\n"
+                "Call again with dry_run=False to apply."
+            )
+
+        try:
+            trashed = _move_to_trash(target)
+        except Exception as e:
+            return f"Could not delete '{path}': {e}"
+
+        rel_trashed = trashed.relative_to(_get_sandbox_root())
+        return f"Deleted '{path}' (moved to '{rel_trashed}')."
+
+    # target.is_dir()
     if target == _get_sandbox_root():
         return "Refused: cannot delete the sandbox root itself."
 
@@ -828,8 +814,7 @@ LOCAL_TOOLS = [
     run_file_command,
 
     # Delete (soft — trash, dry_run by default)
-    delete_file,
-    delete_directory,
+    delete_path,
 ]
 
 
@@ -866,12 +851,7 @@ TOOL_STATUS_MAP = {
     "run_file_command": lambda args: (
         f"Running [white]'{args.get('command')}'[/white]"
     ),
-    "delete_file": lambda args: (
-        f"Previewing delete of [white]'{args.get('path')}'[/white]"
-        if args.get("dry_run", True)
-        else f"Deleting [white]'{args.get('path')}'[/white] (-> trash)"
-    ),
-    "delete_directory": lambda args: (
+    "delete_path": lambda args: (
         f"Previewing delete of [white]'{args.get('path')}'[/white]"
         if args.get("dry_run", True)
         else f"Deleting [white]'{args.get('path')}'[/white] (-> trash)"
