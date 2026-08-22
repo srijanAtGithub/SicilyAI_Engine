@@ -3,243 +3,47 @@ cowork_tools.py
 --------------
 Sandboxed filesystem tools for `sicily start`.
 
-Mirrors the @modelcontextprotocol/server-filesystem interface,
-re-implemented in pure Python with zero extra dependencies.
-
-ALL tools are locked to a single root directory (the cwd where
-`sicily start` was invoked). No path can escape that root.
-
-Tool tiers
-----------
-Read-only tools  — safe:      read_file, list_directory, file_tree_shallow,
-                              get_file_info, list_allowed_directories, read_file_lines
-Write tools      — safe-ish: create_text_file, make_directory, edit_file_lines
-                  Guarantee: never delete existing content.
-                  edit_file_lines requires dry_run=False to apply changes.
-Path pins        — memory:   pin_path, recall_path, recall_all_pins
-                  Survive context summarisation — stored in process memory,
-                  not in the message list.
+All tools are locked to a single root directory (the cwd `sicily start` was invoked from); no path can escape it.
 """
 
-import datetime
-import stat
+import re
+import shutil
 from pathlib import Path
-from typing import Optional
-import importlib
+import json
+import fnmatch
+from typing import List, Optional
 
 from langchain_core.tools import tool
-
-# Noise directories — skipped in trees and searches
-SKIP_DIRS = {
-    ".venv", "venv", "env", ".env",
-    "node_modules",
-    "__pycache__",
-    ".git",
-    ".mypy_cache", ".pytest_cache", ".ruff_cache",
-    "dist", "build", ".eggs",
-    ".tox", ".nox",
-    ".idea", ".vscode",
-    ".sicily-trash",
-}
-
-
-# Allowed extensions for text-based file CONTENT reads/writes only
-# (write_file, edit_file_lines, etc. in THIS file).
-# Binary formats (.docx, .xlsx, .pdf, …) are intentionally excluded from
-# these content write operations — they require structured serialisation,
-# not raw text I/O.
-#
-# NOTE: this restriction is scoped to reading/writing file CONTENT. It does
-# NOT apply to filesystem operations like move/copy/rename/delete, which
-# never touch content — see cowork_tool_fileops.py's READABLE_EXTENSIONS,
-# which deliberately includes .pdf/.docx/.xlsx/.xls/.doc for exactly that
-# reason. Don't infer from this set alone that binary files are unsupported
-# sandbox-wide.
-ALLOWED_WRITE_EXTENSIONS: frozenset[str] = frozenset({
-    # Documents & notes
-    ".txt", ".md", ".markdown", ".rst", ".org", ".tex",
-    # Config & data interchange
-    ".json", ".jsonl", ".ndjson",
-    ".yaml", ".yml", ".toml",
-    ".ini", ".cfg", ".conf", ".env",
-    # Web & markup
-    ".html", ".htm", ".css", ".scss", ".sass", ".xml", ".svg",
-    # Source code — common languages
-    ".py", ".pyi",
-    ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
-    ".sh", ".bash", ".zsh", ".fish",
-    ".rb", ".go", ".rs",
-    ".java", ".kt", ".scala",
-    ".c", ".cpp", ".cc", ".h", ".hpp",
-    ".cs", ".fs",
-    ".php", ".lua", ".r", ".sql",
-    # Data & logs
-    ".csv", ".tsv", ".log",
-    # Misc text
-    ".diff", ".patch", ".gitignore", ".editorconfig",
-})
-
-
-# Sandbox root
-_SANDBOX_ROOT: Optional[Path] = None
-
-
-def set_sandbox_root(path: Path) -> None:
-    global _SANDBOX_ROOT
-    _SANDBOX_ROOT = path.resolve()
-
-
-def get_sandbox_root() -> Path:
-    if _SANDBOX_ROOT is None:
-        raise RuntimeError("Sandbox root has not been set. Call set_sandbox_root() first.")
-    return _SANDBOX_ROOT
-
-
-# Path pin store — survives context summarisation
-# Stored in process memory, not in the message list, so the summariser
-# cannot compress it away.
-_PATH_PINS: dict[str, str] = {}
-
-
-# Internal helpers
-def _safe_path(relative: str) -> Path:
-    """
-    Resolve a user/AI-supplied path against the sandbox root.
-    Raises PermissionError if the resolved path would escape the root.
-    """
-    root = get_sandbox_root()
-    candidate = root / relative
-    try:
-        resolved = candidate.resolve()
-    except OSError:
-        # On Windows, resolve() can raise FileNotFoundError for paths
-        # that don't exist yet. Fall back to normpath-based resolution,
-        # which works for non-existent paths.
-        import os
-        resolved = Path(os.path.normpath(candidate))
-
-    if not resolved.is_relative_to(root):
-        raise PermissionError(
-            f"Access denied: '{relative}' resolves outside the allowed directory."
-        )
-    return resolved
-
-
-def _is_skipped(path: Path) -> bool:
-    """True if this is a noise directory that should be excluded."""
-    return path.is_dir() and path.name in SKIP_DIRS
-
-
-def _fmt_ts(ts: float) -> str:
-    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _fmt_permissions(mode: int) -> str:
-    """Convert a stat st_mode integer to a human-readable 'rwxrwxrwx' string."""
-    result = []
-    for who in ("USR", "GRP", "OTH"):
-        for perm, letter in (("R", "r"), ("W", "w"), ("X", "x")):
-            flag = getattr(stat, f"S_I{perm}{who}")
-            result.append(letter if mode & flag else "-")
-    return "".join(result)
-
-
-# Extensions that require binary parsing rather than UTF-8 text reads
-_BINARY_EXTENSIONS = frozenset({".pdf", ".xlsx", ".xls", ".docx", ".doc"})
-
-
-def _read_binary(path: Path) -> str:
-    """
-    Extract human-readable text from binary file formats.
-    Dispatches to the appropriate parser based on file extension.
-    Raises ImportError with an install hint if the required library is missing.
-    Raises ValueError for unsupported binary extensions.
-    """
-    ext = path.suffix.lower()
-
-    if ext == ".pdf":
-        if importlib.util.find_spec("pypdf") is None:
-            raise ImportError("pip install pypdf")
-
-        from pypdf import PdfReader
-
-        reader = PdfReader(path)
-        text_output = ""
-
-        # 1. Extract text page by page
-        for i, page in enumerate(reader.pages):
-            page_text = page.extract_text() or ""
-            if page_text.strip():
-                text_output += f"[Page {i+1}]\n{page_text.strip()}\n\n"
-
-        # 2. Extract form fields (AcroForm)
-        try:
-            fields = reader.get_fields()
-            if fields:
-                field_lines = []
-                for name, field in fields.items():
-                    value = field.value
-                    if value is not None:
-                        field_lines.append(f"{name}: {value}")
-                    else:
-                        # Optional: show field name even if empty
-                        field_lines.append(f"{name}: [empty]")
-                if field_lines:
-                    text_output += "[Form Field Values]\n" + "\n".join(field_lines)
-        except Exception as e:
-            text_output += f"\n[Form Field Extraction Failed: {e}]"
-
-        return text_output.strip()
-
-    if ext in {".xlsx", ".xls"}:
-        if importlib.util.find_spec("openpyxl") is None:
-            raise ImportError("pip install openpyxl")
-        import openpyxl
-        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-        sheets = []
-        for name in wb.sheetnames:
-            ws = wb[name]
-            rows = [
-                "\t".join("" if cell.value is None else str(cell.value) for cell in row)
-                for row in ws.iter_rows()
-            ]
-            sheets.append(f"[Sheet: {name}]\n" + "\n".join(rows))
-        wb.close()
-        return "\n\n".join(sheets)
-
-    if ext in {".docx", ".doc"}:
-        if importlib.util.find_spec("docx") is None:
-            raise ImportError("pip install python-docx")
-        from docx import Document
-        doc = Document(path)
-        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-
-    raise ValueError(
-        f"No binary reader available for '{ext}'. "
-        "For plain text files this tool reads UTF-8 directly. "
-        "For other binary formats, a dedicated tool may be needed."
-    )
+from Cowork.cowork_helpers import (
+    _safe_path,
+    _read_binary,
+    _get_sandbox_root,
+    _is_skipped,
+    _list_directory_entries,
+    _describe_path,
+    _validate_fileops_command,
+    _move_to_trash,
+    _SKIP_DIRS,
+    _BINARY_EXTENSIONS,
+    _ALLOWED_WRITE_EXTENSIONS,
+    MANAGEABLE_EXTENSIONS,
+    TRASH_DIR_NAME,
+    READABLE_EXTENSIONS,
+    CommandValidationError
+)
 
 
 # READ-ONLY TOOLS
 @tool
 def search_index(query: str) -> str:
     """
-    Search the local RAG index for content relevant to a query.
- 
-    This is the FIRST tool to call for any question that involves finding
-    information inside files — before reading any file directly.
- 
-    The index covers all text-based files in the sandbox:
-    .txt, .md, .pdf, .docx, .xlsx, .py, .json, .csv, and more.
- 
-    Returns the top matching snippets with their file path and position.
-    If a snippet looks relevant, use read_file_lines to read more context
-    around it in the original file.
- 
+    Semantic search over the sandbox's RAG index (.txt, .md, .pdf, .docx,
+    .xlsx, .py, .json, .csv, and more). Returns top matching snippets with
+    file path and position.
+
     Args:
-        query: Plain-language description of what you are looking for.
-               e.g. "quarterly budget figures" or "meeting notes from January"
+        query: Plain-language description of what you're looking for,
+               e.g. "quarterly budget figures".
     """
     from Cowork.cowork_rag import get_rag   # adjust import path to match your project
     rag = get_rag()
@@ -250,54 +54,31 @@ def search_index(query: str) -> str:
 
 
 @tool
-def read_file(path: str, head: int = 0, tail: int = 0) -> str:
+def read_file(path: str, start_line: int = 0, end_line: int = 0) -> str:
     """
-    Read the contents of any file and return it as plain text.
+    Read a file as plain text, in full or by line range.
 
-    NOT THE DEFAULT FIRST MOVE. Before reaching for this tool, ask whether
-    search_file_contents or search_index would get you a line number instead —
-    if so, use that, then jump straight to read_file_lines around that line.
-    Blindly reading the head of a file you haven't searched yet is a common
-    source of wasted calls (you're guessing where the answer lives instead of
-    letting a search tell you).
+    start_line/end_line=0 (default): full file. Otherwise: that 1-indexed,
+    inclusive line range, numbered, max 500 lines/call — text files only;
+    binary documents always return in full regardless of range.
 
-    RECOMMENDED WORKFLOW:
-    - If you don't yet know where in the file the answer is, search first
-      (search_file_contents / search_index) rather than reading head/tail blind.
-    - When a search returns specific line numbers, prefer `read_file_lines`
-      targeted at that range over reading here.
-    - Use full read (`head=0, tail=0`) only for small-to-medium files or when you 
-      genuinely need the entire content (e.g. small scripts, configs, short notes).
-    - `head=N` / `tail=N` are for genuinely unknown-structure files with no
-      search hit yet to anchor on — not a routine first step.
-
-    Handles two categories transparently:
-
-    Text-based files (.txt, .md, .py, .json, .csv, .yaml, .html, etc.)
-        Raw UTF-8 content is returned as-is.
-
-    Binary document formats
-        .pdf   — text extracted page by page, labelled [Page N]
-        .docx  — all paragraph text extracted in order
-        .xlsx/.xls — every sheet as tab-separated table, labelled [Sheet: name]
-
-    IMPORTANT:
-    - Always start with `head=50` on unknown or potentially large files.
-    - Avoid full reads on large files (logs, big CSVs, long source files, etc.).
-      Use `read_file_lines` with targeted ranges or multiple calls instead.
-    - Full reads are mainly justified for summarization of small files, 
-      code review of scripts, or when the complete content is genuinely required.
-
-    For precise line-range reading (especially after RAG), use `read_file_lines`.
+    Handles text (.txt .md .py .json .csv .yaml .html etc. — raw UTF-8) and
+    binary documents (.pdf per-page as [Page N], .docx paragraphs in order,
+    .xlsx/.xls per-sheet tab-separated as [Sheet: name]).
 
     Args:
-        path: Relative path to the file.
-        head: If > 0, return only the first N lines.
-        tail: If > 0, return only the last N lines.
-              Cannot be combined with head.
+        path:       Relative path to the file.
+        start_line: First line to read (1-indexed). 0 for a full read.
+        end_line:   Last line to read (inclusive). 0 for a full read.
     """
-    if head > 0 and tail > 0:
-        return "Error: Cannot specify both `head` and `tail` simultaneously."
+    ranged = start_line > 0 or end_line > 0
+    if ranged:
+        if start_line < 1:
+            return "Error: start_line must be >= 1."
+        if end_line < start_line:
+            return "Error: end_line must be >= start_line."
+        if end_line - start_line > 500:
+            return "Error: Cannot read more than 500 lines at once. Narrow your range."
 
     try:
         file_path = _safe_path(path)
@@ -309,16 +90,39 @@ def read_file(path: str, head: int = 0, tail: int = 0) -> str:
     if not file_path.is_file():
         return f"'{path}' is a directory, not a file."
 
-    # Binary formats — route to dedicated parser
-    if file_path.suffix.lower() in _BINARY_EXTENSIONS:
+    is_binary = file_path.suffix.lower() in _BINARY_EXTENSIONS
+
+    if ranged:
+        if is_binary:
+            return (
+                f"'{path}' is a binary document ({file_path.suffix}). "
+                "Ranged reads only work on text files — call read_file(path) "
+                "without start_line/end_line to get its full extracted text."
+            )
+        try:
+            all_lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        except Exception as e:
+            return f"Could not read '{path}': {e}"
+
+        total = len(all_lines)
+        if start_line > total:
+            return f"File only has {total} lines. start_line={start_line} is out of range."
+
+        actual_end = min(end_line, total)
+        selected = all_lines[start_line - 1 : actual_end]
+
+        numbered = "".join(f"{start_line + i:>6}  {line}" for i, line in enumerate(selected))
+        header = f"[{path} | lines {start_line}–{actual_end} of {total}]\n"
+        return header + numbered
+
+    # Full read
+    if is_binary:
         try:
             content = _read_binary(file_path)
         except ImportError as e:
             return f"Cannot read '{path}': missing required package — {e}"
         except Exception as e:
             return f"Could not extract text from '{path}': {e}"
-
-    # Text files — UTF-8 read
     else:
         try:
             content = file_path.read_text(encoding="utf-8", errors="replace")
@@ -326,489 +130,110 @@ def read_file(path: str, head: int = 0, tail: int = 0) -> str:
             return f"Could not read '{path}': {e}"
 
     total_lines = len(content.splitlines())
-
-    if head > 0:
-        shown = content.splitlines(keepends=True)[:head]
-        shown_count = len(shown)
-        header = f"[{path} | showing first {shown_count} of {total_lines} lines (head={head})]\n"
-        return header + "".join(shown)
-
-    if tail > 0:
-        shown = content.splitlines(keepends=True)[-tail:]
-        shown_count = len(shown)
-        header = f"[{path} | showing last {shown_count} of {total_lines} lines (tail={tail})]\n"
-        return header + "".join(shown)
-
     header = f"[{path} | full file, {total_lines} lines]\n"
     return header + content
 
 
-@tool
-def read_file_lines(path: str, start_line: int, end_line: int) -> str:
-    """
-    Read a specific line range from a text file, with line numbers shown.
-    Lines are 1-indexed and inclusive on both ends. Maximum 500 lines per call.
-
-    Use this BEFORE edit_file_lines to confirm you are targeting the correct
-    lines. This lets you work surgically on large files without pulling their
-    full content into context.
-
-    DO NOT GUESS start_line/end_line. Only call this with a range you already
-    have evidence for — a line number from a search_file_contents match, a
-    symbol location from search_index, or a range you've already confirmed via
-    a prior read. Picking a speculative window (e.g. "it's probably somewhere
-    around line 400") to go fishing wastes a call on a guess; search for the
-    line first, then read exactly around it.
-
-    Typical workflow
-    ----------------
-    1. search_file_contents(pattern, ...)  — get a real line number as evidence
-    2. read_file_lines(path, N, M)         — read a small window around that
-                                              evidenced line, confirm exact lines
-    3. edit_file_lines(path, N, M, ...)    — make the surgical replacement
-
-    (Use read_file with head/tail only if you have no search hit at all yet
-    and need to understand an unfamiliar file's structure first.)
-
-    Args:
-        path:       Relative path to the file.
-        start_line: First line to read (1-indexed).
-        end_line:   Last line to read (inclusive).
-    """
-    if start_line < 1:
-        return "Error: start_line must be >= 1."
-    if end_line < start_line:
-        return "Error: end_line must be >= start_line."
-    if end_line - start_line > 500:
-        return "Error: Cannot read more than 500 lines at once. Narrow your range."
-
-    try:
-        target = _safe_path(path)
-    except PermissionError as e:
-        return str(e)
-
-    if not target.exists():
-        return f"File '{path}' does not exist."
-    if not target.is_file():
-        return f"'{path}' is a directory, not a file."
-
-    try:
-        all_lines = target.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
-    except Exception as e:
-        return f"Could not read '{path}': {e}"
-
-    total = len(all_lines)
-    if start_line > total:
-        return f"File only has {total} lines. start_line={start_line} is out of range."
-
-    actual_end = min(end_line, total)
-    selected = all_lines[start_line - 1 : actual_end]
-
-    numbered = "".join(f"{start_line + i:>6}  {line}" for i, line in enumerate(selected))
-    header = f"[{path} | lines {start_line}–{actual_end} of {total}]\n"
-    return header + numbered
-
-
-@tool
-def list_directory(path: str = ".") -> str:
-    """
-    List the immediate contents of a directory.
-    Each entry is prefixed with [FILE] or [DIR].
-    Does NOT recurse into subdirectories.
-
-    Args:
-        path: Relative path to the directory. Defaults to "." (sandbox root).
-    """
-    try:
-        target = _safe_path(path)
-    except PermissionError as e:
-        return str(e)
-
-    if not target.exists():
-        return f"Directory '{path}' does not exist."
-    if not target.is_dir():
-        return f"'{path}' is a file, not a directory."
-
-    try:
-        entries = sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name))
-    except PermissionError:
-        return f"Permission denied: cannot list '{path}'."
-
-    if not entries:
-        return "Directory is empty."
-
-    lines = []
-    for entry in entries:
-        tag = "[DIR] " if entry.is_dir() else "[FILE]"
-        note = "  [skipped — noise dir]" if _is_skipped(entry) else ""
-        lines.append(f"{tag} {entry.name}{note}")
-
-    return "\n".join(lines)
-
-
-@tool
-def file_tree_shallow(subdirectory: str = ".", max_depth: int = 2, max_entries: int = 200) -> str:
-    """
-    Show a recursive visual tree of files and folders — token-safe.
-
-    Unlike an unlimited tree dump, this tool is depth-limited and entry-capped
-    so it never floods the context window on large or deeply nested projects.
-
-    Use this as the FIRST tool when exploring any unknown project. If you need
-    to go deeper into a specific subdirectory, call again with that path as the
-    root and a higher max_depth.
-
-    Rules of thumb
-    --------------
-    - Start at root with max_depth=2 to understand the project shape.
-    - Drill into a specific folder: file_tree_shallow("src/billing", max_depth=3)
-    - When the cap warning appears, narrow the subdirectory instead of raising it.
-    - Do NOT use this with max_depth > 4 on the project root.
-
-    Args:
-        subdirectory: Relative path to start the tree from. Defaults to ".".
-        max_depth:    How many levels deep to recurse. Default 2. Hard max 6.
-        max_entries:  Stop emitting after this many entries to prevent token
-                      floods. Default 200. A warning is appended when hit.
-    """
-    try:
-        target = _safe_path(subdirectory)
-    except PermissionError as e:
-        return str(e)
-
-    if not target.exists():
-        return f"Directory '{subdirectory}' does not exist."
-    if not target.is_dir():
-        return f"'{subdirectory}' is a file, not a directory."
-
-    max_depth = min(max(1, max_depth), 6)
-    root = get_sandbox_root()
-    label = str(target.relative_to(root)) if subdirectory != "." else "."
-    lines = [f"📁 {label}"]
-    entry_count = 0
-    capped = False
-
-    def _render(directory: Path, prefix: str = "", depth: int = 0) -> None:
-        nonlocal entry_count, capped
-        if capped or depth >= max_depth:
-            return
-        try:
-            children = sorted(directory.iterdir(), key=lambda p: (p.is_file(), p.name))
-        except PermissionError:
-            lines.append(f"{prefix}└── [permission denied]")
-            return
-
-        for i, child in enumerate(children):
-            if capped:
-                return
-            is_last = i == len(children) - 1
-            connector = "└── " if is_last else "├── "
-
-            if _is_skipped(child):
-                lines.append(f"{prefix}{connector}📁 {child.name}/  [skipped]")
-                entry_count += 1
-                if entry_count >= max_entries:
-                    capped = True
-                continue
-
-            icon = "📁 " if child.is_dir() else "📄 "
-            lines.append(f"{prefix}{connector}{icon}{child.name}")
-            entry_count += 1
-            if entry_count >= max_entries:
-                capped = True
-                return
-
-            if child.is_dir():
-                extension = "    " if is_last else "│   "
-                _render(child, prefix + extension, depth + 1)
-
-    _render(target)
-
-    if capped:
-        lines.append(
-            f"\n⚠️  Output capped at {max_entries} entries. "
-            "Narrow the subdirectory path to explore deeper sections."
-        )
-
-    lines.append(f"\n[Depth: {max_depth} | Entries shown: {entry_count}]")
-    return "\n".join(lines)
-
-
-@tool
-def get_file_info(path: str) -> str:
-    """
-    Get detailed metadata about a file or directory.
-    Returns: name, type, size, permissions, created, modified, and accessed times.
-
-    Args:
-        path: Relative path to the file or directory.
-    """
-    try:
-        target = _safe_path(path)
-    except PermissionError as e:
-        return str(e)
-
-    if not target.exists():
-        return f"'{path}' does not exist."
-
-    try:
-        s = target.stat()
-    except PermissionError:
-        return f"Permission denied: cannot stat '{path}'."
-
-    kind = "Directory" if target.is_dir() else "File"
-    size = f"{s.st_size:,} bytes" if target.is_file() else "—"
-    permissions = _fmt_permissions(s.st_mode)
-
-    # Creation time:
-    #   macOS  → st_birthtime (real creation time)
-    #   Windows→ st_ctime     (real creation time)
-    #   Linux  → st_ctime     (last metadata change; true birthtime not exposed by Python)
-    created = _fmt_ts(getattr(s, "st_birthtime", s.st_ctime))
-
-    return "\n".join([
-        f"Name:        {target.name}",
-        f"Type:        {kind}",
-        f"Size:        {size}",
-        f"Permissions: {permissions}",
-        f"Created:     {created}",
-        f"Modified:    {_fmt_ts(s.st_mtime)}",
-        f"Accessed:    {_fmt_ts(s.st_atime)}",
-        f"Path:        {path}",
-    ])
-
-
-@tool
-def list_allowed_directories() -> str:
-    """
-    List all directories the agent is allowed to access.
-    Returns the sandbox root that was locked in when `sicily start` was invoked.
-    No input required.
-    """
-    root = get_sandbox_root()
-    return f"Allowed directories:\n  {root}"
-
-
-# PATH PIN TOOLS — survive context summarisation
-@tool
-def pin_path(alias: str, path: str) -> str:
-    """
-    Save a file path under a short alias so it survives context summarisation.
-
-    The summariser compresses old tool outputs out of the message list. A path
-    discovered 10 turns ago may no longer be in context when you need to act
-    on it. Pinned paths live in process memory — the summariser cannot touch them.
-
-    ALWAYS call this immediately after finding a file you plan to use later,
-    before reading it or doing anything else.
-
-    Examples
-    --------
-    pin_path("target",  "src/billing/formatters/pdf_renderer.py")
-    pin_path("config",  "infrastructure/k8s/prod/values.yaml")
-    pin_path("tests",   "tests/unit/billing/test_invoice.py")
-
-    Args:
-        alias: A short memorable name for this path (e.g. "target", "config").
-        path:  The relative file path to save.
-    """
-    _PATH_PINS[alias] = path
-    return f"📌 Pinned '{alias}' → '{path}'. Use recall_path('{alias}') to retrieve it later."
-
-
-@tool
-def recall_path(alias: str) -> str:
-    """
-    Retrieve a previously pinned file path by its alias.
-
-    Use this whenever you need to act on a file but cannot be certain its
-    path is still in your active context (it may have been summarised away).
-
-    Args:
-        alias: The alias used when pin_path was called.
-    """
-    if alias not in _PATH_PINS:
-        all_pins = ", ".join(f"'{k}'" for k in _PATH_PINS) if _PATH_PINS else "none"
-        return (
-            f"No path pinned under alias '{alias}'. "
-            f"Available pins: {all_pins}. "
-            "If you have not pinned this path yet, use find_files_by_name to locate it first."
-        )
-    return f"📌 '{alias}' → '{_PATH_PINS[alias]}'"
-
-
-@tool
-def recall_all_pins() -> str:
-    """
-    List every currently pinned path.
-
-    Call this at the start of any multi-step task to remind yourself what
-    files you have already located, or after a long chain of tool calls
-    to re-orient before taking a write action.
-    """
-    if not _PATH_PINS:
-        return "No paths are currently pinned. Use pin_path to save file locations."
-    lines = [f"  {alias:20s} → {path}" for alias, path in _PATH_PINS.items()]
-    return "📌 Pinned paths:\n" + "\n".join(lines)
-
-
 # WRITE TOOLS
 @tool
-def create_text_file(
+def write_file(
     path: str,
-    content: str,
+    content: str = "",
+    mode: str = "create",
+    start_line: int = 0,
+    end_line: int = 0,
     create_parents: bool = True,
-) -> str:
-    """
-    Create a NEW text file at the given relative path with the provided content.
-
-    Safety guarantees
-    -----------------
-    - Will NEVER overwrite an existing file or directory. If the path already
-      exists the operation is aborted immediately and an error is returned.
-    - The resolved path must stay inside the sandbox root; any traversal attempt
-      (e.g. "../../etc/passwd") is blocked before any I/O occurs.
-    - Only recognised text-based extensions are accepted (see list below).
-    - Parent directories are created automatically when `create_parents=True`
-      (the default), as long as they remain inside the sandbox.
-
-    To edit an existing file, use edit_file_lines instead.
-
-    Supported extensions
-    --------------------
-    Documents/notes : .txt .md .markdown .rst .org .tex
-    Config/data     : .json .jsonl .ndjson .yaml .yml .toml .ini .cfg .conf .env
-    Web/markup      : .html .htm .css .scss .sass .xml .svg
-    Source code     : .py .pyi .js .mjs .cjs .ts .tsx .jsx .sh .bash .zsh .fish
-                      .rb .go .rs .java .kt .scala .c .cpp .cc .h .hpp .cs .fs
-                      .php .lua .r .sql
-    Data/logs       : .csv .tsv .log
-    Misc text       : .diff .patch .gitignore .editorconfig
-
-    Args:
-        path:           Relative path for the new file, including its name and
-                        extension (e.g. "notes/meeting.md").
-        content:        UTF-8 text content to write.
-        create_parents: When True (default), any missing parent directories are
-                        created automatically. Set to False if you want the
-                        operation to fail when a parent does not exist.
-    """
-    # 1. Sandbox enforcement
-    try:
-        target = _safe_path(path)
-    except PermissionError as e:
-        return str(e)
-
-    # 2. No-overwrite guard
-    if target.exists():
-        kind = "directory" if target.is_dir() else "file"
-        return (
-            f"Refused: '{path}' already exists as a {kind}. "
-            "Use edit_file_lines to modify an existing file."
-        )
-
-    # 3. Extension whitelist
-    ext = target.suffix.lower()
-    if not ext:
-        return (
-            f"Refused: '{path}' has no file extension. "
-            "Please include one (e.g. report.md, config.yaml)."
-        )
-    if ext not in ALLOWED_WRITE_EXTENSIONS:
-        allowed_str = "  " + "\n  ".join(sorted(ALLOWED_WRITE_EXTENSIONS))
-        return (
-            f"Refused: extension '{ext}' is not in the allowed list.\n"
-            f"Supported extensions:\n{allowed_str}"
-        )
-
-    # 4. Parent directory handling
-    parent = target.parent
-    if not parent.exists():
-        if not create_parents:
-            rel_parent = parent.relative_to(get_sandbox_root())
-            return (
-                f"Error: parent directory '{rel_parent}' does not exist. "
-                "Pass create_parents=True to create it automatically, "
-                "or use make_directory first."
-            )
-        try:
-            parent.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            return f"Could not create parent directories for '{path}': {e}"
-
-    # 5. Write
-    try:
-        target.write_text(content, encoding="utf-8")
-    except Exception as e:
-        return f"Could not write '{path}': {e}"
-
-    size = target.stat().st_size
-    return (
-        f"Created '{path}'.\n"
-        f"Size: {size:,} bytes | Encoding: utf-8"
-    )
-
-
-@tool
-def edit_file_lines(
-    path: str,
-    start_line: int,
-    end_line: int,
-    new_content: str,
     dry_run: bool = True,
 ) -> str:
     """
-    Replace a specific line range in an existing file with new content.
-    This is the correct tool for any task that modifies an existing file.
+    Create a new text file, or replace a line range in an existing one.
 
-    Safety design
-    -------------
-    - dry_run=True (the default): shows a diff-style preview WITHOUT writing.
-      Always call with dry_run=True first so the user can confirm the change.
-    - dry_run=False: actually writes the change. Only use after the user
-      confirms the preview is correct.
-    - The file MUST already exist. Use create_text_file for new files.
-    - Replaces lines [start_line, end_line] inclusive (1-indexed) with
-      new_content. All surrounding lines are untouched.
-    - Set new_content="" to delete the target lines without inserting anything.
-    - Only text-based extensions (same list as create_text_file) are supported.
+    mode="create" (default): writes `content` to `path`; refuses if the
+    path already exists. Parent dirs auto-created when create_parents=True.
 
-    Typical workflow
-    ----------------
-    1. read_file(path, head=50)                         — understand structure
-    2. read_file_lines(path, N, M)                      — confirm exact target
-    3. edit_file_lines(path, N, M, new, dry_run=True)   — preview the change
-    4. User confirms the preview looks correct
-    5. edit_file_lines(path, N, M, new, dry_run=False)  — apply it
+    mode="edit": replaces lines [start_line, end_line] (1-indexed,
+    inclusive) with `content` ("" to delete the range); file must already
+    exist. dry_run=True (default) previews as a diff; dry_run=False applies.
+
+    Text-based extensions only (code, config, docs, csv/tsv/log, etc. — not
+    binary formats like .pdf/.docx/.xlsx).
 
     Args:
-        path:        Relative path to the file.
-        start_line:  First line to replace (1-indexed).
-        end_line:    Last line to replace (inclusive).
-        new_content: Replacement text. Pass "" to delete the range entirely.
-        dry_run:     If True (default), show a preview without writing anything.
+        path:           Relative path to the file.
+        content:        For mode="create": the full file content. For
+                        mode="edit": the replacement text for the line
+                        range (pass "" to delete the range).
+        mode:           "create" for a new file, "edit" to replace lines in
+                        an existing file.
+        start_line:     mode="edit" only — first line to replace (1-indexed).
+        end_line:       mode="edit" only — last line to replace (inclusive).
+        create_parents: mode="create" only — auto-create missing parent
+                        directories (default True).
+        dry_run:        mode="edit" only — if True (default), preview
+                        without writing.
     """
-    if start_line < 1:
-        return "Error: start_line must be >= 1."
-    if end_line < start_line:
-        return "Error: end_line must be >= start_line."
+    if mode not in ("create", "edit"):
+        return f"Error: mode must be 'create' or 'edit', got '{mode}'."
 
     try:
         target = _safe_path(path)
     except PermissionError as e:
         return str(e)
 
+    ext = target.suffix.lower()
+
+    if mode == "create":
+        if target.exists():
+            kind = "directory" if target.is_dir() else "file"
+            return (
+                f"Refused: '{path}' already exists as a {kind}. "
+                "Use mode=\"edit\" to modify an existing file."
+            )
+        if not ext:
+            return (
+                f"Refused: '{path}' has no file extension. "
+                "Please include one (e.g. report.md, config.yaml)."
+            )
+        if ext not in _ALLOWED_WRITE_EXTENSIONS:
+            allowed_str = "  " + "\n  ".join(sorted(_ALLOWED_WRITE_EXTENSIONS))
+            return (
+                f"Refused: extension '{ext}' is not in the allowed list.\n"
+                f"Supported extensions:\n{allowed_str}"
+            )
+
+        parent = target.parent
+        if not parent.exists():
+            if not create_parents:
+                rel_parent = parent.relative_to(_get_sandbox_root())
+                return (
+                    f"Error: parent directory '{rel_parent}' does not exist. "
+                    "Pass create_parents=True to create it automatically, "
+                    "or use run_file_command('mkdir ...') first."
+                )
+            try:
+                parent.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                return f"Could not create parent directories for '{path}': {e}"
+
+        try:
+            target.write_text(content, encoding="utf-8")
+        except Exception as e:
+            return f"Could not write '{path}': {e}"
+
+        size = target.stat().st_size
+        return f"Created '{path}'.\nSize: {size:,} bytes | Encoding: utf-8"
+
+    # mode == "edit"
+    if start_line < 1:
+        return "Error: start_line must be >= 1."
+    if end_line < start_line:
+        return "Error: end_line must be >= start_line."
+
     if not target.exists():
-        return (
-            f"File '{path}' does not exist. "
-            "Use create_text_file to create new files."
-        )
+        return f"File '{path}' does not exist. Use mode=\"create\" to make new files."
     if not target.is_file():
         return f"'{path}' is a directory, not a file."
-
-    # Extension guard — only edit text-based files
-    ext = target.suffix.lower()
-    if ext not in ALLOWED_WRITE_EXTENSIONS:
+    if ext not in _ALLOWED_WRITE_EXTENSIONS:
         return (
             f"Refused: extension '{ext}' is not in the allowed list for editing. "
             "Only text-based files can be edited."
@@ -826,11 +251,11 @@ def edit_file_lines(
     actual_end = min(end_line, total)
     removed = all_lines[start_line - 1 : actual_end]
 
-    # Ensure new_content ends with a newline so the file stays well-formed
-    if new_content and not new_content.endswith("\n"):
-        replacement_block = new_content + "\n"
+    # Ensure new content ends with a newline so the file stays well-formed
+    if content and not content.endswith("\n"):
+        replacement_block = content + "\n"
     else:
-        replacement_block = new_content
+        replacement_block = content
 
     new_file_lines = all_lines[: start_line - 1] + ([replacement_block] if replacement_block else []) + all_lines[actual_end:]
     new_content_full = "".join(new_file_lines)
@@ -855,7 +280,6 @@ def edit_file_lines(
             f"Call again with dry_run=False to apply."
         )
 
-    # Apply the edit
     try:
         target.write_text(new_content_full, encoding="utf-8")
     except Exception as e:
@@ -874,67 +298,538 @@ def edit_file_lines(
 
 
 @tool
-def make_directory(path: str) -> str:
+def run_file_command(command: str) -> str:
     """
-    Create a new directory at the given relative path, including any missing
-    intermediate parents. Idempotent: succeeds silently if the directory
-    already exists.
+    Run a filesystem command inside the sandbox: `cp`, `mv`, `mkdir`, `ls`,
+    or `info` — for copying, moving/renaming, creating directories, listing
+    directory contents, and reading file/folder metadata. Supports multiple
+    paths per call (e.g. `ls reports/q3 reports/q4`, `info a.pdf b.md`) —
+    batch paths together rather than calling this once per path.
 
-    Safety guarantees
-    -----------------
-    - Will NOT fail or overwrite if the directory already exists.
-    - Will NOT touch any existing files or directories inside the path.
-    - The resolved path must stay inside the sandbox root.
-    - Will refuse if the path already exists as a *file*.
+    Not a general shell: only these five commands, limited flags (`-n`/`-r`/
+    `-p`), no globs, no piping/chaining. Since it's still a command line,
+    feel free to write the exact invocation for what you need rather than
+    defaulting to a generic one — precise flags/paths get you a more
+    targeted result and less to filter through.
 
     Args:
-        path: Relative path of the directory to create (e.g. "reports/q3").
+        command: A single cp/mv/mkdir/ls/info invocation, e.g.
+                "cp reports/draft.md reports/draft-backup.md",
+                "mv -r old_project new_project",
+                "mkdir reports/q3 reports/q4",
+                "ls reports/q3 reports/q4",
+                "info report.pdf notes.md archive/2026".
     """
-    # ── 1. Sandbox enforcement ────────────────────────────────────────────────
+    try:
+        executable, paths, flags = _validate_fileops_command(command)
+    except CommandValidationError as e:
+        return str(e)
+
+    root = _get_sandbox_root()
+    no_clobber = "-n" in flags
+
+    if executable == "ls":
+        sections = []
+        for target in paths:
+            label = str(target.relative_to(root)) if target.is_relative_to(root) else str(target)
+            body = _list_directory_entries(target, label)
+            sections.append(f"[{label}]\n{body}" if len(paths) > 1 else body)
+        return "\n\n".join(sections)
+
+    if executable == "info":
+        if not paths:
+            return "Refused: 'info' needs at least one path argument."
+        sections = []
+        for target in paths:
+            label = str(target.relative_to(root)) if target.is_relative_to(root) else str(target)
+            sections.append(_describe_path(target, label))
+        return "\n\n".join(sections)
+
+    if executable == "mkdir":
+        results = []
+        for target in paths:
+            if target.is_file():
+                results.append(f"'{target.relative_to(root)}': refused — already exists as a file.")
+                continue
+            if target.is_dir():
+                results.append(f"'{target.relative_to(root)}': already exists — nothing to do.")
+                continue
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+                results.append(f"'{target.relative_to(root)}': created.")
+            except Exception as e:
+                results.append(f"'{target.relative_to(root)}': could not create — {e}.")
+        return "\n".join(results)
+
+    # cp / mv — one or more sources, last positional is the destination.
+    *sources, dst = paths
+    multi_source = len(sources) > 1
+
+    # With 2+ sources, the destination must be a directory (create it if it doesn't exist yet, same as real cp/mv). With exactly 1 source,
+    # dst may be either a directory (item goes inside it) or a new path (item is placed/renamed at that exact path).
+    if multi_source:
+        if dst.exists() and not dst.is_dir():
+            return (
+                f"Refused: with multiple sources the destination "
+                f"'{dst.relative_to(root)}' must be a directory."
+            )
+        try:
+            dst.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return f"Could not create destination directory '{dst.relative_to(root)}': {e}"
+
+    results = []
+    for src in sources:
+        if not src.exists():
+            results.append(f"'{src.name}': source does not exist.")
+            continue
+
+        is_dir = src.is_dir()
+        if is_dir and executable == "cp" and "-r" not in flags:
+            results.append(
+                f"'{src.relative_to(root)}': is a directory — pass -r to copy it "
+                "(e.g. \"cp -r folder dest\")."
+            )
+            continue
+        if not is_dir:
+            ext = src.suffix.lower()
+            if ext not in MANAGEABLE_EXTENSIONS:
+                results.append(f"'{src.relative_to(root)}': refused — '{ext}' is not a manageable file type.")
+                continue
+
+        # Resolve final destination path for this item.
+        item_dst = (dst / src.name) if (multi_source or dst.is_dir()) else dst
+
+        if item_dst.exists():
+            if no_clobber:
+                results.append(f"'{src.relative_to(root)}': skipped (destination exists, -n set).")
+                continue
+            results.append(
+                f"'{src.relative_to(root)}': refused — destination "
+                f"'{item_dst.relative_to(root)}' already exists (this tool never overwrites)."
+            )
+            continue
+
+        src_rel = src.relative_to(root)
+        try:
+            item_dst.parent.mkdir(parents=True, exist_ok=True)
+            if executable == "cp":
+                if is_dir:
+                    shutil.copytree(str(src), str(item_dst))
+                    results.append(f"Copied '{src_rel}' -> '{item_dst.relative_to(root)}' (directory).")
+                else:
+                    shutil.copy2(str(src), str(item_dst))
+                    results.append(f"Copied '{src_rel}' -> '{item_dst.relative_to(root)}' ({item_dst.stat().st_size:,} bytes).")
+            else:  # mv
+                shutil.move(str(src), str(item_dst))
+                results.append(f"Moved '{src_rel}' -> '{item_dst.relative_to(root)}'.")
+        except Exception as e:
+            results.append(f"'{src_rel}': could not {executable} — {e}")
+
+    return "\n".join(results)
+
+
+# ---------------------------------------------------------------------------
+# DELETE (soft — trash, never unlink)
+# ---------------------------------------------------------------------------
+
+@tool
+def delete_file(path: str, dry_run: bool = True) -> str:
+    """
+    Delete a file — soft delete, moved to .sicily-trash/, never unlinked.
+    Works on any manageable file type (not just text/PDF/docx/xlsx).
+    dry_run=True (default) previews only; dry_run=False applies.
+
+    Args:
+        path:    Relative path to the file to delete.
+        dry_run: If True (default), preview only.
+    """
     try:
         target = _safe_path(path)
     except PermissionError as e:
         return str(e)
 
-    # ── 2. Collision check ────────────────────────────────────────────────────
-    if target.is_file():
+    if not target.exists():
+        return f"'{path}' does not exist."
+    if not target.is_file():
+        return f"'{path}' is a directory. Use delete_directory instead."
+
+    ext = target.suffix.lower()
+    if ext not in MANAGEABLE_EXTENSIONS:
         return (
-            f"Refused: '{path}' already exists as a file. "
-            "Cannot create a directory at that path."
+            f"Refused: '{ext}' is not currently a manageable file type in "
+            "this sandbox."
         )
 
-    if target.is_dir():
-        return f"Directory '{path}' already exists — nothing to do."
+    if dry_run:
+        return (
+            f"[DRY RUN — nothing deleted]\n"
+            f"Would move '{path}' to {TRASH_DIR_NAME}/.\n"
+            "Call again with dry_run=False to apply."
+        )
 
-    # ── 3. Create ─────────────────────────────────────────────────────────────
     try:
-        target.mkdir(parents=True, exist_ok=True)
+        trashed = _move_to_trash(target)
     except Exception as e:
-        return f"Could not create directory '{path}': {e}"
+        return f"Could not delete '{path}': {e}"
 
-    return f"Directory '{path}' created."
+    rel_trashed = trashed.relative_to(_get_sandbox_root())
+    return f"Deleted '{path}' (moved to '{rel_trashed}')."
+
+
+@tool
+def delete_directory(path: str, recursive: bool = False, dry_run: bool = True) -> str:
+    """
+    Delete a directory — soft delete, moved to .sicily-trash/, not unlinked.
+    Refuses on a non-empty directory unless recursive=True. dry_run=True
+    (default) previews contents and effect; dry_run=False applies.
+
+    Args:
+        path:      Relative path to the directory to delete.
+        recursive: Must be True to delete a non-empty directory.
+        dry_run:   If True (default), preview only.
+    """
+    try:
+        target = _safe_path(path)
+    except PermissionError as e:
+        return str(e)
+
+    if not target.exists():
+        return f"'{path}' does not exist."
+    if not target.is_dir():
+        return f"'{path}' is a file. Use delete_file instead."
+    if target == _get_sandbox_root():
+        return "Refused: cannot delete the sandbox root itself."
+
+    contents = list(target.rglob("*"))
+    file_count = sum(1 for p in contents if p.is_file())
+    dir_count = sum(1 for p in contents if p.is_dir())
+
+    if contents and not recursive:
+        return (
+            f"Refused: '{path}' is not empty "
+            f"({file_count} file(s), {dir_count} subfolder(s)). "
+            "Pass recursive=True to confirm you want to delete it all."
+        )
+
+    if dry_run:
+        root = _get_sandbox_root()
+        preview = "\n".join(f"  - {p.relative_to(root)}" for p in contents[:30])
+        more = f"\n  ... and {len(contents) - 30} more" if len(contents) > 30 else ""
+        return (
+            f"[DRY RUN — nothing deleted]\n"
+            f"Would move '{path}' and its contents "
+            f"({file_count} file(s), {dir_count} subfolder(s)) to {TRASH_DIR_NAME}/.\n\n"
+            f"{preview}{more}\n\n"
+            "Call again with dry_run=False to apply."
+        )
+
+    try:
+        trashed = _move_to_trash(target)
+    except Exception as e:
+        return f"Could not delete '{path}': {e}"
+
+    rel_trashed = trashed.relative_to(_get_sandbox_root())
+    return (
+        f"Deleted '{path}' and its contents "
+        f"({file_count} file(s), {dir_count} subfolder(s)) — moved to '{rel_trashed}'."
+    )
+
+
+# ---------------------------------------------------------------------------
+# SEARCH — three tiers, escalating cost, with the strategy baked into the
+# docstrings themselves so the model follows it without being separately prompted each time.
+# ---------------------------------------------------------------------------
+
+@tool
+def find_files_by_name(path: str, pattern: str, exclude_patterns: list[str] = []) -> str:
+    """
+    Recursively find files by NAME/GLOB (e.g. "*.py", "invoice_*"), not
+    content. Returns relative paths only — reads no file content.
+
+    Args:
+        path:             Starting directory (relative path).
+        pattern:          Glob pattern matched against each entry's name.
+        exclude_patterns: Optional glob patterns to exclude, matched
+                          against both the entry name and relative path.
+    """
+    import fnmatch
+
+    try:
+        start = _safe_path(path)
+    except PermissionError as e:
+        return str(e)
+
+    if not start.exists():
+        return f"Directory '{path}' does not exist."
+    if not start.is_dir():
+        return f"'{path}' is not a directory."
+
+    root = _get_sandbox_root()
+    matches: list[str] = []
+
+    def _walk(directory: Path) -> None:
+        try:
+            children = sorted(directory.iterdir(), key=lambda p: (p.is_file(), p.name))
+        except PermissionError:
+            return
+
+        for child in children:
+            if _is_skipped(child):
+                continue
+
+            rel = str(child.relative_to(root))
+
+            if any(
+                fnmatch.fnmatch(child.name, xp) or fnmatch.fnmatch(rel, xp)
+                for xp in exclude_patterns
+            ):
+                continue
+
+            if fnmatch.fnmatch(child.name, pattern):
+                matches.append(rel)
+
+            if child.is_dir():
+                _walk(child)
+
+    _walk(start)
+
+    if not matches:
+        return f"No files matching '{pattern}' found under '{path}'."
+
+    return f"Found {len(matches)} match(es):\n" + "\n".join(matches)
+
+
+# Hard server-side ceilings — independent of whatever the caller passes.
+# These exist because an unscoped search_file_contents call (broad path, no includes, high max_results) can otherwise walk and return a large
+# fraction of a monorepo in one call. Args are clamped, not rejected, so a call never fails — it just can't blow the budget.
+_MAX_RESULTS_CEILING = 40
+_MAX_FILES_SCANNED = 400          # stop walking after this many readable files, matches or not
+_MAX_CONTEXT_LINES = 4
+_MAX_OUTPUT_CHARS = 6_000         # hard cap on the returned string; truncated with a note past this
+
+
+@tool
+def search_file_contents(
+    pattern: str,
+    path: str = ".",
+    regex: bool = False,
+    case_sensitive: bool = False,
+    context_lines: int = 0,
+    match_per_line: bool = True,
+    includes: Optional[List[str]] = None,
+    max_results: int = 20,
+    return_json: bool = False,
+) -> str:
+    """
+    Grep-equivalent literal/regex search inside file content, under `path`
+    — plain text/code directly, plus PDF/docx/xlsx via text extraction.
+
+    Scope this tightly: pass the narrowest `path` and `includes` the
+    evidence supports, rather than searching the whole tree with a wide
+    alternation pattern. Results, files scanned, and context are all
+    capped server-side (max_results<=40, ~400 files walked, context<=4
+    lines, output truncated past ~6000 chars) — an unscoped call will be
+    clamped and truncated rather than returning everything, so a narrow
+    query is the only way to get complete results back. If a first
+    targeted search comes up empty, widen path/pattern deliberately on
+    the next call rather than starting broad.
+
+    Args:
+        pattern:        Text or regex pattern to search for.
+        path:           Directory to search under (relative or absolute). Defaults to ".".
+        regex:          If True, `pattern` is treated as a regular expression.
+        case_sensitive: If False (default), performs case-insensitive matching.
+        context_lines:  Lines of context above/below each match (default 0, max 4).
+        match_per_line: If True (default), returns matching lines and line numbers.
+                        If False, returns only matching file paths (like git grep -l) — cheaper,
+                        prefer this to locate candidate files before requesting line content.
+        includes:       Optional list of glob patterns to filter files (e.g. ["*.py", "!**/node_modules/*"]).
+                        Strongly recommended whenever you have any hint about file type or area.
+        max_results:    Stop after this many matches (default 20, hard cap 40).
+        return_json:    If True, outputs raw JSON objects like grep_search API.
+    """
+    try:
+        start = _safe_path(path)
+    except PermissionError as e:
+        return str(e)
+
+    if not start.exists():
+        return f"'{path}' does not exist."
+    if not start.is_dir():
+        return f"'{path}' is a file, not a directory. Pass a directory to search."
+
+    # Clamp caller-supplied limits to server-side ceilings rather than
+    # trusting them — this is what actually bounds worst-case cost.
+    max_results = max(1, min(max_results, _MAX_RESULTS_CEILING))
+    context_lines = max(0, min(context_lines, _MAX_CONTEXT_LINES))
+
+    # Compile regex pattern
+    flags = 0 if case_sensitive else re.IGNORECASE
+    try:
+        search_regex = re.compile(pattern if regex else re.escape(pattern), flags)
+    except re.error as e:
+        return f"Invalid regex pattern: {e}"
+
+    root = _get_sandbox_root()
+    matches = []
+    matching_files = set()
+    files_scanned = 0
+    files_skipped = []
+    scan_capped = False
+
+    # Common directory excludes to keep search fast
+    DEFAULT_IGNORE_DIRS = _SKIP_DIRS
+
+    def _should_include(file_rel_path: str) -> bool:
+        if not includes:
+            return True
+        included = False
+        for inc in includes:
+            if inc.startswith("!"):
+                if fnmatch.fnmatch(file_rel_path, inc[1:]):
+                    return False
+            else:
+                if fnmatch.fnmatch(file_rel_path, inc):
+                    included = True
+        return included if any(not inc.startswith("!") for inc in includes) else True
+
+    def _iter_files(directory: Path):
+        try:
+            children = sorted(directory.iterdir(), key=lambda p: (p.is_file(), p.name))
+        except PermissionError:
+            return
+        for child in children:
+            if child.is_dir():
+                if child.name in DEFAULT_IGNORE_DIRS or _is_skipped(child):
+                    continue
+                yield from _iter_files(child)
+            elif child.is_file():
+                if _is_skipped(child):
+                    continue
+                yield child
+
+    for file_path in _iter_files(start):
+        if len(matches) >= max_results:
+            break
+        if files_scanned >= _MAX_FILES_SCANNED:
+            scan_capped = True
+            break
+
+        ext = file_path.suffix.lower()
+        if ext not in READABLE_EXTENSIONS:
+            continue
+
+        try:
+            rel_str = str(file_path.relative_to(root)).replace("\\", "/")
+        except ValueError:
+            rel_str = str(file_path).replace("\\", "/")
+
+        if not _should_include(rel_str):
+            continue
+
+        try:
+            if ext in _BINARY_EXTENSIONS:
+                text = _read_binary(file_path)
+            else:
+                text = file_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            files_skipped.append(rel_str)
+            continue
+
+        files_scanned += 1
+        lines = text.splitlines()
+
+        for i, line in enumerate(lines):
+            if len(matches) >= max_results:
+                break
+
+            if search_regex.search(line):
+                matching_files.add(rel_str)
+
+                # If only file listing requested (git grep -l behavior)
+                if not match_per_line:
+                    if rel_str not in matches:
+                        matches.append(rel_str)
+                    break
+
+                line_num = i + 1
+
+                if return_json:
+                    matches.append({
+                        "Filename": rel_str,
+                        "LineNumber": line_num,
+                        "LineContent": line.strip()
+                    })
+                else:
+                    if context_lines > 0:
+                        lo = max(0, i - context_lines)
+                        hi = min(len(lines), i + context_lines + 1)
+                        snippet_lines = lines[lo:hi]
+                        snippet = "\n".join(
+                            f"{'>' if lo + j == i else ' '} {lo + j + 1:>5}  {l}"
+                            for j, l in enumerate(snippet_lines)
+                        )
+                        matches.append(f"[{rel_str}]\n{snippet}")
+                    else:
+                        matches.append(f"[{rel_str}:{line_num}]  {line.strip()}")
+
+    search_desc = (
+        f"Searched for {'regex' if regex else 'literal'} pattern '{pattern}' "
+        f"({'case-sensitive' if case_sensitive else 'case-insensitive'}) under '{path}'"
+    )
+    cap_note = (
+        f" (stopped after scanning {_MAX_FILES_SCANNED} files — narrow `path`/`includes` "
+        "to search the rest)" if scan_capped else ""
+    )
+
+    if not matches:
+        note = f" ({len(files_skipped)} file(s) could not be read)" if files_skipped else ""
+        return (
+            f"{search_desc}\n"
+            f"No matches across {files_scanned} readable file(s){note}{cap_note}."
+        )
+
+    if return_json:
+        out = json.dumps(matches, indent=2)
+        if len(out) > _MAX_OUTPUT_CHARS:
+            out = out[:_MAX_OUTPUT_CHARS] + f"\n... [truncated at {_MAX_OUTPUT_CHARS} chars — narrow the query for full results]"
+        return out
+
+    header = f"{search_desc}\nFound {len(matches)} match(es) across {len(matching_files)} file(s) ({files_scanned} scanned{cap_note})"
+    if len(matches) >= max_results:
+        header += f" (capped at max_results={max_results})"
+
+    body = "\n\n".join(matches)
+    if len(body) > _MAX_OUTPUT_CHARS:
+        body = body[:_MAX_OUTPUT_CHARS] + f"\n... [truncated at {_MAX_OUTPUT_CHARS} chars — narrow `path`/`includes`/`pattern` for full results]"
+
+    return header + ":\n\n" + body
 
 
 # EXPORTED TOOL LIST
+# list_directory and get_file_info are no longer standalone tools — they're
+# available as the `ls` / `info` sub-commands of run_file_command (see
+# cowork_tool_fileops.py), which lets the model target several paths per
+# call instead of one per round-trip.
 LOCAL_TOOLS = [
     # Read-only (safe)
     search_index,
     read_file,
-    read_file_lines,
-    list_directory,
-    file_tree_shallow,
-    get_file_info,
-    list_allowed_directories,
-
-    # Path pins (process memory — survive summarisation)
-    pin_path,
-    recall_path,
-    recall_all_pins,
 
     # Write (safe-ish)
-    create_text_file,
-    edit_file_lines,
-    make_directory,
+    write_file,
+
+    # Search tier (escalating cost — see docstrings for the strategy)
+    find_files_by_name,
+    search_file_contents,
+
+    # Copy / move / rename / mkdir / list / inspect — one validated command tool (no-clobber by default).
+    run_file_command,
+
+    # Delete (soft — trash, dry_run by default)
+    delete_file,
+    delete_directory,
 ]
 
 
@@ -944,50 +839,44 @@ TOOL_STATUS_MAP = {
         f"Searching index for [white]'{args.get('query')}'[/white]"
     ),
     "read_file": lambda args: (
-        f"Reading first {args.get('head')} lines of [white]'{args.get('path')}'[/white]"
-        if args.get("head")
-        else f"Reading file [white]'{args.get('path')}'[/white]"
-    ),
-    "read_file_lines": lambda args: (
         f"Reading lines {args.get('start_line')}–{args.get('end_line')} of "
         f"[white]'{args.get('path')}'[/white]"
+        if args.get("start_line") or args.get("end_line")
+        else f"Reading file [white]'{args.get('path')}'[/white]"
     ),
-    "list_directory": lambda args: (
-        f"Listing contents of [white]'{args.get('path', '.')}'[/white]"
-    ),
-    "file_tree_shallow": lambda args: (
-        f"Scanning directory tree of [white]'{args.get('subdirectory', '.')}'[/white] "
-        f"(depth {args.get('max_depth', 2)})"
-    ),
-    "get_file_info": lambda args: (
-        f"Inspecting metadata for [white]'{args.get('path')}'[/white]"
-    ),
-    "list_allowed_directories": lambda args: "Checking sandbox boundary",
-    "pin_path": lambda args: (
-        f"Pinning [white]'{args.get('path')}'[/white] as [white]'{args.get('alias')}'[/white]"
-    ),
-    "recall_path": lambda args: (
-        f"Recalling pinned path [white]'{args.get('alias')}'[/white]"
-    ),
-    "recall_all_pins": lambda args: "Checking all pinned paths",
-    "create_text_file": lambda args: (
+    "write_file": lambda args: (
         f"Creating [white]'{args.get('path')}'[/white]"
+        if args.get("mode", "create") == "create"
+        else (
+            f"Previewing edit to [white]'{args.get('path')}'[/white] "
+            f"(lines {args.get('start_line')}–{args.get('end_line')})"
+            if args.get("dry_run", True)
+            else f"Applying edit to [white]'{args.get('path')}'[/white] "
+                 f"(lines {args.get('start_line')}–{args.get('end_line')})"
+        )
     ),
-    "edit_file_lines": lambda args: (
-        f"Previewing edit to [white]'{args.get('path')}'[/white] "
-        f"(lines {args.get('start_line')}–{args.get('end_line')})"
+    "find_files_by_name": lambda args: (
+        f"Searching filenames for [white]'{args.get('pattern')}'[/white] "
+        f"under [white]'{args.get('path')}'[/white]"
+    ),
+    "search_file_contents": lambda args: (
+        f"Searching for [white]'{args.get('pattern')}'[/white] "
+        f"under [white]'{args.get('path', '.')}'[/white]"
+    ),
+    "run_file_command": lambda args: (
+        f"Running [white]'{args.get('command')}'[/white]"
+    ),
+    "delete_file": lambda args: (
+        f"Previewing delete of [white]'{args.get('path')}'[/white]"
         if args.get("dry_run", True)
-        else f"Applying edit to [white]'{args.get('path')}'[/white] "
-             f"(lines {args.get('start_line')}–{args.get('end_line')})"
+        else f"Deleting [white]'{args.get('path')}'[/white] (-> trash)"
     ),
-    "make_directory": lambda args: (
-        f"Creating directory [white]'{args.get('path')}'[/white]"
+    "delete_directory": lambda args: (
+        f"Previewing delete of [white]'{args.get('path')}'[/white]"
+        if args.get("dry_run", True)
+        else f"Deleting [white]'{args.get('path')}'[/white] (-> trash)"
     ),
 }
-
-import Cowork.cowork_tool_fileops as fileops
-LOCAL_TOOLS.extend(fileops.FILEOPS_TOOLS)   # Merge fileops tools
-TOOL_STATUS_MAP.update(fileops.FILEOPS_TOOL_STATUS_MAP) # Merge status messages
 
 
 def get_friendly_tool_message(tool_call: dict) -> str:

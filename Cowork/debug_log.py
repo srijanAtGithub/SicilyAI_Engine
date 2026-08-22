@@ -10,10 +10,12 @@ Usage
     DEBUG = False  # production — completely silent, zero overhead
 """
 
+import os
+
 # ── The switch ───────────────────────────────────────────────────────────────
 # Flip this by hand. True  = print tool/token debug lines.
 #                    False = production behaviour, nothing extra printed.
-DEBUG = False
+DEBUG = os.getenv("SICILY_COWORK_DEBUG", "false").lower() in ("true", "1", "t", "yes")
 
 _step = 0  # running counter so you can see call order across a whole turn
 
