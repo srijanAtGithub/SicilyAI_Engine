@@ -3,6 +3,7 @@ import stat
 from pathlib import Path
 from typing import Optional
 import importlib
+import importlib.util
 import time
 import shlex
 import shutil
@@ -31,7 +32,7 @@ _SKIP_DIRS = {
 # NOTE: this restriction is scoped to reading/writing file CONTENT. It does
 # NOT apply to filesystem operations like move/copy/rename/delete, which
 # never touch content — see cowork_tool_fileops.py's READABLE_EXTENSIONS,
-# which deliberately includes .pdf/.docx/.xlsx/.xls/.doc for exactly that
+# which deliberately includes .pdf/.docx/.xlsx/.xls/.pptx for exactly that
 # reason. Don't infer from this set alone that binary files are unsupported
 # sandbox-wide.
 _ALLOWED_WRITE_EXTENSIONS: frozenset[str] = frozenset({
@@ -124,17 +125,281 @@ def _fmt_permissions(mode: int) -> str:
 
 
 # Extensions that require binary parsing rather than UTF-8 text reads
-_BINARY_EXTENSIONS = frozenset({".pdf", ".xlsx", ".xls", ".docx", ".doc"})
+_BINARY_EXTENSIONS = frozenset({".pdf", ".xlsx", ".xls", ".docx", ".pptx"})
+
+# Legacy pre-2007 Office formats (OLE Compound File Binary, not ZIP/XML).
+# python-docx/python-pptx cannot open these at all — deliberately NOT in
+# _BINARY_EXTENSIONS (so they're excluded from READABLE_EXTENSIONS and
+# search_file_contents/read_file won't attempt extraction), but still
+# routed to a clear, explicit error in _read_binary rather than an
+# undocumented library crash if something reaches this function anyway.
+_UNSUPPORTED_LEGACY_BINARY_EXTENSIONS = frozenset({".doc", ".ppt"})
 
 
-def _read_binary(path: Path) -> str:
+# Which structural unit each binary format is addressed by in read_file's
+# start_unit/end_unit — surfaced so callers can build accurate messages
+# ("pages 1-40", "slides 1-12") without hardcoding the mapping themselves.
+BINARY_UNIT_LABELS: dict[str, str] = {
+    ".pdf": "page",
+    ".pptx": "slide",
+    ".xlsx": "sheet",
+    ".xls": "sheet",
+    ".docx": "paragraph",
+}
+
+
+# DOCX: python-docx exposes doc.paragraphs and doc.tables as separate flat
+# lists that do NOT preserve their relative order in the document (a table
+# in the middle of a doc would otherwise get shoved after every paragraph
+# when reconstructing unit order). This walks the real body XML in true
+# document order so paragraph/table units are numbered the way a reader
+# would actually encounter them, and — critically — so table content (e.g.
+# a name list laid out as a table, which doc.paragraphs never sees at all)
+# is actually searchable/readable.
+def _iter_docx_body_units(doc):
     """
-    Extract human-readable text from binary file formats.
-    Dispatches to the appropriate parser based on file extension.
-    Raises ImportError with an install hint if the required library is missing.
-    Raises ValueError for unsupported binary extensions.
+    Yield (kind, unit_obj) for each top-level body paragraph/table, in true
+    document order. kind is "paragraph" or "table"; unit_obj is a
+    docx.text.paragraph.Paragraph or docx.table.Table.
+    """
+    from docx.oxml.ns import qn
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    for child in doc.element.body.iterchildren():
+        if child.tag == qn("w:p"):
+            yield "paragraph", Paragraph(child, doc)
+        elif child.tag == qn("w:tbl"):
+            yield "table", Table(child, doc)
+        # Other body-level elements (sectPr, etc.) carry no readable text
+        # and are intentionally skipped.
+
+
+def _docx_table_text(table) -> str:
+    """Render a docx Table as tab-separated rows, matching the .xlsx/.pptx table convention used elsewhere."""
+    rows = [
+        "\t".join(cell.text.strip() for cell in row.cells)
+        for row in table.rows
+    ]
+    return "[Table]\n" + "\n".join(rows)
+
+
+def _search_binary_units(path: Path, search_regex) -> list[dict]:
+    """
+    Search a binary document's real internal structure for `search_regex`,
+    returning one dict per match:
+        {
+          "unit": int,          # 1-indexed page/slide/sheet/paragraph —
+                                 # the SAME number read_file's start_unit/
+                                 # end_unit expects, so a search hit here
+                                 # can be handed straight to read_file to
+                                 # pull that exact unit back.
+          "unit_label": str,    # "page" / "slide" / "sheet" / "paragraph"
+          "location": str,      # extra format-specific locator (see below)
+          "line_text": str,     # the matching line/cell/paragraph text
+        }
+
+    This is intentionally separate from _read_binary_units (which returns
+    flattened per-unit text for reading) because search benefits from
+    staying close to each format's real structure instead of flattening
+    first — most usefully for .xlsx, where flattening to tab-separated
+    rows loses the cell reference (e.g. "B7") a match came from.
+
+    Per-format `location` detail (only what's genuinely available/cheap —
+    nothing inferred or approximated):
+      .pdf  -> "page N, line L" (L = line number within that page's own
+               extracted text — meaningful within the page, unlike a
+               whole-document line number)
+      .pptx -> "slide N, <part>" where <part> is "text", "table", or
+               "notes" — which part of the slide the match is actually in
+      .xlsx/.xls -> "sheet 'name', cell REF" (e.g. "sheet 'Q3', cell B7")
+      .docx -> "paragraph N" (no finer locator exists within one
+               paragraph's flat text)
+
+    Raises the same ImportError/ValueError as _read_binary_units for
+    missing packages / unsupported extensions.
     """
     ext = path.suffix.lower()
+
+    if ext in _UNSUPPORTED_LEGACY_BINARY_EXTENSIONS:
+        modern_ext = ".docx" if ext == ".doc" else ".pptx"
+        raise ValueError(
+            f"'{ext}' is the legacy pre-2007 Office format and isn't "
+            f"supported — only the modern '{modern_ext}' format can be "
+            f"read. Re-save the file as {modern_ext} (e.g. via 'Save As' "
+            "in Word/PowerPoint) and try again."
+        )
+
+    matches: list[dict] = []
+
+    if ext == ".pdf":
+        if importlib.util.find_spec("pypdf") is None:
+            raise ImportError("pip install pypdf")
+        from pypdf import PdfReader
+
+        reader = PdfReader(path)
+        for i, page in enumerate(reader.pages):
+            page_text = page.extract_text() or ""
+            if not page_text.strip():
+                continue
+            for j, line in enumerate(page_text.splitlines()):
+                if search_regex.search(line):
+                    matches.append({
+                        "unit": i + 1,
+                        "unit_label": "page",
+                        "location": f"page {i+1}, line {j+1}",
+                        "line_text": line.strip(),
+                    })
+        return matches
+
+    if ext in {".xlsx", ".xls"}:
+        if importlib.util.find_spec("openpyxl") is None:
+            raise ImportError("pip install openpyxl")
+        import openpyxl
+
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        for sheet_idx, name in enumerate(wb.sheetnames):
+            ws = wb[name]
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.value is None:
+                        continue
+                    value_str = str(cell.value)
+                    if search_regex.search(value_str):
+                        matches.append({
+                            "unit": sheet_idx + 1,
+                            "unit_label": "sheet",
+                            "location": f"sheet '{name}', cell {cell.coordinate}",
+                            "line_text": value_str.strip(),
+                        })
+        wb.close()
+        return matches
+
+    if ext == ".docx":
+        if importlib.util.find_spec("docx") is None:
+            raise ImportError("pip install python-docx")
+        from docx import Document
+
+        doc = Document(path)
+        for i, (kind, unit_obj) in enumerate(_iter_docx_body_units(doc)):
+            unit_num = i + 1
+            if kind == "paragraph":
+                if unit_obj.text.strip() and search_regex.search(unit_obj.text):
+                    matches.append({
+                        "unit": unit_num,
+                        "unit_label": "paragraph",
+                        "location": f"paragraph {unit_num}",
+                        "line_text": unit_obj.text.strip(),
+                    })
+            else:  # kind == "table"
+                for r_idx, row in enumerate(unit_obj.rows):
+                    for c_idx, cell in enumerate(row.cells):
+                        if cell.text.strip() and search_regex.search(cell.text):
+                            matches.append({
+                                "unit": unit_num,
+                                "unit_label": "paragraph",
+                                "location": f"table at unit {unit_num}, row {r_idx+1}, col {c_idx+1}",
+                                "line_text": cell.text.strip(),
+                            })
+        return matches
+
+    if ext == ".pptx":
+        if importlib.util.find_spec("pptx") is None:
+            raise ImportError("pip install python-pptx")
+        from pptx import Presentation
+
+        prs = Presentation(path)
+        for i, slide in enumerate(prs.slides):
+            # Text frames — titles, body placeholders, free text boxes.
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    for p in shape.text_frame.paragraphs:
+                        if p.text.strip() and search_regex.search(p.text):
+                            matches.append({
+                                "unit": i + 1,
+                                "unit_label": "slide",
+                                "location": f"slide {i+1}, text",
+                                "line_text": p.text.strip(),
+                            })
+
+                # Tables — cell by cell.
+                if shape.has_table:
+                    for row in shape.table.rows:
+                        for cell in row.cells:
+                            if cell.text.strip() and search_regex.search(cell.text):
+                                matches.append({
+                                    "unit": i + 1,
+                                    "unit_label": "slide",
+                                    "location": f"slide {i+1}, table",
+                                    "line_text": cell.text.strip(),
+                                })
+
+            # Speaker notes.
+            if slide.has_notes_slide:
+                notes_text = (slide.notes_slide.notes_text_frame.text or "")
+                if notes_text.strip() and search_regex.search(notes_text):
+                    for line in notes_text.splitlines():
+                        if line.strip() and search_regex.search(line):
+                            matches.append({
+                                "unit": i + 1,
+                                "unit_label": "slide",
+                                "location": f"slide {i+1}, notes",
+                                "line_text": line.strip(),
+                            })
+        return matches
+
+    raise ValueError(
+        f"No binary reader available for '{ext}'. "
+        "For plain text files this tool reads UTF-8 directly. "
+        "For other binary formats, a dedicated tool may be needed."
+    )
+
+
+def _read_binary_units(path: Path) -> list[str]:
+    """
+    Extract each binary document's content as a list of independently
+    addressable units — one string per unit, in document order, each
+    already carrying its own header (e.g. "[Page 3]\\n...", "[Slide 12]\\n...").
+
+    This is the shared extraction core behind both _read_binary (full read
+    — joins every unit) and ranged binary reads (slices a start/end window
+    of units) in read_file, so both code paths always agree on where a
+    unit begins and ends — a targeted read can never split a slide, page,
+    sheet, or paragraph-block in half.
+
+    Unit meaning per format (dictated by what each format's own document
+    model actually exposes — not arbitrary):
+      .pdf  -> one unit per page (PDF's native structural unit)
+      .pptx -> one unit per slide (PPTX's native structural unit)
+      .xlsx/.xls -> one unit per sheet (workbook's native structural unit)
+      .docx -> one unit per paragraph. DOCX has no page concept in the
+               XML (pagination is computed at render time by Word, not
+               stored), and python-docx's `sections` don't expose which
+               paragraphs belong to which section — so paragraph index is
+               the finest stable, addressable unit actually available.
+
+    Only pages/slides/sheets/paragraphs with non-empty text produce a
+    unit — this matches _read_binary's existing full-read behavior of
+    skipping blank pages/slides, so unit numbering (e.g. "[Page 3]") is
+    unaffected by this refactor.
+
+    Empty pdf form-field data is intentionally NOT its own unit (it's
+    sandbox metadata, not page content) — _read_binary appends it once,
+    after all page units, to preserve the exact prior full-read output.
+
+    Raises ImportError with an install hint if the required library is
+    missing. Raises ValueError for unsupported binary extensions.
+    """
+    ext = path.suffix.lower()
+
+    if ext in _UNSUPPORTED_LEGACY_BINARY_EXTENSIONS:
+        modern_ext = ".docx" if ext == ".doc" else ".pptx"
+        raise ValueError(
+            f"'{ext}' is the legacy pre-2007 Office format and isn't "
+            f"supported — only the modern '{modern_ext}' format can be "
+            f"read. Re-save the file as {modern_ext} (e.g. via 'Save As' "
+            "in Word/PowerPoint) and try again."
+        )
 
     if ext == ".pdf":
         if importlib.util.find_spec("pypdf") is None:
@@ -143,15 +408,117 @@ def _read_binary(path: Path) -> str:
         from pypdf import PdfReader
 
         reader = PdfReader(path)
-        text_output = ""
-
-        # 1. Extract text page by page
+        units = []
         for i, page in enumerate(reader.pages):
             page_text = page.extract_text() or ""
             if page_text.strip():
-                text_output += f"[Page {i+1}]\n{page_text.strip()}\n\n"
+                units.append(f"[Page {i+1}]\n{page_text.strip()}")
+        return units
 
-        # 2. Extract form fields (AcroForm)
+    if ext in {".xlsx", ".xls"}:
+        if importlib.util.find_spec("openpyxl") is None:
+            raise ImportError("pip install openpyxl")
+        import openpyxl
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        units = []
+        for name in wb.sheetnames:
+            ws = wb[name]
+            rows = [
+                "\t".join("" if cell.value is None else str(cell.value) for cell in row)
+                for row in ws.iter_rows()
+            ]
+            units.append(f"[Sheet: {name}]\n" + "\n".join(rows))
+        wb.close()
+        return units
+
+    if ext == ".docx":
+        if importlib.util.find_spec("docx") is None:
+            raise ImportError("pip install python-docx")
+        from docx import Document
+        doc = Document(path)
+        units = []
+        for i, (kind, unit_obj) in enumerate(_iter_docx_body_units(doc)):
+            unit_num = i + 1
+            if kind == "paragraph":
+                if unit_obj.text.strip():
+                    units.append(f"[Paragraph {unit_num}]\n{unit_obj.text.strip()}")
+            else:  # kind == "table"
+                rows = [
+                    "\t".join(cell.text.strip() for cell in row.cells)
+                    for row in unit_obj.rows
+                ]
+                rows_text = "\n".join(rows).strip()
+                if rows_text:
+                    units.append(f"[Unit {unit_num} — Table]\n{rows_text}")
+        return units
+
+    if ext == ".pptx":
+        if importlib.util.find_spec("pptx") is None:
+            raise ImportError("pip install python-pptx")
+        from pptx import Presentation
+
+        prs = Presentation(path)
+        units = []
+
+        for i, slide in enumerate(prs.slides):
+            parts = []
+
+            # 1. Text frames (titles + body placeholders + free text boxes),
+            #    in shape order — cheap: no OCR, no embedded-chart parsing.
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    text = "\n".join(
+                        p.text for p in shape.text_frame.paragraphs if p.text.strip()
+                    )
+                    if text.strip():
+                        parts.append(text.strip())
+
+                # 2. Tables — cell text only, row by row, tab-separated to
+                #    match the .xlsx sheet convention used above.
+                if shape.has_table:
+                    rows = [
+                        "\t".join(cell.text.strip() for cell in row.cells)
+                        for row in shape.table.rows
+                    ]
+                    parts.append("[Table]\n" + "\n".join(rows))
+
+            # 3. Speaker notes, if present.
+            if slide.has_notes_slide:
+                notes_text = (slide.notes_slide.notes_text_frame.text or "").strip()
+                if notes_text:
+                    parts.append(f"[Notes]\n{notes_text}")
+
+            if parts:
+                units.append(f"[Slide {i+1}]\n" + "\n\n".join(parts))
+
+        return units
+
+    raise ValueError(
+        f"No binary reader available for '{ext}'. "
+        "For plain text files this tool reads UTF-8 directly. "
+        "For other binary formats, a dedicated tool may be needed."
+    )
+
+
+def _read_binary(path: Path) -> str:
+    """
+    Extract human-readable text from binary file formats, as one string
+    (all units joined in document order). For PDFs, also appends any
+    AcroForm field values as a trailing block, matching this function's
+    long-standing full-read output.
+
+    Dispatches to the appropriate parser based on file extension.
+    Raises ImportError with an install hint if the required library is missing.
+    Raises ValueError for unsupported binary extensions.
+    """
+    ext = path.suffix.lower()
+    units = _read_binary_units(path)
+    text_output = "\n\n".join(units)
+
+    if ext == ".pdf":
+        from pypdf import PdfReader
+
+        reader = PdfReader(path)
         try:
             fields = reader.get_fields()
             if fields:
@@ -161,43 +528,14 @@ def _read_binary(path: Path) -> str:
                     if value is not None:
                         field_lines.append(f"{name}: {value}")
                     else:
-                        # Optional: show field name even if empty
                         field_lines.append(f"{name}: [empty]")
                 if field_lines:
-                    text_output += "[Form Field Values]\n" + "\n".join(field_lines)
+                    sep = "\n\n" if text_output else ""
+                    text_output += sep + "[Form Field Values]\n" + "\n".join(field_lines)
         except Exception as e:
             text_output += f"\n[Form Field Extraction Failed: {e}]"
 
-        return text_output.strip()
-
-    if ext in {".xlsx", ".xls"}:
-        if importlib.util.find_spec("openpyxl") is None:
-            raise ImportError("pip install openpyxl")
-        import openpyxl
-        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-        sheets = []
-        for name in wb.sheetnames:
-            ws = wb[name]
-            rows = [
-                "\t".join("" if cell.value is None else str(cell.value) for cell in row)
-                for row in ws.iter_rows()
-            ]
-            sheets.append(f"[Sheet: {name}]\n" + "\n".join(rows))
-        wb.close()
-        return "\n\n".join(sheets)
-
-    if ext in {".docx", ".doc"}:
-        if importlib.util.find_spec("docx") is None:
-            raise ImportError("pip install python-docx")
-        from docx import Document
-        doc = Document(path)
-        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-
-    raise ValueError(
-        f"No binary reader available for '{ext}'. "
-        "For plain text files this tool reads UTF-8 directly. "
-        "For other binary formats, a dedicated tool may be needed."
-    )
+    return text_output.strip()
 
 
 def _list_directory_entries(target: Path, path_label: str) -> str:
@@ -292,6 +630,9 @@ MANAGEABLE_ONLY_EXTENSIONS: frozenset[str] = frozenset({
     ".zip", ".tar", ".gz", ".tgz", ".rar", ".7z", ".bz2",
     # Packages / installers / misc binaries
     ".apk", ".ipa", ".exe", ".dmg", ".msi", ".bin", ".iso",
+    # Legacy pre-2007 Office formats — movable/copyable/deletable, but no
+    # content parser exists (see _UNSUPPORTED_LEGACY_BINARY_EXTENSIONS).
+    ".doc", ".ppt",
 })
 
 # What copy_file / move_file / rename_file / delete_file are allowed to

@@ -17,6 +17,9 @@ from langchain_core.tools import tool
 from Cowork.cowork_helpers import (
     _safe_path,
     _read_binary,
+    _read_binary_units,
+    _search_binary_units,
+    BINARY_UNIT_LABELS,
     _get_sandbox_root,
     _is_skipped,
     _list_directory_entries,
@@ -54,31 +57,69 @@ def search_index(query: str) -> str:
 
 
 @tool
-def read_file(path: str, start_line: int = 0, end_line: int = 0) -> str:
+def read_file(
+    path: str,
+    start_line: int = 0,
+    end_line: int = 0,
+    start_unit: int = 0,
+    end_unit: int = 0,
+) -> str:
     """
-    Read a file as plain text, in full or by line range.
+    Read a file as plain text, in full or by a targeted range.
 
-    start_line/end_line=0 (default): full file. Otherwise: that 1-indexed,
-    inclusive line range, numbered, max 500 lines/call — text files only;
-    binary documents always return in full regardless of range.
+    Text files (.txt .md .py .json .csv .yaml .html etc. — raw UTF-8):
+    use start_line/end_line, 1-indexed inclusive, numbered, max 500
+    lines/call. 0/0 (default): full file.
 
-    Handles text (.txt .md .py .json .csv .yaml .html etc. — raw UTF-8) and
-    binary documents (.pdf per-page as [Page N], .docx paragraphs in order,
-    .xlsx/.xls per-sheet tab-separated as [Sheet: name]).
+    Binary documents (.pdf, .docx, .xlsx/.xls, .pptx): use start_unit/
+    end_unit instead — line numbers don't mean anything in these formats.
+    A "unit" is each format's own natural structural division, so a
+    targeted read always returns whole, uncut units:
+        .pdf  -> page       (e.g. start_unit=12, end_unit=15 = pages 12-15)
+        .pptx -> slide       (e.g. start_unit=30, end_unit=30 = slide 30 alone)
+        .xlsx/.xls -> sheet  (1-indexed by sheet order, not by name)
+        .docx -> paragraph   (DOCX has no page concept in its file format)
+    1-indexed inclusive, max 50 units/call. 0/0 (default): full document.
+    Extraction detail per format: .pdf per-page as [Page N] (plus a
+    trailing form-field block on a full read), .docx as [Paragraph N],
+    .xlsx/.xls per-sheet tab-separated as [Sheet: name], .pptx per-slide
+    as [Slide N] with text, tables, and speaker notes.
+
+    Only one range mechanism may be used per call, matching the file's
+    own type — don't pass start_line/end_line for a binary document or
+    start_unit/end_unit for a text file.
 
     Args:
         path:       Relative path to the file.
-        start_line: First line to read (1-indexed). 0 for a full read.
-        end_line:   Last line to read (inclusive). 0 for a full read.
+        start_line: Text files only — first line to read (1-indexed). 0 for a full read.
+        end_line:   Text files only — last line to read (inclusive). 0 for a full read.
+        start_unit: Binary documents only — first page/slide/sheet/paragraph (1-indexed). 0 for a full read.
+        end_unit:   Binary documents only — last page/slide/sheet/paragraph (inclusive). 0 for a full read.
     """
-    ranged = start_line > 0 or end_line > 0
-    if ranged:
+    line_ranged = start_line > 0 or end_line > 0
+    unit_ranged = start_unit > 0 or end_unit > 0
+
+    if line_ranged and unit_ranged:
+        return (
+            "Error: pass either start_line/end_line or start_unit/end_unit, "
+            "not both — they address different file types."
+        )
+
+    if line_ranged:
         if start_line < 1:
             return "Error: start_line must be >= 1."
         if end_line < start_line:
             return "Error: end_line must be >= start_line."
         if end_line - start_line > 500:
             return "Error: Cannot read more than 500 lines at once. Narrow your range."
+
+    if unit_ranged:
+        if start_unit < 1:
+            return "Error: start_unit must be >= 1."
+        if end_unit < start_unit:
+            return "Error: end_unit must be >= start_unit."
+        if end_unit - start_unit > 50:
+            return "Error: Cannot read more than 50 units at once. Narrow your range."
 
     try:
         file_path = _safe_path(path)
@@ -90,15 +131,35 @@ def read_file(path: str, start_line: int = 0, end_line: int = 0) -> str:
     if not file_path.is_file():
         return f"'{path}' is a directory, not a file."
 
-    is_binary = file_path.suffix.lower() in _BINARY_EXTENSIONS
+    suffix = file_path.suffix.lower()
+    if suffix in {".doc", ".ppt"}:
+        modern_ext = ".docx" if suffix == ".doc" else ".pptx"
+        return (
+            f"'{path}' is the legacy pre-2007 Office format ('{suffix}') and "
+            f"isn't supported — only the modern '{modern_ext}' format can be "
+            f"read. Re-save the file as {modern_ext} (e.g. via 'Save As' in "
+            "Word/PowerPoint) and try again."
+        )
 
-    if ranged:
-        if is_binary:
-            return (
-                f"'{path}' is a binary document ({file_path.suffix}). "
-                "Ranged reads only work on text files — call read_file(path) "
-                "without start_line/end_line to get its full extracted text."
-            )
+    is_binary = suffix in _BINARY_EXTENSIONS
+
+    if line_ranged and is_binary:
+        unit_label = BINARY_UNIT_LABELS.get(suffix, "unit")
+        return (
+            f"'{path}' is a binary document ({file_path.suffix}). "
+            f"start_line/end_line only work on text files — use "
+            f"start_unit/end_unit instead, which for this format means "
+            f"{unit_label} number."
+        )
+
+    if unit_ranged and not is_binary:
+        return (
+            f"'{path}' is a text file. start_unit/end_unit only work on "
+            "binary documents (.pdf/.docx/.xlsx/.pptx) — use start_line/"
+            "end_line instead."
+        )
+
+    if line_ranged:
         try:
             all_lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
         except Exception as e:
@@ -114,6 +175,27 @@ def read_file(path: str, start_line: int = 0, end_line: int = 0) -> str:
         numbered = "".join(f"{start_line + i:>6}  {line}" for i, line in enumerate(selected))
         header = f"[{path} | lines {start_line}–{actual_end} of {total}]\n"
         return header + numbered
+
+    if unit_ranged:
+        unit_label = BINARY_UNIT_LABELS.get(suffix, "unit")
+        try:
+            units = _read_binary_units(file_path)
+        except ImportError as e:
+            return f"Cannot read '{path}': missing required package — {e}"
+        except Exception as e:
+            return f"Could not extract text from '{path}': {e}"
+
+        total = len(units)
+        if total == 0:
+            return f"'{path}' has no extractable {unit_label}s (it may be empty or unparseable)."
+        if start_unit > total:
+            return f"'{path}' only has {total} {unit_label}(s). start_unit={start_unit} is out of range."
+
+        actual_end = min(end_unit, total)
+        selected = units[start_unit - 1 : actual_end]
+
+        header = f"[{path} | {unit_label}s {start_unit}–{actual_end} of {total}]\n"
+        return header + "\n\n".join(selected)
 
     # Full read
     if is_binary:
@@ -609,7 +691,21 @@ def search_file_contents(
 ) -> str:
     """
     Grep-equivalent literal/regex search inside file content, under `path`
-    — plain text/code directly, plus PDF/docx/xlsx via text extraction.
+    — plain text/code directly by line, plus PDF/docx/xlsx/pptx by
+    searching each format's real structure (pages/slides/sheets/
+    paragraphs) rather than a flattened blob.
+
+    For binary matches, results report the page/slide/sheet/paragraph
+    number the match was found in (plus, where the format supports it, a
+    finer locator — an in-page line, which slide part, or an exact cell
+    reference). That unit number is exactly what read_file's start_unit/
+    end_unit expects, so the intended flow is: search here first to find
+    which page/slide/sheet/paragraph has the evidence, then call
+    read_file(path, start_unit=N, end_unit=N) to pull just that unit's
+    full content — never the whole document. context_lines has no effect
+    on binary matches (there's no meaningful "line before/after" across a
+    page/slide/sheet/paragraph boundary); pull the surrounding unit via
+    read_file instead if more context is needed.
 
     Scope this tightly: pass the narrowest `path` and `includes` the
     evidence supports, rather than searching the whole tree with a wide
@@ -626,7 +722,7 @@ def search_file_contents(
         path:           Directory to search under (relative or absolute). Defaults to ".".
         regex:          If True, `pattern` is treated as a regular expression.
         case_sensitive: If False (default), performs case-insensitive matching.
-        context_lines:  Lines of context above/below each match (default 0, max 4).
+        context_lines:  Lines of context above/below each match (default 0, max 4). Text files only — no effect on binary documents.
         match_per_line: If True (default), returns matching lines and line numbers.
                         If False, returns only matching file paths (like git grep -l) — cheaper,
                         prefer this to locate candidate files before requesting line content.
@@ -714,11 +810,45 @@ def search_file_contents(
         if not _should_include(rel_str):
             continue
 
+        # ── Binary documents: search real structure (page/slide/sheet/
+        #    paragraph), not a flattened line number — this is what keeps
+        #    results in sync with read_file's start_unit/end_unit, which
+        #    addresses the same page/slide/sheet/paragraph numbering.
+        if ext in _BINARY_EXTENSIONS:
+            try:
+                unit_matches = _search_binary_units(file_path, search_regex)
+            except Exception:
+                files_skipped.append(rel_str)
+                continue
+
+            files_scanned += 1
+            for m in unit_matches:
+                if len(matches) >= max_results:
+                    break
+
+                matching_files.add(rel_str)
+
+                if not match_per_line:
+                    if rel_str not in matches:
+                        matches.append(rel_str)
+                    break
+
+                if return_json:
+                    matches.append({
+                        "Filename": rel_str,
+                        "Unit": m["unit"],
+                        "UnitLabel": m["unit_label"],
+                        "Location": m["location"],
+                        "LineContent": m["line_text"],
+                    })
+                else:
+                    matches.append(f"[{rel_str} | {m['location']}]  {m['line_text']}")
+
+            continue
+
+        # ── Text files: unchanged line-based search.
         try:
-            if ext in _BINARY_EXTENSIONS:
-                text = _read_binary(file_path)
-            else:
-                text = file_path.read_text(encoding="utf-8", errors="replace")
+            text = file_path.read_text(encoding="utf-8", errors="replace")
         except Exception:
             files_skipped.append(rel_str)
             continue
@@ -827,7 +957,12 @@ TOOL_STATUS_MAP = {
         f"Reading lines {args.get('start_line')}–{args.get('end_line')} of "
         f"[white]'{args.get('path')}'[/white]"
         if args.get("start_line") or args.get("end_line")
-        else f"Reading file [white]'{args.get('path')}'[/white]"
+        else (
+            f"Reading units {args.get('start_unit')}–{args.get('end_unit')} of "
+            f"[white]'{args.get('path')}'[/white]"
+            if args.get("start_unit") or args.get("end_unit")
+            else f"Reading file [white]'{args.get('path')}'[/white]"
+        )
     ),
     "write_file": lambda args: (
         f"Creating [white]'{args.get('path')}'[/white]"
