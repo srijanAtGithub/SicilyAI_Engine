@@ -16,8 +16,7 @@ never open or interpret content — file type is not a blocker for them.
 delete_directory has no extension gate at all.
 
 run_file_command is a single validated command tool (not a shell escape
-hatch) replacing separate copy/move/rename/mkdir tools — see its docstring
-for the exact contract.
+hatch) covering copy/move/rename/mkdir — see its docstring for scope.
 
 Safety: every path goes through _safe_path(). Destructive ops move to
 .sicily-trash/ rather than unlinking. Destructive/overwriting ops default
@@ -121,26 +120,34 @@ def _move_to_trash(target: Path) -> Path:
 # COPY / MOVE / RENAME — via a single validated CLI-command tool
 # ---------------------------------------------------------------------------
 
-# Flags each executable is allowed to use. Anything not listed here is
-# rejected before the command ever runs — this is the whole point of the
-# validator: the model cannot "invent" a plausible-looking flag (e.g. `-r`
-# on cp, `--force`) and have it silently reach a real subprocess.
+# Executables this tool will ever run, and the flags each may take.
+# Anything not listed here — unknown executables, unknown flags, or
+# anything requiring shell features — is rejected before a subprocess
+# ever starts.
 _ALLOWED_FLAGS = {
-    "cp": {"-n"},      # -n: no-clobber (never overwrite silently) — the
-                       #     only flag exposed; there is no -f, no -r
-                       #     (directories go through delete_directory,
-                       #     not this tool).
-    "mv": {"-n"},      # -n: no-clobber. Same rationale as cp.
-    "mkdir": {"-p"},   # -p: create intermediate parents. This is also the
-                       #     ALWAYS-ON behavior (see below) — accepted so a
-                       #     model-written `mkdir -p ...` isn't rejected,
-                       #     but a bare `mkdir dir` behaves identically.
+    "cp": {"-n", "-r"},
+    "mv": {"-n"},
+    "mkdir": {"-p"},
 }
 
-# Number of required positional path arguments per executable.
-_POSITIONAL_COUNTS = {"cp": 2, "mv": 2, "mkdir": 1}
-
 _ALLOWED_EXECUTABLES = frozenset(_ALLOWED_FLAGS.keys())
+
+# Executables/keywords that must never reach this tool, checked explicitly
+# so a rejection names the real reason ("that's a shell/programming/VCS/
+# package/privilege command") instead of a generic "not allowed". Not
+# exhaustive by design — _ALLOWED_EXECUTABLES is the actual allowlist and
+# is what's enforced; this set only makes common bad attempts easier to
+# explain. Covers both Unix and Windows spellings.
+_EXPLICITLY_BLOCKED = frozenset({
+    "rm", "rmdir", "del", "erase", "rd",
+    "python", "python3", "py", "node", "ruby", "perl", "php",
+    "git", "svn", "hg",
+    "npm", "npx", "pip", "pip3", "yarn", "pnpm", "cargo", "gem",
+    "sudo", "su", "chmod", "chown", "runas",
+    "sh", "bash", "zsh", "powershell", "pwsh", "cmd", "cmd.exe",
+    "curl", "wget", "ssh", "scp", "nc", "netcat",
+    "eval", "exec",
+})
 
 
 class _CommandValidationError(ValueError):
@@ -154,8 +161,11 @@ def _validate_fileops_command(command: str) -> tuple[str, list[Path], list[str]]
     """
     Parse and validate a `cp`/`mv`/`mkdir` command string against the
     contract in run_file_command's docstring. Returns (executable,
-    resolved_paths, flags) on success — resolved_paths is [src, dst] for
-    cp/mv or [target] for mkdir. Raises _CommandValidationError otherwise.
+    resolved_paths, flags) on success:
+      - cp/mv: resolved_paths is [src1, src2, ..., dst] (2+ items —
+        one or more sources, last item is the destination).
+      - mkdir: resolved_paths is [path1, path2, ...] (1+ items).
+    Raises _CommandValidationError otherwise.
 
     Uses shlex.split (no shell=True, no /bin/sh) — no pipes, redirects,
     globs, or chaining possible.
@@ -169,6 +179,17 @@ def _validate_fileops_command(command: str) -> tuple[str, list[Path], list[str]]
         raise _CommandValidationError("Empty command.")
 
     executable = tokens[0]
+    # Normalize away path prefixes / .exe so "/bin/rm" or "python3.exe"
+    # still match the blocklist.
+    executable_name = Path(executable).stem.lower()
+
+    if executable_name in _EXPLICITLY_BLOCKED:
+        raise _CommandValidationError(
+            f"Refused: '{executable}' is a shell, scripting, VCS, package-"
+            "manager, or privilege-escalation command. run_file_command "
+            "only runs cp, mv, or mkdir."
+        )
+
     if executable not in _ALLOWED_EXECUTABLES:
         raise _CommandValidationError(
             f"Refused: '{executable}' is not an allowed command. "
@@ -192,22 +213,21 @@ def _validate_fileops_command(command: str) -> tuple[str, list[Path], list[str]]
             f"'{executable}'. Only {sorted(allowed_flags)} are permitted."
         )
 
-    expected = _POSITIONAL_COUNTS[executable]
-    if len(positionals) != expected:
-        noun = "path argument" if expected == 1 else "path arguments (source, destination)"
+    min_positionals = 1 if executable == "mkdir" else 2
+    if len(positionals) < min_positionals:
+        noun = "path argument" if executable == "mkdir" else "path arguments (at least one source plus a destination)"
         raise _CommandValidationError(
-            f"Refused: expected exactly {expected} {noun} for "
-            f"'{executable}', got {len(positionals)}: {positionals}. "
-            "No globs, no multi-destination forms."
+            f"Refused: expected at least {min_positionals} {noun} for "
+            f"'{executable}', got {len(positionals)}: {positionals}."
         )
 
-    for label, raw in zip(("source", "destination") if expected == 2 else ("path",), positionals):
+    for raw in positionals:
         if any(ch in raw for ch in "*?[]"):
             raise _CommandValidationError(
-                f"Refused: {label} '{raw}' contains a glob character "
+                f"Refused: path '{raw}' contains a glob character "
                 "(*, ?, [, ]). There is no shell here to expand globs — "
                 "they would be treated as a literal, nonexistent filename. "
-                "Pass one exact path instead."
+                "List each exact path as its own argument instead."
             )
 
     try:
@@ -221,58 +241,27 @@ def _validate_fileops_command(command: str) -> tuple[str, list[Path], list[str]]
 @tool
 def run_file_command(command: str) -> str:
     """
-    Copy, move, rename, or create a directory by running a validated `cp`,
-    `mv`, or `mkdir` command. This is the ONLY way to do these things in
-    this sandbox — it replaces the old copy_file/move_file/rename_file/
-    make_directory tools. Renaming is just `mv <old-path> <new-path-same-
-    folder>`; there is no separate verb for it.
+    Run a copy, move/rename, or create-directory command inside the
+    sandbox: `cp`, `mv`, or `mkdir`. Use this whenever the task is to
+    duplicate, relocate, rename, or organize files and folders.
 
-    This is NOT a general shell tool. Only these exact forms are accepted:
+    Handles single or multiple files, single or multiple folders (copied/
+    moved recursively), and multiple destinations for mkdir — same as the
+    real commands: `cp a.txt b.txt dest/` (2 sources -> a directory),
+    `cp -r folder1 folder2 archive/`, `mkdir a b c`. mkdir also accepts a
+    single path. Renaming is `mv <old> <new>` in the same folder.
 
-        cp [-n] <source> <destination>
-        mv [-n] <source> <destination>
-        mkdir [-p] <path>
-
-    Hard contract (violating ANY of these gets the command rejected before
-    anything runs — no partial execution, no fallback interpretation):
-      - The executable must be exactly "cp", "mv", or "mkdir". Nothing
-        else — not "cp -r", not "rsync", not "rm", not any pipe/redirect/
-        chain (`|`, `>`, `;`, `&&`, backticks, etc.).
-      - cp/mv accept only `-n` (no-clobber). mkdir accepts only `-p`
-        (create missing parents — already the default behavior, see
-        below). Any other flag (`-r`, `-f`, `-v`, `--force`) is refused.
-        cp/mv have no recursive/directory form — directories other than
-        via mkdir are out of scope for this tool.
-      - cp/mv take exactly two path arguments (source, destination); mkdir
-        takes exactly one. No globs (`*.txt`), no multiple sources.
-      - Every path must resolve inside the sandbox (same _safe_path()
-        check every other tool in this module uses); for cp/mv the source
-        file's extension must be in MANAGEABLE_EXTENSIONS.
-      - cp/mv without `-n`: an existing destination file is refused rather
-        than silently overwritten. mkdir is always idempotent — an
-        already-existing directory at that path is a no-op success either
-        way, and missing intermediate parents are always created, whether
-        or not `-p` is passed.
-
-    If you're unsure whether a command you're about to write is valid,
-    write the simplest possible form — `cp source.txt dest.txt`,
-    `mv old/path.pdf new/path.pdf`, or `mkdir reports/q3` — rather than
-    guessing at flags. An invalid command is rejected with a clear reason
-    and nothing happens; it never partially runs.
-
-    cp/mv work on ANY file this sandbox can manage — plain text,
-    PDF/DOCX/XLSX, and also images, video, audio, archives (.zip/.tar), and
-    APKs. They move raw bytes and never parse or interpret content, so file
-    type is never a blocker. (The agent still cannot read or extract text
-    from an image/zip/video via this tool — only relocate/duplicate it.
-    Don't infer readability from copyability.)
+    This is not a general shell — only `cp`, `mv`, `mkdir` are supported,
+    no flags beyond `-n`/`-r`/`-p`, no globs (list exact paths instead of
+    `*.txt`), no piping or chaining. Every path must resolve inside the
+    sandbox.
 
     Args:
-        command: A single `cp`, `mv`, or `mkdir` invocation as a plain
-                 string, e.g. "cp reports/draft.md reports/draft-backup.md",
-                 "mv photo.jpg archive/2026/photo.jpg", or
-                 "mkdir reports/q3". `-n`/`-p` are accepted but rarely
-                 needed — their behavior is already the default.
+        command: A single cp/mv/mkdir invocation, e.g.
+                 "cp reports/draft.md reports/draft-backup.md",
+                 "cp report.pdf photo.jpg archive/2026/",
+                 "mv -r old_project new_project",
+                 "mkdir reports/q3 reports/q4".
     """
     try:
         executable, paths, flags = _validate_fileops_command(command)
@@ -280,62 +269,92 @@ def run_file_command(command: str) -> str:
         return str(e)
 
     root = get_sandbox_root()
+    no_clobber = "-n" in flags
 
     if executable == "mkdir":
-        target = paths[0]
-        if target.is_file():
+        results = []
+        for target in paths:
+            if target.is_file():
+                results.append(f"'{target.relative_to(root)}': refused — already exists as a file.")
+                continue
+            if target.is_dir():
+                results.append(f"'{target.relative_to(root)}': already exists — nothing to do.")
+                continue
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+                results.append(f"'{target.relative_to(root)}': created.")
+            except Exception as e:
+                results.append(f"'{target.relative_to(root)}': could not create — {e}.")
+        return "\n".join(results)
+
+    # cp / mv — one or more sources, last positional is the destination.
+    *sources, dst = paths
+    multi_source = len(sources) > 1
+
+    # With 2+ sources, the destination must be a directory (create it if
+    # it doesn't exist yet, same as real cp/mv). With exactly 1 source,
+    # dst may be either a directory (item goes inside it) or a new path
+    # (item is placed/renamed at that exact path).
+    if multi_source:
+        if dst.exists() and not dst.is_dir():
             return (
-                f"Refused: '{target.relative_to(root)}' already exists as "
-                "a file. Cannot create a directory at that path."
+                f"Refused: with multiple sources the destination "
+                f"'{dst.relative_to(root)}' must be a directory."
             )
-        if target.is_dir():
-            return f"Directory '{target.relative_to(root)}' already exists — nothing to do."
         try:
-            target.mkdir(parents=True, exist_ok=True)
+            dst.mkdir(parents=True, exist_ok=True)
         except Exception as e:
-            return f"Could not create directory '{target.relative_to(root)}': {e}"
-        return f"Directory '{target.relative_to(root)}' created."
+            return f"Could not create destination directory '{dst.relative_to(root)}': {e}"
 
-    # cp / mv
-    src, dst = paths
+    results = []
+    for src in sources:
+        if not src.exists():
+            results.append(f"'{src.name}': source does not exist.")
+            continue
 
-    if not src.exists():
-        return f"Source '{src.name}' does not exist."
-    if not src.is_file():
-        return (
-            f"Source resolves to a directory. run_file_command only "
-            "handles single files for cp/mv, not directories."
-        )
+        is_dir = src.is_dir()
+        if is_dir and executable == "cp" and "-r" not in flags:
+            results.append(
+                f"'{src.relative_to(root)}': is a directory — pass -r to copy it "
+                "(e.g. \"cp -r folder dest\")."
+            )
+            continue
+        if not is_dir:
+            ext = src.suffix.lower()
+            if ext not in MANAGEABLE_EXTENSIONS:
+                results.append(f"'{src.relative_to(root)}': refused — '{ext}' is not a manageable file type.")
+                continue
 
-    ext = src.suffix.lower()
-    if ext not in MANAGEABLE_EXTENSIONS:
-        return (
-            f"Refused: '{ext}' is not currently a manageable file type in "
-            "this sandbox."
-        )
+        # Resolve final destination path for this item.
+        item_dst = (dst / src.name) if (multi_source or dst.is_dir()) else dst
 
-    if dst.is_dir():
-        return "Refused: destination is an existing directory, not a file path."
-    if dst.exists():
-        return (
-            f"Refused: destination already exists. Pass -n explicitly if "
-            "you intend to no-clobber-refuse (same result), or choose a "
-            "different destination path — this tool never overwrites."
-        )
+        if item_dst.exists():
+            if no_clobber:
+                results.append(f"'{src.relative_to(root)}': skipped (destination exists, -n set).")
+                continue
+            results.append(
+                f"'{src.relative_to(root)}': refused — destination "
+                f"'{item_dst.relative_to(root)}' already exists (this tool never overwrites)."
+            )
+            continue
 
-    src_rel = src.relative_to(root)
-    dst_rel = dst.relative_to(root)
+        src_rel = src.relative_to(root)
+        try:
+            item_dst.parent.mkdir(parents=True, exist_ok=True)
+            if executable == "cp":
+                if is_dir:
+                    shutil.copytree(str(src), str(item_dst))
+                    results.append(f"Copied '{src_rel}' -> '{item_dst.relative_to(root)}' (directory).")
+                else:
+                    shutil.copy2(str(src), str(item_dst))
+                    results.append(f"Copied '{src_rel}' -> '{item_dst.relative_to(root)}' ({item_dst.stat().st_size:,} bytes).")
+            else:  # mv
+                shutil.move(str(src), str(item_dst))
+                results.append(f"Moved '{src_rel}' -> '{item_dst.relative_to(root)}'.")
+        except Exception as e:
+            results.append(f"'{src_rel}': could not {executable} — {e}")
 
-    try:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if executable == "cp":
-            shutil.copy2(str(src), str(dst))
-            return f"Copied '{src_rel}' -> '{dst_rel}' ({dst.stat().st_size:,} bytes)."
-        else:  # mv
-            shutil.move(str(src), str(dst))
-            return f"Moved '{src_rel}' -> '{dst_rel}'."
-    except Exception as e:
-        return f"Could not run '{command}': {e}"
+    return "\n".join(results)
 
 
 # ---------------------------------------------------------------------------
@@ -510,6 +529,17 @@ def find_files_by_name(path: str, pattern: str, exclude_patterns: list[str] = []
     return f"Found {len(matches)} match(es):\n" + "\n".join(matches)
 
 
+# Hard server-side ceilings — independent of whatever the caller passes.
+# These exist because an unscoped search_file_contents call (broad path,
+# no includes, high max_results) can otherwise walk and return a large
+# fraction of a monorepo in one call. Args are clamped, not rejected, so
+# a call never fails — it just can't blow the budget.
+_MAX_RESULTS_CEILING = 40
+_MAX_FILES_SCANNED = 400          # stop walking after this many readable files, matches or not
+_MAX_CONTEXT_LINES = 4
+_MAX_OUTPUT_CHARS = 6_000         # hard cap on the returned string; truncated with a note past this
+
+
 @tool
 def search_file_contents(
     pattern: str,
@@ -519,23 +549,35 @@ def search_file_contents(
     context_lines: int = 0,
     match_per_line: bool = True,
     includes: Optional[List[str]] = None,
-    max_results: int = 50,
+    max_results: int = 20,
     return_json: bool = False,
 ) -> str:
     """
     Grep-equivalent literal/regex search inside file content, under `path`
     — plain text/code directly, plus PDF/docx/xlsx via text extraction.
 
+    Scope this tightly: pass the narrowest `path` and `includes` the
+    evidence supports, rather than searching the whole tree with a wide
+    alternation pattern. Results, files scanned, and context are all
+    capped server-side (max_results<=40, ~400 files walked, context<=4
+    lines, output truncated past ~6000 chars) — an unscoped call will be
+    clamped and truncated rather than returning everything, so a narrow
+    query is the only way to get complete results back. If a first
+    targeted search comes up empty, widen path/pattern deliberately on
+    the next call rather than starting broad.
+
     Args:
         pattern:        Text or regex pattern to search for.
         path:           Directory to search under (relative or absolute). Defaults to ".".
         regex:          If True, `pattern` is treated as a regular expression.
         case_sensitive: If False (default), performs case-insensitive matching.
-        context_lines:  Lines of context above/below each match (default 0).
+        context_lines:  Lines of context above/below each match (default 0, max 4).
         match_per_line: If True (default), returns matching lines and line numbers.
-                        If False, returns only matching file paths (like git grep -l).
+                        If False, returns only matching file paths (like git grep -l) — cheaper,
+                        prefer this to locate candidate files before requesting line content.
         includes:       Optional list of glob patterns to filter files (e.g. ["*.py", "!**/node_modules/*"]).
-        max_results:    Stop after this many matches (default 50).
+                        Strongly recommended whenever you have any hint about file type or area.
+        max_results:    Stop after this many matches (default 20, hard cap 40).
         return_json:    If True, outputs raw JSON objects like grep_search API.
     """
     try:
@@ -547,6 +589,11 @@ def search_file_contents(
         return f"'{path}' does not exist."
     if not start.is_dir():
         return f"'{path}' is a file, not a directory. Pass a directory to search."
+
+    # Clamp caller-supplied limits to server-side ceilings rather than
+    # trusting them — this is what actually bounds worst-case cost.
+    max_results = max(1, min(max_results, _MAX_RESULTS_CEILING))
+    context_lines = max(0, min(context_lines, _MAX_CONTEXT_LINES))
 
     # Compile regex pattern
     flags = 0 if case_sensitive else re.IGNORECASE
@@ -560,6 +607,7 @@ def search_file_contents(
     matching_files = set()
     files_scanned = 0
     files_skipped = []
+    scan_capped = False
 
     # Common directory excludes to keep search fast
     DEFAULT_IGNORE_DIRS = SKIP_DIRS
@@ -594,6 +642,9 @@ def search_file_contents(
 
     for file_path in _iter_files(start):
         if len(matches) >= max_results:
+            break
+        if files_scanned >= _MAX_FILES_SCANNED:
+            scan_capped = True
             break
 
         ext = file_path.suffix.lower()
@@ -658,22 +709,33 @@ def search_file_contents(
         f"Searched for {'regex' if regex else 'literal'} pattern '{pattern}' "
         f"({'case-sensitive' if case_sensitive else 'case-insensitive'}) under '{path}'"
     )
+    cap_note = (
+        f" (stopped after scanning {_MAX_FILES_SCANNED} files — narrow `path`/`includes` "
+        "to search the rest)" if scan_capped else ""
+    )
 
     if not matches:
         note = f" ({len(files_skipped)} file(s) could not be read)" if files_skipped else ""
         return (
             f"{search_desc}\n"
-            f"No matches across {files_scanned} readable file(s){note}."
+            f"No matches across {files_scanned} readable file(s){note}{cap_note}."
         )
 
     if return_json:
-        return json.dumps(matches, indent=2)
+        out = json.dumps(matches, indent=2)
+        if len(out) > _MAX_OUTPUT_CHARS:
+            out = out[:_MAX_OUTPUT_CHARS] + f"\n... [truncated at {_MAX_OUTPUT_CHARS} chars — narrow the query for full results]"
+        return out
 
-    header = f"{search_desc}\nFound {len(matches)} match(es) across {len(matching_files)} file(s) ({files_scanned} scanned)"
+    header = f"{search_desc}\nFound {len(matches)} match(es) across {len(matching_files)} file(s) ({files_scanned} scanned{cap_note})"
     if len(matches) >= max_results:
         header += f" (capped at max_results={max_results})"
-    
-    return header + ":\n\n" + "\n\n".join(matches)
+
+    body = "\n\n".join(matches)
+    if len(body) > _MAX_OUTPUT_CHARS:
+        body = body[:_MAX_OUTPUT_CHARS] + f"\n... [truncated at {_MAX_OUTPUT_CHARS} chars — narrow `path`/`includes`/`pattern` for full results]"
+
+    return header + ":\n\n" + body
 
 
 FILEOPS_TOOLS = [
