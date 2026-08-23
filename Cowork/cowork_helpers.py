@@ -1210,3 +1210,20 @@ def _validate_fileops_command(command: str) -> tuple[str, list[Path], list[str]]
         raise CommandValidationError(str(e))
 
     return executable, resolved, flags
+
+
+# SPINNER STATUS MESSAGES
+def _fmt_delete_path_arg(path) -> str:
+    """
+    Render delete_path's `path` arg (a single string OR a list, since
+    batch delete support was added) as a clean status-line fragment.
+    A bare f-string interpolation of a list renders its raw Python repr
+    (e.g. "'['a.txt', 'b.md']'") — this keeps the display readable and
+    truncates long batches instead of dumping every path inline.
+    """
+    if isinstance(path, list):
+        shown = ", ".join(f"[white]'{p}'[/white]" for p in path[:3])
+        if len(path) > 3:
+            shown += f", and {len(path) - 3} more"
+        return shown
+    return f"[white]'{path}'[/white]"
