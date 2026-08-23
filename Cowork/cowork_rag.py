@@ -89,8 +89,8 @@ CHROMA_QUERY_BATCH_SIZE = 200
 INDEXABLE_EXTENSIONS: frozenset[str] = frozenset({
     # Plain documents / notes
     ".txt", ".md", ".markdown", ".rst", ".org", ".tex",
-    # General data / logs (not project source)
-    ".csv", ".tsv", ".log",
+    # General data (not project source)
+    ".csv", ".tsv",
     # Binary formats with text extractors
     ".pdf", ".docx", ".doc", ".xlsx", ".xls",
 })

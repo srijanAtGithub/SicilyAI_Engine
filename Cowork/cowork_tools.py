@@ -11,12 +11,15 @@ import shutil
 from pathlib import Path
 import json
 import fnmatch
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from langchain_core.tools import tool
 from Cowork.cowork_helpers import (
     _safe_path,
     _read_binary,
+    _read_binary_units,
+    _search_binary_units,
+    BINARY_UNIT_LABELS,
     _get_sandbox_root,
     _is_skipped,
     _list_directory_entries,
@@ -29,8 +32,24 @@ from Cowork.cowork_helpers import (
     MANAGEABLE_EXTENSIONS,
     TRASH_DIR_NAME,
     READABLE_EXTENSIONS,
-    CommandValidationError
+    CommandValidationError,
+    build_binary_file,
+    _format_script_library_status,
+    _fmt_delete_path_arg,
 )
+
+
+# Caps on read_file's UNRANGED ("full read") path — the one a model falls
+# into by omitting start_line/end_line/start_unit/end_unit entirely. This
+# is the actual risk surface for cost/latency: a targeted range is already
+# capped (500 lines / 50 units, enforced above), but nothing previously
+# stopped an unranged call from returning an entire 300-page PDF or
+# 500-slide deck in one shot. These constants are that backstop — past
+# them, a full read auto-downgrades to a preview + explicit paging
+# instruction instead of dumping everything.
+_FULL_READ_MAX_LINES = 500     # text files
+_FULL_READ_MAX_UNITS = 20      # binary documents (pages/slides/sheets/paragraphs)
+_FULL_READ_PREVIEW_UNITS = 3   # units shown in the preview when capped
 
 
 # READ-ONLY TOOLS
@@ -41,9 +60,20 @@ def search_index(query: str) -> str:
     .xlsx, .py, .json, .csv, and more). Returns top matching snippets with
     file path and position.
 
+    Prefer this over read_file for "find X in this document" on any file
+    you haven't already confirmed is short — it returns only the relevant
+    snippets instead of a full read, at a fraction of the token cost, and
+    works even when you don't know which page/slide/sheet the answer is
+    on. Use read_file instead when you already know the exact unit/line
+    range you need, or need the full unmodified text of a short file.
+
     Args:
         query: Plain-language description of what you're looking for,
                e.g. "quarterly budget figures".
+
+    Returns:
+        Formatted top-matching snippets with file path and position, or
+        a message that the index has no relevant matches.
     """
     from Cowork.cowork_rag import get_rag   # adjust import path to match your project
     rag = get_rag()
@@ -54,31 +84,79 @@ def search_index(query: str) -> str:
 
 
 @tool
-def read_file(path: str, start_line: int = 0, end_line: int = 0) -> str:
+def read_file(
+    path: str,
+    start_line: int = 0,
+    end_line: int = 0,
+    start_unit: int = 0,
+    end_unit: int = 0,
+) -> str:
     """
-    Read a file as plain text, in full or by line range.
+    Read a file as plain text, in full or by a targeted range.
 
-    start_line/end_line=0 (default): full file. Otherwise: that 1-indexed,
-    inclusive line range, numbered, max 500 lines/call — text files only;
-    binary documents always return in full regardless of range.
+    Text files: use start_line/end_line, 1-indexed inclusive, max 500
+    lines/call.
 
-    Handles text (.txt .md .py .json .csv .yaml .html etc. — raw UTF-8) and
-    binary documents (.pdf per-page as [Page N], .docx paragraphs in order,
-    .xlsx/.xls per-sheet tab-separated as [Sheet: name]).
+    Binary documents (.pdf/.docx/.xlsx/.xls/.pptx): use start_unit/
+    end_unit instead — line numbers don't apply. A unit is the format's
+    own structural division: .pdf=page, .pptx=slide, .xlsx/.xls=sheet
+    (by order, not name), .docx=paragraph (no page concept in the file
+    format). 1-indexed inclusive, max 50 units/call. Extraction per
+    format: .pdf per-page (plus trailing form fields on a full read),
+    .docx per-paragraph, .xlsx/.xls per-sheet tab-separated, .pptx
+    per-slide with text/tables/notes.
+
+    Use one mechanism matching the file's type, not both.
+
+    0/0 on both (default) = full file/document — but only up to
+    500 lines / 20 units. Past that, you get a preview (first 3 units, or
+    the text-file equivalent) plus the true total, not the whole thing —
+    large files must be paged with start_unit/end_unit (or start_line/
+    end_line) instead of read in one call. Check the header on any full
+    read: it states the true total, so if it's larger than what a preview
+    would show, switch to a ranged call. For "find X in this document"
+    without knowing which page/slide it's on, prefer search_index — it's
+    cheaper and works regardless of document length.
 
     Args:
         path:       Relative path to the file.
-        start_line: First line to read (1-indexed). 0 for a full read.
-        end_line:   Last line to read (inclusive). 0 for a full read.
+        start_line: Text files only — first line (1-indexed). 0 for full/preview.
+        end_line:   Text files only — last line (inclusive). 0 for full/preview.
+        start_unit: Binary documents only — first page/slide/sheet/paragraph (1-indexed). 0 for full/preview.
+        end_unit:   Binary documents only — last page/slide/sheet/paragraph (inclusive). 0 for full/preview.
+
+    Returns:
+        A header line stating what was read and the true total ("lines
+        1–500 of 3200" or "pages 1–3 of 340 (PREVIEW — capped; use
+        start_unit/end_unit to page through the rest)"), followed by the
+        content. On error: a plain-text explanation (bad range, wrong
+        mechanism for this file type, file not found, unsupported/legacy
+        format, missing package) — never raises.
     """
-    ranged = start_line > 0 or end_line > 0
-    if ranged:
+    line_ranged = start_line > 0 or end_line > 0
+    unit_ranged = start_unit > 0 or end_unit > 0
+
+    if line_ranged and unit_ranged:
+        return (
+            "Error: pass either start_line/end_line or start_unit/end_unit, "
+            "not both — they address different file types."
+        )
+
+    if line_ranged:
         if start_line < 1:
             return "Error: start_line must be >= 1."
         if end_line < start_line:
             return "Error: end_line must be >= start_line."
         if end_line - start_line > 500:
             return "Error: Cannot read more than 500 lines at once. Narrow your range."
+
+    if unit_ranged:
+        if start_unit < 1:
+            return "Error: start_unit must be >= 1."
+        if end_unit < start_unit:
+            return "Error: end_unit must be >= start_unit."
+        if end_unit - start_unit > 50:
+            return "Error: Cannot read more than 50 units at once. Narrow your range."
 
     try:
         file_path = _safe_path(path)
@@ -90,15 +168,35 @@ def read_file(path: str, start_line: int = 0, end_line: int = 0) -> str:
     if not file_path.is_file():
         return f"'{path}' is a directory, not a file."
 
-    is_binary = file_path.suffix.lower() in _BINARY_EXTENSIONS
+    suffix = file_path.suffix.lower()
+    if suffix in {".doc", ".ppt"}:
+        modern_ext = ".docx" if suffix == ".doc" else ".pptx"
+        return (
+            f"'{path}' is the legacy pre-2007 Office format ('{suffix}') and "
+            f"isn't supported — only the modern '{modern_ext}' format can be "
+            f"read. Re-save the file as {modern_ext} (e.g. via 'Save As' in "
+            "Word/PowerPoint) and try again."
+        )
 
-    if ranged:
-        if is_binary:
-            return (
-                f"'{path}' is a binary document ({file_path.suffix}). "
-                "Ranged reads only work on text files — call read_file(path) "
-                "without start_line/end_line to get its full extracted text."
-            )
+    is_binary = suffix in _BINARY_EXTENSIONS
+
+    if line_ranged and is_binary:
+        unit_label = BINARY_UNIT_LABELS.get(suffix, "unit")
+        return (
+            f"'{path}' is a binary document ({file_path.suffix}). "
+            f"start_line/end_line only work on text files — use "
+            f"start_unit/end_unit instead, which for this format means "
+            f"{unit_label} number."
+        )
+
+    if unit_ranged and not is_binary:
+        return (
+            f"'{path}' is a text file. start_unit/end_unit only work on "
+            "binary documents (.pdf/.docx/.xlsx/.pptx) — use start_line/"
+            "end_line instead."
+        )
+
+    if line_ranged:
         try:
             all_lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
         except Exception as e:
@@ -115,26 +213,127 @@ def read_file(path: str, start_line: int = 0, end_line: int = 0) -> str:
         header = f"[{path} | lines {start_line}–{actual_end} of {total}]\n"
         return header + numbered
 
-    # Full read
+    if unit_ranged:
+        unit_label = BINARY_UNIT_LABELS.get(suffix, "unit")
+        try:
+            units = _read_binary_units(file_path)
+        except ImportError as e:
+            return f"Cannot read '{path}': missing required package — {e}"
+        except Exception as e:
+            return f"Could not extract text from '{path}': {e}"
+
+        total = len(units)
+        if total == 0:
+            return f"'{path}' has no extractable {unit_label}s (it may be empty or unparseable)."
+        if start_unit > total:
+            return f"'{path}' only has {total} {unit_label}(s). start_unit={start_unit} is out of range."
+
+        actual_end = min(end_unit, total)
+        selected = units[start_unit - 1 : actual_end]
+
+        header = f"[{path} | {unit_label}s {start_unit}–{actual_end} of {total}]\n"
+        return header + "\n\n".join(selected)
+
+    # ── Unranged ("full read") path — the one a model falls into by
+    # omitting every range argument. This is the actual cost/latency risk
+    # for large documents, so it is capped the same way a ranged call
+    # would be, rather than ever returning an entire large document in one
+    # response. Small files (the common case) are completely unaffected —
+    # this only changes behavior once a file exceeds the cap.
     if is_binary:
+        unit_label = BINARY_UNIT_LABELS.get(suffix, "unit")
+        try:
+            units = _read_binary_units(file_path)
+        except ImportError as e:
+            return f"Cannot read '{path}': missing required package — {e}"
+        except Exception as e:
+            return f"Could not extract text from '{path}': {e}"
+
+        total = len(units)
+        if total == 0:
+            return f"'{path}' has no extractable {unit_label}s (it may be empty or unparseable)."
+
+        if total > _FULL_READ_MAX_UNITS:
+            preview = units[:_FULL_READ_PREVIEW_UNITS]
+            header = (
+                f"[{path} | {unit_label}s 1–{_FULL_READ_PREVIEW_UNITS} of {total} "
+                f"— PREVIEW, full document too large for one read. Use "
+                f"start_unit/end_unit (max 50 {unit_label}s/call) to page "
+                f"through the rest, or search_index/search_file_contents "
+                "to jump straight to relevant content.]\n"
+            )
+            return header + "\n\n".join(preview)
+
+        # Under the cap — safe to return the full document. Goes through
+        # _read_binary (not just "\n\n".join(units)) so PDFs still get
+        # their trailing form-field block, matching pre-cap behavior
+        # exactly for every file this cap doesn't affect.
         try:
             content = _read_binary(file_path)
         except ImportError as e:
             return f"Cannot read '{path}': missing required package — {e}"
         except Exception as e:
             return f"Could not extract text from '{path}': {e}"
+
+        header = f"[{path} | full document, {total} {unit_label}s]\n"
+        return header + content
+
     else:
         try:
             content = file_path.read_text(encoding="utf-8", errors="replace")
         except Exception as e:
             return f"Could not read '{path}': {e}"
 
-    total_lines = len(content.splitlines())
-    header = f"[{path} | full file, {total_lines} lines]\n"
-    return header + content
+        all_lines = content.splitlines(keepends=True)
+        total = len(all_lines)
+
+        if total > _FULL_READ_MAX_LINES:
+            preview_lines = all_lines[:_FULL_READ_MAX_LINES]
+            numbered = "".join(f"{i + 1:>6}  {line}" for i, line in enumerate(preview_lines))
+            header = (
+                f"[{path} | lines 1–{_FULL_READ_MAX_LINES} of {total} — "
+                f"PREVIEW, full file too large for one read. Use "
+                f"start_line/end_line (max 500 lines/call) to page through "
+                "the rest, or search_index/search_file_contents to jump "
+                "straight to relevant content.]\n"
+            )
+            return header + numbered
+
+        header = f"[{path} | full file, {total} lines]\n"
+        return header + content
 
 
 # WRITE TOOLS
+@tool
+def check_binary_write_libraries() -> str:
+    """
+    Report which Python libraries (and pandoc) are actually importable in
+    THIS sandbox right now, for building .docx/.pptx/.xlsx/.xls/.pdf files
+    via write_file's binary-script mode.
+
+    Call this ONCE, before writing your first binary-build script this
+    session — it tells you which library to reach for without guessing or
+    discovering a missing import from a failed run. The result is valid
+    for the rest of the session (nothing installs/uninstalls itself
+    mid-session), so there's no need to call this again per file.
+
+    Takes no arguments and does not touch the filesystem.
+    """
+    lines = ["Library availability for binary file creation in this sandbox:\n"]
+    for ext in (".docx", ".pptx", ".xlsx", ".xls", ".pdf"):
+        lines.append(f"{ext}:")
+        lines.append(_format_script_library_status(ext))
+        lines.append("")
+    lines.append(
+        "Any library shown as NOT available can still be installed from "
+        "inside your build script (e.g. `subprocess.check_call([sys.executable, "
+        "'-m', 'pip', 'install', 'PACKAGE', '--break-system-packages'])` "
+        "before importing it) — but preferring an already-available library "
+        "avoids that extra install step and its runtime cost."
+    )
+    return "\n".join(lines)
+
+
 @tool
 def write_file(
     path: str,
@@ -146,31 +345,60 @@ def write_file(
     dry_run: bool = True,
 ) -> str:
     """
-    Create a new text file, or replace a line range in an existing one.
+    Create a new file, or replace a line range in an existing text file.
 
     mode="create" (default): writes `content` to `path`; refuses if the
     path already exists. Parent dirs auto-created when create_parents=True.
 
     mode="edit": replaces lines [start_line, end_line] (1-indexed,
     inclusive) with `content` ("" to delete the range); file must already
-    exist. dry_run=True (default) previews as a diff; dry_run=False applies.
+    exist. dry_run=True (default) previews as a diff; dry_run=False
+    applies. Text extensions only — not supported for .docx/.xlsx/.pptx/
+    .pdf.
 
-    Text-based extensions only (code, config, docs, csv/tsv/log, etc. — not
-    binary formats like .pdf/.docx/.xlsx).
+    --- Binary formats (.docx, .xlsx, .xls, .pptx, .pdf) ---
+
+    mode="create" only. `content` is not written verbatim — it must be a
+    full standalone Python 3 script that builds the file, using whatever
+    library and structure you choose. Two hard requirements, everything
+    else is free:
+      1. The script's working directory contains nothing else — don't
+         read/reference any other path.
+      2. Save the result to exactly this filename (relative, no folders):
+           .docx -> "__cowork_output__.docx"   .xlsx -> "__cowork_output__.xlsx"
+           .pptx -> "__cowork_output__.pptx"   .xls  -> "__cowork_output__.xls"
+           .pdf  -> "__cowork_output__.pdf"
+    That file is validated by opening it with the matching reader library
+    (python-docx/python-pptx/openpyxl/pypdf), then copied to `path`. If
+    the script errors, times out, produces no file, or produces one that
+    fails to open, nothing is written to the sandbox — the error explains
+    which, with the script's own stderr or the reader's parse error; fix
+    and call write_file again.
+
+    Call check_binary_write_libraries() once per session, before your
+    first binary build, to see which libraries are actually importable
+    here.
 
     Args:
         path:           Relative path to the file.
-        content:        For mode="create": the full file content. For
-                        mode="edit": the replacement text for the line
-                        range (pass "" to delete the range).
-        mode:           "create" for a new file, "edit" to replace lines in
-                        an existing file.
+        content:        mode="create" + text extension: full file content, written verbatim.
+                        mode="create" + binary extension: a Python build script (see above).
+                        mode="edit": replacement text for the line range ("" to delete it).
+        mode:           "create" or "edit".
         start_line:     mode="edit" only — first line to replace (1-indexed).
         end_line:       mode="edit" only — last line to replace (inclusive).
-        create_parents: mode="create" only — auto-create missing parent
-                        directories (default True).
-        dry_run:        mode="edit" only — if True (default), preview
-                        without writing.
+        create_parents: mode="create" only — auto-create missing parent dirs (default True).
+        dry_run:        mode="edit" only — True (default) previews without writing.
+
+    Returns:
+        Success: "Created '{path}'.\\nSize: N bytes" (text writes also
+        append "| Encoding: utf-8"). mode="edit" success: a diff preview
+        (dry_run=True) or confirmation of applied lines (dry_run=False).
+        Failure: a plain-text explanation of exactly what went wrong —
+        already-exists, missing extension, disallowed extension, missing
+        parent dir, or (binary only) the build script's stderr or the
+        reader library's validation error. Never raises; always returns
+        a string either way.
     """
     if mode not in ("create", "edit"):
         return f"Error: mode must be 'create' or 'edit', got '{mode}'."
@@ -194,6 +422,40 @@ def write_file(
                 f"Refused: '{path}' has no file extension. "
                 "Please include one (e.g. report.md, config.yaml)."
             )
+
+        if ext in _BINARY_EXTENSIONS:
+            parent = target.parent
+            if not parent.exists():
+                if not create_parents:
+                    rel_parent = parent.relative_to(_get_sandbox_root())
+                    return (
+                        f"Error: parent directory '{rel_parent}' does not exist. "
+                        "Pass create_parents=True to create it automatically, "
+                        "or use run_file_command('mkdir ...') first."
+                    )
+                try:
+                    parent.mkdir(parents=True, exist_ok=True)
+                except Exception as e:
+                    return f"Could not create parent directories for '{path}': {e}"
+
+            if not content.strip():
+                status = _format_script_library_status(ext)
+                return (
+                    f"Refused: '{path}' is a '{ext}' file, which requires "
+                    f"`content` to be a Python script that builds it (see "
+                    f"write_file's docstring). Library availability in this "
+                    f"sandbox:\n{status}"
+                )
+
+            try:
+                size = build_binary_file(target, ext, content)
+            except ValueError as e:
+                return str(e)
+            except Exception as e:
+                return f"Could not build '{path}': {e}"
+
+            return f"Created '{path}'.\nSize: {size:,} bytes"
+
         if ext not in _ALLOWED_WRITE_EXTENSIONS:
             allowed_str = "  " + "\n  ".join(sorted(_ALLOWED_WRITE_EXTENSIONS))
             return (
@@ -434,106 +696,156 @@ def run_file_command(command: str) -> str:
 # ---------------------------------------------------------------------------
 
 @tool
-def delete_file(path: str, dry_run: bool = True) -> str:
+def delete_path(
+    path: Union[str, List[str]],
+    recursive: bool = False,
+    dry_run: bool = True,
+) -> str:
     """
-    Delete a file — soft delete, moved to .sicily-trash/, never unlinked.
-    Works on any manageable file type (not just text/PDF/docx/xlsx).
-    dry_run=True (default) previews only; dry_run=False applies.
+    Delete one or more files/directories — soft delete, moved to
+    .sicily-trash/, never unlinked. `path` may be a single string or a
+    list; files and directories can be freely mixed in one call.
+
+    Every path is validated independently: must exist, files must be a
+    manageable type, non-empty directories need recursive=True, sandbox
+    root is always refused. Any single failure refuses the ENTIRE
+    batch — never a partial delete — with the specific reason per failing
+    path.
+
+    dry_run=True (default) previews every path's effect without deleting
+    anything; dry_run=False applies the whole validated batch at once. No
+    cap on batch size.
 
     Args:
-        path:    Relative path to the file to delete.
-        dry_run: If True (default), preview only.
+        path:      A single path, or a list of paths, to delete.
+        recursive: Must be True if ANY directory in the batch is non-empty.
+                   Ignored for files.
+        dry_run:   If True (default), preview only — nothing is deleted.
+
+    Returns:
+        dry_run=True: "[DRY RUN — nothing deleted]" + per-path preview
+        and counts. dry_run=False success: per-path confirmation with
+        each new trash location. Any validation failure: a report naming
+        each failing path and its reason — nothing deleted in this case.
     """
-    try:
-        target = _safe_path(path)
-    except PermissionError as e:
-        return str(e)
+    paths = [path] if isinstance(path, str) else list(path)
 
-    if not target.exists():
-        return f"'{path}' does not exist."
-    if not target.is_file():
-        return f"'{path}' is a directory. Use delete_directory instead."
+    if not paths:
+        return "Error: no path(s) provided."
 
-    ext = target.suffix.lower()
-    if ext not in MANAGEABLE_EXTENSIONS:
-        return (
-            f"Refused: '{ext}' is not currently a manageable file type in "
-            "this sandbox."
+    root = _get_sandbox_root()
+
+    # ── Pass 1: validate every path independently, collect outcomes.
+    # Nothing is deleted in this pass — this is pure inspection, so a
+    # failing item never prevents us from also reporting on the others.
+    resolved = []       # list of dicts describing each valid, ready-to-delete item
+    problems = []        # list of "path: reason" strings for anything that failed
+
+    for p in paths:
+        try:
+            target = _safe_path(p)
+        except PermissionError as e:
+            problems.append(f"'{p}': {e}")
+            continue
+
+        if not target.exists():
+            problems.append(f"'{p}': does not exist.")
+            continue
+
+        if target.is_file():
+            ext = target.suffix.lower()
+            if ext not in MANAGEABLE_EXTENSIONS:
+                problems.append(
+                    f"'{p}': '{ext}' is not currently a manageable file type."
+                )
+                continue
+            resolved.append({"path": p, "target": target, "kind": "file"})
+            continue
+
+        # target.is_dir()
+        if target == root:
+            problems.append(f"'{p}': cannot delete the sandbox root itself.")
+            continue
+
+        contents = list(target.rglob("*"))
+        file_count = sum(1 for c in contents if c.is_file())
+        dir_count = sum(1 for c in contents if c.is_dir())
+
+        if contents and not recursive:
+            problems.append(
+                f"'{p}': not empty ({file_count} file(s), {dir_count} "
+                "subfolder(s)) — pass recursive=True to confirm deleting it all."
+            )
+            continue
+
+        resolved.append({
+            "path": p, "target": target, "kind": "dir",
+            "contents": contents, "file_count": file_count, "dir_count": dir_count,
+        })
+
+    # ── All-or-nothing gate: any failure refuses the ENTIRE batch, so a
+    # destructive call never partially applies. Every failure is reported
+    # together, not just the first, so one retry can fix them all.
+    if problems:
+        header = (
+            f"Refused: {len(problems)} of {len(paths)} path(s) failed "
+            "validation — nothing was deleted.\n\n"
         )
+        body = "\n".join(f"  - {p}" for p in problems)
+        footer = (
+            "\n\nFix the issue(s) above (or pass recursive=True if any are "
+            "non-empty directories you intend to delete entirely) and call "
+            "again with the full corrected list."
+        )
+        return header + body + footer
 
+    # ── All paths valid. dry_run: preview the whole batch, delete nothing.
     if dry_run:
-        return (
-            f"[DRY RUN — nothing deleted]\n"
-            f"Would move '{path}' to {TRASH_DIR_NAME}/.\n"
-            "Call again with dry_run=False to apply."
-        )
+        lines = [f"[DRY RUN — nothing deleted, {len(resolved)} path(s) validated]\n"]
+        for item in resolved:
+            if item["kind"] == "file":
+                lines.append(f"  FILE  '{item['path']}' -> {TRASH_DIR_NAME}/")
+            else:
+                preview = "\n".join(
+                    f"      - {c.relative_to(root)}" for c in item["contents"][:10]
+                )
+                more = (
+                    f"\n      ... and {len(item['contents']) - 10} more"
+                    if len(item["contents"]) > 10 else ""
+                )
+                lines.append(
+                    f"  DIR   '{item['path']}' -> {TRASH_DIR_NAME}/ "
+                    f"({item['file_count']} file(s), {item['dir_count']} subfolder(s))"
+                    + (f"\n{preview}{more}" if item["contents"] else "")
+                )
+        lines.append("\nCall again with dry_run=False to apply.")
+        return "\n".join(lines)
 
-    try:
-        trashed = _move_to_trash(target)
-    except Exception as e:
-        return f"Could not delete '{path}': {e}"
+    # ── Apply the entire validated batch.
+    results = []
+    for item in resolved:
+        try:
+            trashed = _move_to_trash(item["target"])
+        except Exception as e:
+            # A failure here is a filesystem-level surprise happening
+            # AFTER validation passed (e.g. permissions changed, disk
+            # error) — surface it per-item rather than silently stopping,
+            # since prior items in this loop may already be trashed.
+            results.append(f"  FAILED '{item['path']}': {e}")
+            continue
 
-    rel_trashed = trashed.relative_to(_get_sandbox_root())
-    return f"Deleted '{path}' (moved to '{rel_trashed}')."
+        rel_trashed = trashed.relative_to(root)
+        if item["kind"] == "file":
+            results.append(f"  Deleted '{item['path']}' -> '{rel_trashed}'")
+        else:
+            results.append(
+                f"  Deleted '{item['path']}' and its contents "
+                f"({item['file_count']} file(s), {item['dir_count']} "
+                f"subfolder(s)) -> '{rel_trashed}'"
+            )
 
-
-@tool
-def delete_directory(path: str, recursive: bool = False, dry_run: bool = True) -> str:
-    """
-    Delete a directory — soft delete, moved to .sicily-trash/, not unlinked.
-    Refuses on a non-empty directory unless recursive=True. dry_run=True
-    (default) previews contents and effect; dry_run=False applies.
-
-    Args:
-        path:      Relative path to the directory to delete.
-        recursive: Must be True to delete a non-empty directory.
-        dry_run:   If True (default), preview only.
-    """
-    try:
-        target = _safe_path(path)
-    except PermissionError as e:
-        return str(e)
-
-    if not target.exists():
-        return f"'{path}' does not exist."
-    if not target.is_dir():
-        return f"'{path}' is a file. Use delete_file instead."
-    if target == _get_sandbox_root():
-        return "Refused: cannot delete the sandbox root itself."
-
-    contents = list(target.rglob("*"))
-    file_count = sum(1 for p in contents if p.is_file())
-    dir_count = sum(1 for p in contents if p.is_dir())
-
-    if contents and not recursive:
-        return (
-            f"Refused: '{path}' is not empty "
-            f"({file_count} file(s), {dir_count} subfolder(s)). "
-            "Pass recursive=True to confirm you want to delete it all."
-        )
-
-    if dry_run:
-        root = _get_sandbox_root()
-        preview = "\n".join(f"  - {p.relative_to(root)}" for p in contents[:30])
-        more = f"\n  ... and {len(contents) - 30} more" if len(contents) > 30 else ""
-        return (
-            f"[DRY RUN — nothing deleted]\n"
-            f"Would move '{path}' and its contents "
-            f"({file_count} file(s), {dir_count} subfolder(s)) to {TRASH_DIR_NAME}/.\n\n"
-            f"{preview}{more}\n\n"
-            "Call again with dry_run=False to apply."
-        )
-
-    try:
-        trashed = _move_to_trash(target)
-    except Exception as e:
-        return f"Could not delete '{path}': {e}"
-
-    rel_trashed = trashed.relative_to(_get_sandbox_root())
-    return (
-        f"Deleted '{path}' and its contents "
-        f"({file_count} file(s), {dir_count} subfolder(s)) — moved to '{rel_trashed}'."
-    )
+    header = f"Deleted {len(resolved)} path(s):\n\n"
+    return header + "\n".join(results)
 
 
 # ---------------------------------------------------------------------------
@@ -622,32 +934,53 @@ def search_file_contents(
     return_json: bool = False,
 ) -> str:
     """
-    Grep-equivalent literal/regex search inside file content, under `path`
-    — plain text/code directly, plus PDF/docx/xlsx via text extraction.
+    Grep-equivalent literal/regex search inside file content under `path`
+    — plain text/code by line; PDF/docx/xlsx/pptx by real structure
+    (page/slide/sheet/paragraph) instead of a flattened blob. `path` may
+    be a single file OR a directory — a single file searches only that
+    file (nothing else in its folder is touched); a directory recurses.
 
-    Scope this tightly: pass the narrowest `path` and `includes` the
-    evidence supports, rather than searching the whole tree with a wide
-    alternation pattern. Results, files scanned, and context are all
-    capped server-side (max_results<=40, ~400 files walked, context<=4
-    lines, output truncated past ~6000 chars) — an unscoped call will be
-    clamped and truncated rather than returning everything, so a narrow
-    query is the only way to get complete results back. If a first
-    targeted search comes up empty, widen path/pattern deliberately on
-    the next call rather than starting broad.
+    Binary matches report a unit number (page/slide/sheet/paragraph) plus
+    a finer locator where the format supports one (in-page line, slide
+    part, or cell reference). That unit number is what read_file's
+    start_unit/end_unit takes — workflow is: search here to find which
+    unit has the evidence, then read_file(path, start_unit=N, end_unit=N)
+    for that unit's full content, not the whole document. context_lines
+    is text-files-only; for binary matches, get context via read_file.
+
+    If you already know or suspect the specific file, pass that file
+    directly as `path` — don't pass its parent directory, which would
+    also search every other file there. Pass a directory only when
+    searching across multiple files or you don't yet know which one has
+    it. Server-side caps apply regardless of arguments passed: max_results
+    <=40, ~400 files walked (directory mode only), context_lines<=4,
+    output truncated ~6000 chars — an unscoped call gets clamped/
+    truncated, not a full result, so narrowing the query is the only way
+    to get everything back.
 
     Args:
         pattern:        Text or regex pattern to search for.
-        path:           Directory to search under (relative or absolute). Defaults to ".".
-        regex:          If True, `pattern` is treated as a regular expression.
-        case_sensitive: If False (default), performs case-insensitive matching.
-        context_lines:  Lines of context above/below each match (default 0, max 4).
-        match_per_line: If True (default), returns matching lines and line numbers.
-                        If False, returns only matching file paths (like git grep -l) — cheaper,
-                        prefer this to locate candidate files before requesting line content.
-        includes:       Optional list of glob patterns to filter files (e.g. ["*.py", "!**/node_modules/*"]).
-                        Strongly recommended whenever you have any hint about file type or area.
+        path:           A single file to search, or a directory to search recursively. Defaults to ".".
+        regex:          If True, `pattern` is a regular expression.
+        case_sensitive: Default False.
+        context_lines:  Lines of context per match (default 0, max 4). Text files only.
+        match_per_line: True (default): matching lines + line numbers.
+                        False: matching file paths only (git grep -l) — cheaper, use to
+                        locate candidates before requesting line content.
+        includes:       Glob filters (e.g. ["*.py", "!**/node_modules/*"]). Directory mode
+                        only — ignored when `path` is a single file. Use whenever file
+                        type/area is known.
         max_results:    Stop after this many matches (default 20, hard cap 40).
-        return_json:    If True, outputs raw JSON objects like grep_search API.
+        return_json:    Return raw JSON match objects instead of formatted text.
+
+    Returns:
+        Plain text (default): a header line ("Found N match(es) across
+        M file(s) (K scanned)") followed by one block per match —
+        "[path:line]  text" for text files, "[path | location]  text"
+        for binary units — or "No matches across N readable file(s)."
+        if none. return_json=True: a JSON array of match objects
+        (Filename, LineNumber/Unit/UnitLabel/Location, LineContent)
+        instead of formatted text.
     """
     try:
         start = _safe_path(path)
@@ -656,7 +989,17 @@ def search_file_contents(
 
     if not start.exists():
         return f"'{path}' does not exist."
-    if not start.is_dir():
+
+    single_file_mode = start.is_file()
+
+    if single_file_mode:
+        ext = start.suffix.lower()
+        if ext not in READABLE_EXTENSIONS:
+            return (
+                f"'{path}' has extension '{ext}', which isn't a searchable "
+                "text or document format."
+            )
+    elif not start.is_dir():
         return f"'{path}' is a file, not a directory. Pass a directory to search."
 
     # Clamp caller-supplied limits to server-side ceilings rather than
@@ -694,9 +1037,14 @@ def search_file_contents(
                     included = True
         return included if any(not inc.startswith("!") for inc in includes) else True
 
-    def _iter_files(directory: Path):
+    def _iter_files(target: Path):
+        # Single-file mode: yield just that file, no directory walk.
+        if target.is_file():
+            if not _is_skipped(target):
+                yield target
+            return
         try:
-            children = sorted(directory.iterdir(), key=lambda p: (p.is_file(), p.name))
+            children = sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name))
         except PermissionError:
             return
         for child in children:
@@ -725,14 +1073,48 @@ def search_file_contents(
         except ValueError:
             rel_str = str(file_path).replace("\\", "/")
 
-        if not _should_include(rel_str):
+        if not single_file_mode and not _should_include(rel_str):
             continue
 
+        # ── Binary documents: search real structure (page/slide/sheet/
+        #    paragraph), not a flattened line number — this is what keeps
+        #    results in sync with read_file's start_unit/end_unit, which
+        #    addresses the same page/slide/sheet/paragraph numbering.
+        if ext in _BINARY_EXTENSIONS:
+            try:
+                unit_matches = _search_binary_units(file_path, search_regex)
+            except Exception:
+                files_skipped.append(rel_str)
+                continue
+
+            files_scanned += 1
+            for m in unit_matches:
+                if len(matches) >= max_results:
+                    break
+
+                matching_files.add(rel_str)
+
+                if not match_per_line:
+                    if rel_str not in matches:
+                        matches.append(rel_str)
+                    break
+
+                if return_json:
+                    matches.append({
+                        "Filename": rel_str,
+                        "Unit": m["unit"],
+                        "UnitLabel": m["unit_label"],
+                        "Location": m["location"],
+                        "LineContent": m["line_text"],
+                    })
+                else:
+                    matches.append(f"[{rel_str} | {m['location']}]  {m['line_text']}")
+
+            continue
+
+        # ── Text files: unchanged line-based search.
         try:
-            if ext in _BINARY_EXTENSIONS:
-                text = _read_binary(file_path)
-            else:
-                text = file_path.read_text(encoding="utf-8", errors="replace")
+            text = file_path.read_text(encoding="utf-8", errors="replace")
         except Exception:
             files_skipped.append(rel_str)
             continue
@@ -828,12 +1210,10 @@ LOCAL_TOOLS = [
     run_file_command,
 
     # Delete (soft — trash, dry_run by default)
-    delete_file,
-    delete_directory,
+    delete_path,
 ]
 
 
-# SPINNER STATUS MESSAGES
 TOOL_STATUS_MAP = {
     "search_index": lambda args: (
         f"Searching index for [white]'{args.get('query')}'[/white]"
@@ -842,7 +1222,12 @@ TOOL_STATUS_MAP = {
         f"Reading lines {args.get('start_line')}–{args.get('end_line')} of "
         f"[white]'{args.get('path')}'[/white]"
         if args.get("start_line") or args.get("end_line")
-        else f"Reading file [white]'{args.get('path')}'[/white]"
+        else (
+            f"Reading units {args.get('start_unit')}–{args.get('end_unit')} of "
+            f"[white]'{args.get('path')}'[/white]"
+            if args.get("start_unit") or args.get("end_unit")
+            else f"Reading file [white]'{args.get('path')}'[/white]"
+        )
     ),
     "write_file": lambda args: (
         f"Creating [white]'{args.get('path')}'[/white]"
@@ -866,15 +1251,10 @@ TOOL_STATUS_MAP = {
     "run_file_command": lambda args: (
         f"Running [white]'{args.get('command')}'[/white]"
     ),
-    "delete_file": lambda args: (
-        f"Previewing delete of [white]'{args.get('path')}'[/white]"
+    "delete_path": lambda args: (
+        f"Previewing delete of {_fmt_delete_path_arg(args.get('path'))}"
         if args.get("dry_run", True)
-        else f"Deleting [white]'{args.get('path')}'[/white] (-> trash)"
-    ),
-    "delete_directory": lambda args: (
-        f"Previewing delete of [white]'{args.get('path')}'[/white]"
-        if args.get("dry_run", True)
-        else f"Deleting [white]'{args.get('path')}'[/white] (-> trash)"
+        else f"Deleting {_fmt_delete_path_arg(args.get('path'))} (-> trash)"
     ),
 }
 
