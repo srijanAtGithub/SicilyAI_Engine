@@ -25,12 +25,10 @@ from Cowork.cowork_helpers import (
     _list_directory_entries,
     _describe_path,
     _validate_fileops_command,
-    _move_to_trash,
     _SKIP_DIRS,
     _BINARY_EXTENSIONS,
     _ALLOWED_WRITE_EXTENSIONS,
     MANAGEABLE_EXTENSIONS,
-    TRASH_DIR_NAME,
     READABLE_EXTENSIONS,
     CommandValidationError,
     build_binary_file,
@@ -683,7 +681,7 @@ def run_file_command(command: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# DELETE (soft — trash, never unlink)
+# DELETE (permanent — dry_run confirmation required)
 # ---------------------------------------------------------------------------
 
 @tool
@@ -693,31 +691,27 @@ def delete_path(
     dry_run: bool = True,
 ) -> str:
     """
-    Delete one or more files/directories — soft delete, moved to
-    .sicily-trash/, never unlinked. `path` may be a single string or a
-    list; files and directories can be freely mixed in one call.
+    Permanently delete one or more files/directories. `path` may be a
+    string or list; files and directories can be mixed in one call.
 
-    Every path is validated independently: must exist, files must be a
-    manageable type, non-empty directories need recursive=True, sandbox
-    root is always refused. Any single failure refuses the ENTIRE
-    batch — never a partial delete — with the specific reason per failing
-    path.
+    Every path is validated independently (must exist, file must be a
+    manageable type, non-empty dirs need recursive=True). Any single
+    failure refuses the ENTIRE batch — never a partial delete — naming
+    the reason per failing path.
 
-    dry_run=True (default) previews every path's effect without deleting
-    anything; dry_run=False applies the whole validated batch at once. No
-    cap on batch size.
+    dry_run=True (default) previews without deleting; dry_run=False
+    applies the whole validated batch at once (irreversible).
 
     Args:
-        path:      A single path, or a list of paths, to delete.
-        recursive: Must be True if ANY directory in the batch is non-empty.
-                   Ignored for files.
-        dry_run:   If True (default), preview only — nothing is deleted.
+        path:      A single path, or list of paths, to delete.
+        recursive: Must be True if ANY directory in the batch is
+                   non-empty. Ignored for files.
+        dry_run:   If True (default), preview only.
 
     Returns:
-        dry_run=True: "[DRY RUN — nothing deleted]" + per-path preview
-        and counts. dry_run=False success: per-path confirmation with
-        each new trash location. Any validation failure: a report naming
-        each failing path and its reason — nothing deleted in this case.
+        dry_run=True: preview + counts, nothing deleted. dry_run=False
+        success: per-path confirmation of permanent deletion.
+        Validation failure: reason per failing path, nothing deleted.
     """
     paths = [path] if isinstance(path, str) else list(path)
 
@@ -795,7 +789,7 @@ def delete_path(
         lines = [f"[DRY RUN — nothing deleted, {len(resolved)} path(s) validated]\n"]
         for item in resolved:
             if item["kind"] == "file":
-                lines.append(f"  FILE  '{item['path']}' -> {TRASH_DIR_NAME}/")
+                lines.append(f"  FILE  '{item['path']}' (permanent delete)")
             else:
                 preview = "\n".join(
                     f"      - {c.relative_to(root)}" for c in item["contents"][:10]
@@ -805,37 +799,36 @@ def delete_path(
                     if len(item["contents"]) > 10 else ""
                 )
                 lines.append(
-                    f"  DIR   '{item['path']}' -> {TRASH_DIR_NAME}/ "
+                    f"  DIR   '{item['path']}' (permanent delete) "
                     f"({item['file_count']} file(s), {item['dir_count']} subfolder(s))"
                     + (f"\n{preview}{more}" if item["contents"] else "")
                 )
-        lines.append("\nCall again with dry_run=False to apply.")
+        lines.append("\nCall again with dry_run=False to apply (irreversible).")
         return "\n".join(lines)
 
-    # ── Apply the entire validated batch.
+    # ── Apply the entire validated batch (permanent).
     results = []
     for item in resolved:
         try:
-            trashed = _move_to_trash(item["target"])
+            if item["kind"] == "file":
+                item["target"].unlink()
+                results.append(f"  Deleted '{item['path']}'")
+            else:
+                shutil.rmtree(str(item["target"]))
+                results.append(
+                    f"  Deleted '{item['path']}' and its contents "
+                    f"({item['file_count']} file(s), {item['dir_count']} "
+                    f"subfolder(s))"
+                )
         except Exception as e:
             # A failure here is a filesystem-level surprise happening
             # AFTER validation passed (e.g. permissions changed, disk
             # error) — surface it per-item rather than silently stopping,
-            # since prior items in this loop may already be trashed.
+            # since prior items in this loop may already be deleted.
             results.append(f"  FAILED '{item['path']}': {e}")
             continue
 
-        rel_trashed = trashed.relative_to(root)
-        if item["kind"] == "file":
-            results.append(f"  Deleted '{item['path']}' -> '{rel_trashed}'")
-        else:
-            results.append(
-                f"  Deleted '{item['path']}' and its contents "
-                f"({item['file_count']} file(s), {item['dir_count']} "
-                f"subfolder(s)) -> '{rel_trashed}'"
-            )
-
-    header = f"Deleted {len(resolved)} path(s):\n\n"
+    header = f"Permanently deleted {len(resolved)} path(s):\n\n"
     return header + "\n".join(results)
 
 

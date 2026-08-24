@@ -1032,43 +1032,6 @@ MANAGEABLE_ONLY_EXTENSIONS: frozenset[str] = frozenset({
 # everything that's only filesystem-manageable.
 MANAGEABLE_EXTENSIONS: frozenset[str] = READABLE_EXTENSIONS | MANAGEABLE_ONLY_EXTENSIONS
 
-TRASH_DIR_NAME = ".sicily-trash"
-
-
-# ---------------------------------------------------------------------------
-# Trash helpers
-# ---------------------------------------------------------------------------
-
-def _trash_root() -> Path:
-    """
-    Return (and create) the sandbox-local trash directory.
-    Lives INSIDE the sandbox root so it passes _safe_path() like everything
-    else, and so trashed files survive a session restart for manual recovery.
-    """
-    root = _get_sandbox_root()
-    trash = root / TRASH_DIR_NAME
-    trash.mkdir(exist_ok=True)
-    return trash
-
-
-def _move_to_trash(target: Path) -> Path:
-    """
-    Move `target` into the trash dir, preserving its relative path so a
-    human can find and restore it by hand. Timestamps the leaf name on
-    collision instead of overwriting a previously trashed item.
-    """
-    root = _get_sandbox_root()
-    rel = target.relative_to(root)
-    dest = _trash_root() / rel
-    dest.parent.mkdir(parents=True, exist_ok=True)
-
-    if dest.exists():
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        dest = dest.with_name(f"{stamp}__{dest.name}")
-
-    shutil.move(str(target), str(dest))
-    return dest
-
 
 # ---------------------------------------------------------------------------
 # COPY / MOVE / RENAME — via a single validated CLI-command tool
