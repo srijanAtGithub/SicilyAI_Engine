@@ -45,6 +45,7 @@ import configuration
 console = Console()
 from Agent.agent import maybe_summarize
 from Cowork.cowork_helpers import _set_sandbox_root
+from Cowork.cowork_sandbox_exec import jail_status
 from Cowork.cowork_tools import LOCAL_TOOLS, get_friendly_tool_message
 from Cowork.debug_log import DEBUG, reset_step_counter, log_tool_call, log_llm_tokens, log_turn_summary, log_error
 
@@ -216,6 +217,7 @@ def build_local_graph():
             ## Response style
             - Concise by default; go long only when asked or genuinely needed.
             - Cite line numbers exactly as returned by tools — no "around"/"approximately". Omit only if truly unavailable, never invent one.
+            - IMPORTANT: When unsure or confused about a task regarding any important aspect, simply ask the user. Never guess on your own.
             """
 
         # NOTE: summarization is intentionally NOT done here. This node
@@ -260,6 +262,7 @@ async def run_local_session():
 
     console.print(f"[bold dark_orange]{BANNER}[/bold dark_orange]")
     print_info(f"Sandbox root: {cwd}")
+    print_info(jail_status())
     console.print()
 
     # initialise RAG index
@@ -349,6 +352,16 @@ async def run_local_session():
         if user_input.lower() in ("exit", "quit", "bye"):
             print("\nGoodbye!")
             break
+
+        # A fresh human message just arrived — this is the only point in
+        # the loop that represents a genuinely new turn (as opposed to a
+        # model tool call within the same turn), so it's the only place
+        # a pending run_script change is allowed to become apply-able.
+        # See the STATUS note at the bottom of cowork_tool_sandbox_exec.py.
+        from Cowork.cowork_sandbox_exec import _CHANGES
+        for cs in _CHANGES.values():
+            if not cs.applied and not cs.confirmed:
+                cs.confirmed = True
 
         messages.append(HumanMessage(content=user_input))
 

@@ -37,7 +37,7 @@ from Cowork.cowork_helpers import (
     _format_script_library_status,
     _fmt_delete_path_arg,
 )
-
+from Cowork.cowork_tool_sandbox_exec import run_script, apply_change, rollback_change
 
 # Caps on read_file's UNRANGED ("full read") path — the one a model falls
 # into by omitting start_line/end_line/start_unit/end_unit entirely. This
@@ -1211,6 +1211,12 @@ LOCAL_TOOLS = [
 
     # Delete (soft — trash, dry_run by default)
     delete_path,
+
+    # Tier 1 escape hatch — arbitrary scripts, staged + diffed + human-gated. 
+    # Only reached for tasks run_file_command can't express (see run_script's docstring for when to prefer which).
+    run_script,
+    apply_change,
+    rollback_change,
 ]
 
 
@@ -1256,6 +1262,16 @@ TOOL_STATUS_MAP = {
         if args.get("dry_run", True)
         else f"Deleting {_fmt_delete_path_arg(args.get('path'))} (-> trash)"
     ),
+    "run_script": lambda args: (
+         f"Running a {args.get('interpreter', 'python3')} script against "
+         f"[white]'{args.get('scope', '.')}'[/white] (staged copy only)"
+     ),
+     "apply_change": lambda args: (
+         f"Applying change [white]'{args.get('change_id')}'[/white] to real files"
+     ),
+     "rollback_change": lambda args: (
+         f"Rolling back change [white]'{args.get('change_id')}'[/white]"
+     ),
 }
 
 
