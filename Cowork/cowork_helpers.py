@@ -1,16 +1,17 @@
 import datetime
-import stat
-from pathlib import Path
-from typing import Optional, Callable
 import importlib
 import importlib.util
-import time
+import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
+from pathlib import Path
+from typing import Optional, Callable
 
 
 # Noise directories — skipped in trees and searches
@@ -192,7 +193,7 @@ def _docx_table_text(table) -> str:
     return "[Table]\n" + "\n".join(rows)
 
 
-def _search_binary_units(path: Path, search_regex) -> list[dict]:
+def _search_binary_units(path: Path, search_regex: re.Pattern) -> list[dict]:
     """
     Search a binary document's real internal structure for `search_regex`,
     returning one dict per match:

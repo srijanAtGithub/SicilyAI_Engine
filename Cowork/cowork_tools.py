@@ -845,16 +845,27 @@ def delete_path(
 # ---------------------------------------------------------------------------
 
 @tool
-def find_files_by_name(path: str, pattern: str, exclude_patterns: list[str] = []) -> str:
+def find_files_by_name(
+    path: str,
+    pattern: str,
+    exclude_patterns: list[str] = [],
+    max_results: int = 100,
+) -> str:
     """
     Recursively find files by NAME/GLOB (e.g. "*.py", "invoice_*"), not
     content. Returns relative paths only — reads no file content.
+
+    Server-side caps apply regardless of arguments: max_results<=200,
+    ~2000 entries walked — a broad pattern over a large tree gets
+    clamped/stopped early rather than returning everything, so narrow
+    `path` and/or `pattern`/`exclude_patterns` for full results on a big tree.
 
     Args:
         path:             Starting directory (relative path).
         pattern:          Glob pattern matched against each entry's name.
         exclude_patterns: Optional glob patterns to exclude, matched
                           against both the entry name and relative path.
+        max_results:      Stop after this many matches (default 100, hard cap 200).
     """
     import fnmatch
 
@@ -868,19 +879,33 @@ def find_files_by_name(path: str, pattern: str, exclude_patterns: list[str] = []
     if not start.is_dir():
         return f"'{path}' is not a directory."
 
+    max_results = max(1, min(max_results, _MAX_NAME_RESULTS_CEILING))
+
     root = _get_sandbox_root()
     matches: list[str] = []
+    entries_scanned = 0
+    scan_capped = False
 
     def _walk(directory: Path) -> None:
+        nonlocal entries_scanned, scan_capped
+        if len(matches) >= max_results or scan_capped:
+            return
         try:
             children = sorted(directory.iterdir(), key=lambda p: (p.is_file(), p.name))
         except PermissionError:
             return
 
         for child in children:
+            if len(matches) >= max_results:
+                return
+            if entries_scanned >= _MAX_NAME_FILES_SCANNED:
+                scan_capped = True
+                return
+
             if _is_skipped(child):
                 continue
 
+            entries_scanned += 1
             rel = str(child.relative_to(root))
 
             if any(
@@ -898,9 +923,16 @@ def find_files_by_name(path: str, pattern: str, exclude_patterns: list[str] = []
     _walk(start)
 
     if not matches:
-        return f"No files matching '{pattern}' found under '{path}'."
+        note = " (stopped early — narrow `path`/`pattern` to search the rest)" if scan_capped else ""
+        return f"No files matching '{pattern}' found under '{path}'{note}."
 
-    return f"Found {len(matches)} match(es):\n" + "\n".join(matches)
+    cap_note = ""
+    if len(matches) >= max_results:
+        cap_note = f" (capped at max_results={max_results})"
+    elif scan_capped:
+        cap_note = " (stopped scanning early — narrow `path`/`pattern` for full results)"
+
+    return f"Found {len(matches)} match(es){cap_note}:\n" + "\n".join(matches)
 
 
 # Hard server-side ceilings — independent of whatever the caller passes.
@@ -908,17 +940,21 @@ def find_files_by_name(path: str, pattern: str, exclude_patterns: list[str] = []
 # fraction of a monorepo in one call. Args are clamped, not rejected, so a call never fails — it just can't blow the budget.
 _MAX_RESULTS_CEILING = 40
 _MAX_FILES_SCANNED = 400          # stop walking after this many readable files, matches or not
-_MAX_CONTEXT_LINES = 4
 _MAX_OUTPUT_CHARS = 6_000         # hard cap on the returned string; truncated with a note past this
+_MAX_PATTERNS = 8                 # cap on how many patterns one search_file_contents call can OR together
+
+# find_files_by_name ceilings — mirrors the caps above so every tool in the
+# search tier degrades the same way (clamp + note, never a hard failure).
+_MAX_NAME_RESULTS_CEILING = 200
+_MAX_NAME_FILES_SCANNED = 2000
 
 
 @tool
 def search_file_contents(
-    pattern: str,
+    pattern: Union[str, List[str]],
     path: str = ".",
     regex: bool = False,
     case_sensitive: bool = False,
-    context_lines: int = 0,
     match_per_line: bool = True,
     includes: Optional[List[str]] = None,
     max_results: int = 20,
@@ -931,29 +967,43 @@ def search_file_contents(
     be a single file OR a directory — a single file searches only that
     file; a directory recurses.
 
+    `pattern` accepts a single string OR a list of strings (max 8) — pass
+    a list to search for several terms in one call instead of one call
+    per term (e.g. pattern=["invoice", "purchase order", "PO#"]). All
+    patterns are OR'd together: a line/unit matching ANY of them is a hit.
+    If a line matches more than one pattern, it is still reported once
+    (not once per pattern) — the match entry names every pattern that hit
+    it, so results stay deduplicated regardless of how many terms overlap.
+
     Binary matches report a unit number (page/slide/sheet/paragraph) plus
     a finer locator where the format supports one. That unit number is
-    what read_file's start_unit/end_unit takes — workflow: search here to
-    find which unit has the evidence, then read_file(..., start_unit=N,
-    end_unit=N) for that unit's full content. context_lines is text-files-
-    only; for binary matches get context via read_file.
+    what read_file's start_unit/end_unit takes. Text matches report a line
+    number the same way. Workflow: search here to find which line/unit has
+    the evidence, then read_file(...) with that line/unit range (plus a
+    little padding, e.g. a handful of lines either side, if you want
+    surrounding context) to get the full area — read_file is the intended
+    next step for context, not this tool.
 
     If you already know or suspect the specific file, pass that file
     directly as `path` — don't pass its parent directory. Pass a directory
     only when searching across multiple files or you don't yet know which
-    one has it. Server-side caps apply regardless of arguments: max_results
-    <=40, ~400 files walked (directory mode only), context_lines<=4,
-    output truncated ~6000 chars — an unscoped call gets clamped/
-    truncated, so narrowing the query is the only way to get everything.
+    one has it. For OR-searches across multiple literal terms, prefer the
+    list form of `pattern` over regex alternation — it merges same-line
+    hits for you and reports which term(s) matched. Server-side caps apply
+    regardless of arguments: max_results<=40, up to 8 patterns/call, ~400
+    files walked (directory mode only), output truncated ~6000 chars — an
+    unscoped call gets clamped/truncated, so narrowing the query is the
+    only way to get everything.
 
     Args:
-        pattern:        Text or regex pattern to search for.
+        pattern:        Text or regex pattern to search for, or a list of
+                        up to 8 to search for together (results merged,
+                        not duplicated, when several match the same line).
         path:           A single file to search, or a directory to search
                         recursively. Defaults to ".".
-        regex:          If True, `pattern` is a regular expression.
+        regex:          If True, every pattern in `pattern` is treated as
+                        a regular expression.
         case_sensitive: Default False.
-        context_lines:  Lines of context per match (default 0, max 4). Text
-                        files only.
         match_per_line: True (default): matching lines + line numbers.
                         False: matching file paths only (cheaper, use to
                         locate candidates before requesting line content).
@@ -967,9 +1017,11 @@ def search_file_contents(
         Plain text (default): a header line ("Found N match(es) across
         M file(s) (K scanned)") followed by one block per match —
         "[path:line]  text" for text files, "[path | location]  text"
-        for binary units — or "No matches across N readable file(s)."
-        if none. return_json=True: a JSON array of match objects
-        (Filename, LineNumber/Unit/UnitLabel/Location, LineContent).
+        for binary units — with a "(matched: term1, term2)" suffix when
+        more than one pattern was searched and more than one hit that
+        line/unit — or "No matches across N readable file(s)." if none.
+        return_json=True: a JSON array of match objects (Filename,
+        LineNumber/Unit/UnitLabel/Location, LineContent, MatchedPatterns).
     """
     try:
         start = _safe_path(path)
@@ -994,14 +1046,28 @@ def search_file_contents(
     # Clamp caller-supplied limits to server-side ceilings rather than
     # trusting them — this is what actually bounds worst-case cost.
     max_results = max(1, min(max_results, _MAX_RESULTS_CEILING))
-    context_lines = max(0, min(context_lines, _MAX_CONTEXT_LINES))
 
-    # Compile regex pattern
+    patterns = [pattern] if isinstance(pattern, str) else list(pattern)
+    if not patterns:
+        return "Error: pattern must be a non-empty string or list of strings."
+    if len(patterns) > _MAX_PATTERNS:
+        return f"Error: at most {_MAX_PATTERNS} patterns per call — got {len(patterns)}. Narrow the list or split into separate calls."
+
+    # Compile one regex per pattern (not one combined regex) so we can
+    # report which specific pattern(s) matched a given line/unit — that's
+    # what powers the same-line merge/dedup below.
     flags = 0 if case_sensitive else re.IGNORECASE
-    try:
-        search_regex = re.compile(pattern if regex else re.escape(pattern), flags)
-    except re.error as e:
-        return f"Invalid regex pattern: {e}"
+    compiled = []  # list of (pattern_text, compiled_regex)
+    for p in patterns:
+        try:
+            compiled.append((p, re.compile(p if regex else re.escape(p), flags)))
+        except re.error as e:
+            return f"Invalid regex pattern '{p}': {e}"
+
+    def _matched_patterns(text: str) -> list:
+        """Every pattern (in caller order) that hits `text`, deduplicating
+        multi-pattern hits on the same line/unit into one match entry."""
+        return [p for p, rx in compiled if rx.search(text)]
 
     root = _get_sandbox_root()
     matches = []
@@ -1070,8 +1136,13 @@ def search_file_contents(
         #    results in sync with read_file's start_unit/end_unit, which
         #    addresses the same page/slide/sheet/paragraph numbering.
         if ext in _BINARY_EXTENSIONS:
+            # _search_binary_units takes the full pattern list and does the
+            # multi-pattern merge itself, on a single parse of the file —
+            # keeping that here (rather than looping over it once per
+            # pattern) is what keeps an 8-pattern search from re-opening
+            # and re-extracting the same PDF/workbook/deck 8 times.
             try:
-                unit_matches = _search_binary_units(file_path, search_regex)
+                unit_matches = _search_binary_units(file_path, compiled)
             except Exception:
                 files_skipped.append(rel_str)
                 continue
@@ -1081,6 +1152,7 @@ def search_file_contents(
                 if len(matches) >= max_results:
                     break
 
+                hit_patterns = m["matched_patterns"]
                 matching_files.add(rel_str)
 
                 if not match_per_line:
@@ -1095,9 +1167,11 @@ def search_file_contents(
                         "UnitLabel": m["unit_label"],
                         "Location": m["location"],
                         "LineContent": m["line_text"],
+                        "MatchedPatterns": hit_patterns,
                     })
                 else:
-                    matches.append(f"[{rel_str} | {m['location']}]  {m['line_text']}")
+                    suffix = f"  (matched: {', '.join(hit_patterns)})" if len(patterns) > 1 and len(hit_patterns) > 1 else ""
+                    matches.append(f"[{rel_str} | {m['location']}]  {m['line_text']}{suffix}")
 
             continue
 
@@ -1115,7 +1189,8 @@ def search_file_contents(
             if len(matches) >= max_results:
                 break
 
-            if search_regex.search(line):
+            hit_patterns = _matched_patterns(line)
+            if hit_patterns:
                 matching_files.add(rel_str)
 
                 # If only file listing requested (git grep -l behavior)
@@ -1130,23 +1205,16 @@ def search_file_contents(
                     matches.append({
                         "Filename": rel_str,
                         "LineNumber": line_num,
-                        "LineContent": line.strip()
+                        "LineContent": line.strip(),
+                        "MatchedPatterns": hit_patterns,
                     })
                 else:
-                    if context_lines > 0:
-                        lo = max(0, i - context_lines)
-                        hi = min(len(lines), i + context_lines + 1)
-                        snippet_lines = lines[lo:hi]
-                        snippet = "\n".join(
-                            f"{'>' if lo + j == i else ' '} {lo + j + 1:>5}  {l}"
-                            for j, l in enumerate(snippet_lines)
-                        )
-                        matches.append(f"[{rel_str}]\n{snippet}")
-                    else:
-                        matches.append(f"[{rel_str}:{line_num}]  {line.strip()}")
+                    suffix = f"  (matched: {', '.join(hit_patterns)})" if len(patterns) > 1 and len(hit_patterns) > 1 else ""
+                    matches.append(f"[{rel_str}:{line_num}]  {line.strip()}{suffix}")
 
+    pattern_desc = f"pattern '{patterns[0]}'" if len(patterns) == 1 else f"{len(patterns)} patterns {patterns}"
     search_desc = (
-        f"Searched for {'regex' if regex else 'literal'} pattern '{pattern}' "
+        f"Searched for {'regex' if regex else 'literal'} {pattern_desc} "
         f"({'case-sensitive' if case_sensitive else 'case-insensitive'}) under '{path}'"
     )
     cap_note = (
@@ -1240,8 +1308,11 @@ TOOL_STATUS_MAP = {
         f"under [white]'{args.get('path')}'[/white]"
     ),
     "search_file_contents": lambda args: (
-        f"Searching for [white]'{args.get('pattern')}'[/white] "
+        f"Searching for [white]{', '.join(repr(p) for p in args.get('pattern'))}[/white] "
         f"under [white]'{args.get('path', '.')}'[/white]"
+        if isinstance(args.get("pattern"), list)
+        else f"Searching for [white]'{args.get('pattern')}'[/white] "
+             f"under [white]'{args.get('path', '.')}'[/white]"
     ),
     "run_file_command": lambda args: (
         f"Running [white]'{args.get('command')}'[/white]"
