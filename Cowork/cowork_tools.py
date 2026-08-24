@@ -34,8 +34,34 @@ from Cowork.cowork_helpers import (
     build_binary_file,
     _format_script_library_status,
     _fmt_delete_path_arg,
+    _encode_image,
+    _IMAGE_EXTENSIONS,
+    _MAX_IMAGES_PER_CALL,
+    _extract_text,
 )
 from Cowork.cowork_tool_sandbox_exec import run_script, apply_change, rollback_change
+
+# One lazily-built vision sub-client, separate from the main agent LLM.
+# Kept cheap/fast on purpose — this never runs at xhigh reasoning effort,
+# it just answers a bounded visual question and returns text. Reusing the
+# main orchestrator model here would re-inject raw image tokens into the
+# expensive, long-lived agent loop for no benefit (see design note on
+# view_image below).
+_VISION_LLM = None
+
+
+def _get_vision_llm():
+    global _VISION_LLM
+    if _VISION_LLM is None:
+        from langchain_openai import ChatOpenAI
+        _VISION_LLM = ChatOpenAI(
+            model="gpt-5.6-luna",     # same model family; capability, not reasoning cost, is what's needed here
+            use_responses_api=True,
+            reasoning_effort="low",   # this is a lookup, not a plan — keep it fast/cheap
+            max_retries=0,
+        )
+    return _VISION_LLM
+
 
 # Caps on read_file's UNRANGED ("full read") path — the one a model falls
 # into by omitting start_line/end_line/start_unit/end_unit entirely. This
@@ -171,6 +197,10 @@ def read_file(
             f"read. Re-save the file as {modern_ext} (e.g. via 'Save As' in "
             "Word/PowerPoint) and try again."
         )
+
+    # checking for images:
+    if suffix in _IMAGE_EXTENSIONS:
+        return f"'{path}' is an image — use view_image instead, with a question about what you need from it."
 
     is_binary = suffix in _BINARY_EXTENSIONS
 
@@ -326,6 +356,112 @@ def check_binary_write_libraries() -> str:
         "avoids that extra install step and its runtime cost."
     )
     return "\n".join(lines)
+
+
+@tool
+def view_image(paths: Union[str, List[str]], question: str) -> str:
+    """
+    Ask a question about one or more images (.png/.jpg/.jpeg/.gif/.webp)
+    and get a text answer back. Use this for screenshots, diagrams,
+    scanned pages, photos — anything read_file can't parse as text.
+
+    Always pass a specific question — what you actually need to know
+    (e.g. "what error message is shown?", "list the values in this
+    chart", "transcribe the handwritten note", "which of these two
+    screenshots shows the bug?"). A vague or missing question wastes the
+    call.
+
+    Pass multiple paths when the question spans several images at once
+    (compare two screenshots, summarize a folder of charts, etc.) instead
+    of calling this once per image — one multi-image call is cheaper and
+    lets the answer reason across all of them together. Cap: 8 images per
+    call.
+
+    Args:
+        paths:    A single image path, or a list of image paths (all
+                  relative to the sandbox root).
+        question: What you want to know about the image(s).
+
+    Returns:
+        A text answer. Per-image errors (missing file, wrong format, too
+        large) are reported inline and don't fail the whole call — the
+        answer is still generated from whichever images loaded fine.
+    """
+    if isinstance(paths, str):
+        paths = [paths]
+
+    if not paths:
+        return "Error: at least one image path is required."
+
+    if len(paths) > _MAX_IMAGES_PER_CALL:
+        return (
+            f"Error: {len(paths)} images requested, max is "
+            f"{_MAX_IMAGES_PER_CALL} per call. Split into multiple calls."
+        )
+
+    if not question or not question.strip():
+        return (
+            "Error: a question is required — e.g. 'what does this "
+            "screenshot show?' Sending an image with no question wastes "
+            "the call, since nothing is extracted from it."
+        )
+
+    content_blocks = [{"type": "text", "text": question}]
+    loaded, errors = [], []
+
+    for p in paths:
+        try:
+            file_path = _safe_path(p)
+        except PermissionError as e:
+            errors.append(f"'{p}': {e}")
+            continue
+
+        if not file_path.exists():
+            errors.append(f"'{p}': does not exist.")
+            continue
+        if not file_path.is_file():
+            errors.append(f"'{p}': is a directory, not a file.")
+            continue
+        if file_path.suffix.lower() not in _IMAGE_EXTENSIONS:
+            errors.append(
+                f"'{p}': not a supported image format "
+                f"({', '.join(_IMAGE_EXTENSIONS)})."
+            )
+            continue
+
+        try:
+            data, mime = _encode_image(file_path)
+        except ValueError as e:
+            errors.append(f"'{p}': {e}")
+            continue
+
+        content_blocks.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{data}"},
+        })
+        loaded.append(p)
+
+    if not loaded:
+        return "Could not load any images:\n" + "\n".join(errors)
+
+    try:
+        from langchain_core.messages import HumanMessage
+        response = _get_vision_llm().invoke([HumanMessage(content=content_blocks)])
+        answer = response.content
+    except Exception as e:
+        return f"Vision request failed: {e}"
+
+    try:
+        from langchain_core.messages import HumanMessage
+        response = _get_vision_llm().invoke([HumanMessage(content=content_blocks)])
+        answer = _extract_text(response.content)
+    except Exception as e:
+        return f"Vision request failed: {e}"
+
+    prefix = f"[Viewed: {', '.join(loaded)}]\n"
+    if errors:
+        prefix += "Skipped — " + "; ".join(errors) + "\n"
+    return prefix + answer
 
 
 @tool
@@ -1248,6 +1384,7 @@ LOCAL_TOOLS = [
     # Read-only (safe)
     search_index,
     read_file,
+    view_image,
 
     # Write (safe-ish)
     write_file,
@@ -1284,6 +1421,10 @@ TOOL_STATUS_MAP = {
             if args.get("start_unit") or args.get("end_unit")
             else f"Reading file [white]'{args.get('path')}'[/white]"
         )
+    ),
+    "view_image": lambda args: (
+        f"Viewing [white]{len(args.get('paths')) if isinstance(args.get('paths'), list) else 1} "
+        f"image(s)[/white] — [white]'{args.get('question', '')[:60]}'[/white]"
     ),
     "write_file": lambda args: (
         f"Creating [white]'{args.get('path')}'[/white]"

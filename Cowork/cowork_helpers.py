@@ -133,6 +133,66 @@ def _fmt_permissions(mode: int) -> str:
     return "".join(result)
 
 
+# Image extensions viewable via view_image. Never parsed as text — always
+# base64-encoded and handed to a vision-capable model.
+_IMAGE_EXTENSIONS: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+# Matches Anthropic/OpenAI vision limits — reject before wasting a request.
+_MAX_IMAGE_BYTES = 8 * 1024 * 1024   # 8 MB, matches claude.ai's own cap
+_MAX_IMAGES_PER_CALL = 8             # keep a single view_image call cheap and reviewable
+
+
+def _encode_image(path: Path) -> tuple[str, str]:
+    """
+    Read one image file and return (base64_data, mime_type).
+    Raises ValueError on unsupported format or oversize file — never raises
+    on I/O errors uncaught, so callers can turn this into a clean per-image
+    error line instead of failing the whole batch.
+    """
+    import base64
+
+    suffix = path.suffix.lower()
+    mime = _IMAGE_EXTENSIONS.get(suffix)
+    if mime is None:
+        raise ValueError(f"'{suffix}' is not a supported image format.")
+
+    size = path.stat().st_size
+    if size > _MAX_IMAGE_BYTES:
+        raise ValueError(
+            f"{size / 1_048_576:.1f} MB, over the "
+            f"{_MAX_IMAGE_BYTES / 1_048_576:.0f} MB limit."
+        )
+
+    data = base64.b64encode(path.read_bytes()).decode("ascii")
+    return data, mime
+
+
+def _extract_text(content) -> str:
+    """
+    Normalize a LangChain message's .content into plain text. With
+    use_responses_api=True, .content can come back as a string OR as a
+    list of content blocks (text/reasoning/refusal/etc.) — this collapses
+    it to just the text, in order, regardless of which shape it took.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        return "".join(parts) if parts else "(no text content returned)"
+    return str(content)
+
+
 # Extensions that require binary parsing rather than UTF-8 text reads
 _BINARY_EXTENSIONS = frozenset({".pdf", ".xlsx", ".xls", ".docx", ".pptx"})
 
