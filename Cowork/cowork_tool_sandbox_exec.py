@@ -35,47 +35,38 @@ def run_script(script: str, interpreter: str = "python3", scope: str = ".", time
     edits, pattern-based transforms across many files, anything needing
     real logic rather than a single cp/mv/mkdir call.
 
-    SAFETY MODEL — read before using: this NEVER touches the real
-    sandbox. `script` runs only against a disposable COPY of `scope`.
-    You get back a diff of what the script would change. Nothing is
-    written to the real files until you separately call apply_change()
-    with the exact change_id this returns — and only after actually
-    reading the diff, since a mistaken or half-working script produces a
-    diff too, and applying it blindly defeats the point of this tool.
+    SAFETY MODEL: this NEVER touches the real sandbox. `script` runs only
+    against a disposable COPY of `scope`. You get a diff of what the
+    script would change. Nothing is written until you separately call
+    apply_change() with the exact change_id this returns — and only after
+    you have actually read the diff. A broken or half-working script still
+    produces a diff; applying it blindly defeats the point of this tool.
 
-    Only python3, node, bash, and sh are supported interpreters. This
-    runs in SOFT JAIL mode (no Docker required, works on macOS/Windows):
-    real wall-clock timeout (default 30s, max 120s) and a real memory
-    cap are enforced, but network access is NOT blocked — a script with
-    a hardcoded destination can still reach it. Never use this on a
-    script whose intent you don't already trust; call jail_status() if
-    you need the exact wording of what's enforced on this host.
+    Only python3, node, bash, and sh are supported. Runs in SOFT JAIL
+    (no Docker): real wall-clock timeout (default 30s, max 120s) and a
+    real memory cap are enforced, but network is NOT blocked. Never use
+    this on a script whose intent you don't already trust; call
+    jail_status() if you need the exact wording of what's enforced.
 
-    Prefer the smallest `scope` that covers the task (a specific
-    subfolder, not always the whole sandbox) — smaller scope means a
-    faster stage/diff and a diff that's actually readable.
+    Prefer the smallest `scope` that covers the task — smaller scope means
+    a faster stage/diff and a readable diff.
 
     Args:
-        script:      Full source of the script, passed to the interpreter
-                     via `-c`. Operate on the CURRENT DIRECTORY (i.e. `.`,
-                     `Path(".")`, `os.getcwd()`) — the working directory
-                     IS ALREADY the staged copy of `scope`, not a parent
-                     containing a folder named after `scope`. If scope=
-                     "apps", iterate `Path(".").iterdir()` for the module
-                     folders directly — do NOT do `Path("apps").iterdir()`,
-                     that path won't exist inside the staged copy and the
-                     script will fail with FileNotFoundError.
+        script:      Full source, passed via `-c`. Operate on the CURRENT
+                    DIRECTORY (`.`, Path("."), os.getcwd()) — the working
+                    directory IS ALREADY the staged copy of `scope`. If
+                    scope="apps", iterate Path(".").iterdir() for the
+                    module folders; do NOT do Path("apps").iterdir() —
+                    that path does not exist inside the staged copy.
         interpreter: One of "python3", "node", "bash", "sh". Default python3.
-        scope:       Subpath within the sandbox to stage and run against
-                     (e.g. "apps", "reports/q3"). Default "." = whole sandbox
-                     — narrow this when you can.
+        scope:       Subpath within the sandbox to stage (e.g. "apps",
+                    "reports/q3"). Default "." = whole sandbox.
         timeout_s:   Wall-clock limit in seconds (max 120). Default 30.
 
     Returns:
-        A readable diff: files added/removed/modified, with inline unified
-        diffs for text files, plus the change_id needed to apply it. If
-        the script errored or timed out, says so and marks the change
-        not-applyable.
+        A readable diff (files added/removed/modified + unified diffs for
+        text) plus the change_id needed to apply it. If the script errored
+        or timed out, says so and marks the change not-applyable.
     """
     root = _get_sandbox_root()
     try:
@@ -93,12 +84,16 @@ def apply_change(change_id: str) -> str:
     run_script call's diff output — you cannot invent one.
 
     Only call this after you (and ideally the person you're working for)
-    have actually looked at the diff run_script returned and confirmed
-    it's correct. This is the irreversible-until-rollback step; treat it
-    with the same care as delete_path(dry_run=False).
+    have actually looked at the diff and confirmed it is correct. This is
+    the irreversible-until-rollback step; treat it with the same care as
+    delete_path(dry_run=False).
 
     A pre-apply snapshot is taken automatically, so rollback_change() can
     undo this if the applied change turns out to be wrong.
+
+    If the change has not been confirmed by the user yet, this call is
+    refused. Show the diff and wait for their explicit go-ahead in their
+    NEXT message — do not call apply_change again in the same turn.
 
     Args:
         change_id: The id shown in a prior run_script diff output.

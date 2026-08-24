@@ -100,38 +100,34 @@ def read_file(
     Binary documents (.pdf/.docx/.xlsx/.xls/.pptx): use start_unit/
     end_unit instead — line numbers don't apply. A unit is the format's
     own structural division: .pdf=page, .pptx=slide, .xlsx/.xls=sheet
-    (by order, not name), .docx=paragraph (no page concept in the file
-    format). 1-indexed inclusive, max 50 units/call. Extraction per
-    format: .pdf per-page (plus trailing form fields on a full read),
-    .docx per-paragraph, .xlsx/.xls per-sheet tab-separated, .pptx
-    per-slide with text/tables/notes.
+    (by order, not name), .docx=paragraph. 1-indexed inclusive, max 50
+    units/call.
 
     Use one mechanism matching the file's type, not both.
 
-    0/0 on both (default) = full file/document — but only up to
-    500 lines / 20 units. Past that, you get a preview (first 3 units, or
-    the text-file equivalent) plus the true total, not the whole thing —
-    large files must be paged with start_unit/end_unit (or start_line/
-    end_line) instead of read in one call. Check the header on any full
-    read: it states the true total, so if it's larger than what a preview
-    would show, switch to a ranged call. For "find X in this document"
-    without knowing which page/slide it's on, prefer search_index — it's
-    cheaper and works regardless of document length.
+    0/0 on both (default) = full file/document, but only up to 500 lines /
+    20 units. Past that you get a preview (first 3 units, or the text
+    equivalent) plus the true total — large files must be paged. Check the
+    header on any full read: it states the true total. For "find X in this
+    document" without knowing which page/slide it's on, prefer
+    search_index — cheaper and length-independent.
 
     Args:
         path:       Relative path to the file.
         start_line: Text files only — first line (1-indexed). 0 for full/preview.
         end_line:   Text files only — last line (inclusive). 0 for full/preview.
-        start_unit: Binary documents only — first page/slide/sheet/paragraph (1-indexed). 0 for full/preview.
-        end_unit:   Binary documents only — last page/slide/sheet/paragraph (inclusive). 0 for full/preview.
+        start_unit: Binary documents only — first page/slide/sheet/paragraph
+                    (1-indexed). 0 for full/preview.
+        end_unit:   Binary documents only — last page/slide/sheet/paragraph
+                    (inclusive). 0 for full/preview.
 
     Returns:
-        A header line stating what was read and the true total ("lines
-        1–500 of 3200" or "pages 1–3 of 340 (PREVIEW — capped; use
+        A header line stating what was read and the true total
+        ("lines 1-500 of 3200" or "pages 1-3 of 340 (PREVIEW — capped; use
         start_unit/end_unit to page through the rest)"), followed by the
         content. On error: a plain-text explanation (bad range, wrong
-        mechanism for this file type, file not found, unsupported/legacy
-        format, missing package) — never raises.
+        mechanism, file not found, unsupported format, missing package) —
+        never raises.
     """
     line_ranged = start_line > 0 or end_line > 0
     unit_ranged = start_unit > 0 or end_unit > 0
@@ -359,31 +355,27 @@ def write_file(
     --- Binary formats (.docx, .xlsx, .xls, .pptx, .pdf) ---
 
     mode="create" only. `content` is not written verbatim — it must be a
-    full standalone Python 3 script that builds the file, using whatever
-    library and structure you choose. Two hard requirements, everything
-    else is free:
-      1. The script's working directory contains nothing else — don't
-         read/reference any other path.
-      2. Save the result to exactly this filename (relative, no folders):
-           .docx -> "__cowork_output__.docx"   .xlsx -> "__cowork_output__.xlsx"
-           .pptx -> "__cowork_output__.pptx"   .xls  -> "__cowork_output__.xls"
-           .pdf  -> "__cowork_output__.pdf"
-    That file is validated by opening it with the matching reader library
-    (python-docx/python-pptx/openpyxl/pypdf), then copied to `path`. If
-    the script errors, times out, produces no file, or produces one that
-    fails to open, nothing is written to the sandbox — the error explains
-    which, with the script's own stderr or the reader's parse error; fix
-    and call write_file again.
+    full standalone Python 3 script that builds the file. Two hard
+    requirements, everything else is free:
+    1. The script's working directory contains nothing else — don't
+        read/reference any other path.
+    2. Save the result to exactly this filename (relative, no folders):
+        .docx -> "__cowork_output__.docx"   .xlsx -> "__cowork_output__.xlsx"
+        .pptx -> "__cowork_output__.pptx"   .xls  -> "__cowork_output__.xls"
+        .pdf  -> "__cowork_output__.pdf"
+    That file is validated by opening it with the matching reader library,
+    then copied to `path`. If the script errors, times out, produces no
+    file, or produces one that fails to open, nothing is written — the
+    error explains which. Fix and call write_file again.
 
     Call check_binary_write_libraries() once per session, before your
-    first binary build, to see which libraries are actually importable
-    here.
+    first binary build, to see which libraries are actually importable.
 
     Args:
         path:           Relative path to the file.
-        content:        mode="create" + text extension: full file content, written verbatim.
-                        mode="create" + binary extension: a Python build script (see above).
-                        mode="edit": replacement text for the line range ("" to delete it).
+        content:        mode="create" + text: full file content, written verbatim.
+                        mode="create" + binary: a Python build script (see above).
+                        mode="edit": replacement text for the line range ("" to delete).
         mode:           "create" or "edit".
         start_line:     mode="edit" only — first line to replace (1-indexed).
         end_line:       mode="edit" only — last line to replace (inclusive).
@@ -391,14 +383,13 @@ def write_file(
         dry_run:        mode="edit" only — True (default) previews without writing.
 
     Returns:
-        Success: "Created '{path}'.\\nSize: N bytes" (text writes also
+        Success: "Created '{path}'.\nSize: N bytes" (text writes also
         append "| Encoding: utf-8"). mode="edit" success: a diff preview
         (dry_run=True) or confirmation of applied lines (dry_run=False).
         Failure: a plain-text explanation of exactly what went wrong —
-        already-exists, missing extension, disallowed extension, missing
-        parent dir, or (binary only) the build script's stderr or the
-        reader library's validation error. Never raises; always returns
-        a string either way.
+        already-exists, missing/disallowed extension, missing parent, or
+        (binary) the build script's stderr or the reader library's
+        validation error. Never raises.
     """
     if mode not in ("create", "edit"):
         return f"Error: mode must be 'create' or 'edit', got '{mode}'."
@@ -938,38 +929,37 @@ def search_file_contents(
     — plain text/code by line; PDF/docx/xlsx/pptx by real structure
     (page/slide/sheet/paragraph) instead of a flattened blob. `path` may
     be a single file OR a directory — a single file searches only that
-    file (nothing else in its folder is touched); a directory recurses.
+    file; a directory recurses.
 
     Binary matches report a unit number (page/slide/sheet/paragraph) plus
-    a finer locator where the format supports one (in-page line, slide
-    part, or cell reference). That unit number is what read_file's
-    start_unit/end_unit takes — workflow is: search here to find which
-    unit has the evidence, then read_file(path, start_unit=N, end_unit=N)
-    for that unit's full content, not the whole document. context_lines
-    is text-files-only; for binary matches, get context via read_file.
+    a finer locator where the format supports one. That unit number is
+    what read_file's start_unit/end_unit takes — workflow: search here to
+    find which unit has the evidence, then read_file(..., start_unit=N,
+    end_unit=N) for that unit's full content. context_lines is text-files-
+    only; for binary matches get context via read_file.
 
     If you already know or suspect the specific file, pass that file
-    directly as `path` — don't pass its parent directory, which would
-    also search every other file there. Pass a directory only when
-    searching across multiple files or you don't yet know which one has
-    it. Server-side caps apply regardless of arguments passed: max_results
+    directly as `path` — don't pass its parent directory. Pass a directory
+    only when searching across multiple files or you don't yet know which
+    one has it. Server-side caps apply regardless of arguments: max_results
     <=40, ~400 files walked (directory mode only), context_lines<=4,
     output truncated ~6000 chars — an unscoped call gets clamped/
-    truncated, not a full result, so narrowing the query is the only way
-    to get everything back.
+    truncated, so narrowing the query is the only way to get everything.
 
     Args:
         pattern:        Text or regex pattern to search for.
-        path:           A single file to search, or a directory to search recursively. Defaults to ".".
+        path:           A single file to search, or a directory to search
+                        recursively. Defaults to ".".
         regex:          If True, `pattern` is a regular expression.
         case_sensitive: Default False.
-        context_lines:  Lines of context per match (default 0, max 4). Text files only.
+        context_lines:  Lines of context per match (default 0, max 4). Text
+                        files only.
         match_per_line: True (default): matching lines + line numbers.
-                        False: matching file paths only (git grep -l) — cheaper, use to
-                        locate candidates before requesting line content.
-        includes:       Glob filters (e.g. ["*.py", "!**/node_modules/*"]). Directory mode
-                        only — ignored when `path` is a single file. Use whenever file
-                        type/area is known.
+                        False: matching file paths only (cheaper, use to
+                        locate candidates before requesting line content).
+        includes:       Glob filters (e.g. ["*.py", "!**/node_modules/*"]).
+                        Directory mode only — ignored when `path` is a
+                        single file. Use whenever file type/area is known.
         max_results:    Stop after this many matches (default 20, hard cap 40).
         return_json:    Return raw JSON match objects instead of formatted text.
 
@@ -979,8 +969,7 @@ def search_file_contents(
         "[path:line]  text" for text files, "[path | location]  text"
         for binary units — or "No matches across N readable file(s)."
         if none. return_json=True: a JSON array of match objects
-        (Filename, LineNumber/Unit/UnitLabel/Location, LineContent)
-        instead of formatted text.
+        (Filename, LineNumber/Unit/UnitLabel/Location, LineContent).
     """
     try:
         start = _safe_path(path)
