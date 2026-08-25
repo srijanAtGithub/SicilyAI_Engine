@@ -8,7 +8,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import time
 import uuid
 from pathlib import Path
 from typing import Optional, Callable
@@ -215,6 +214,192 @@ BINARY_UNIT_LABELS: dict[str, str] = {
     ".xls": "sheet",
     ".docx": "paragraph",
 }
+
+
+# One lazily-built vision sub-client, separate from the main agent LLM.
+# Kept cheap/fast on purpose — this never runs at xhigh reasoning effort,
+# it just answers a bounded visual question and returns text. Reusing the
+# main orchestrator model here would re-inject raw image tokens into the
+# expensive, long-lived agent loop for no benefit (see design note on
+# view_image below).
+_VISION_LLM = None
+
+
+def _get_vision_llm():
+    global _VISION_LLM
+    if _VISION_LLM is None:
+        from langchain_openai import ChatOpenAI
+        _VISION_LLM = ChatOpenAI(
+            model="gpt-5.6-luna",     # same model family; capability, not reasoning cost, is what's needed here
+            use_responses_api=True,
+            reasoning_effort="low",   # this is a lookup, not a plan — keep it fast/cheap
+            max_retries=0,
+        )
+    return _VISION_LLM
+
+
+# ---------------------------------------------------------------------------
+# Tier 0: RapidOCR — free, local, CPU, no LLM call.
+# Same underlying PP-OCR models as PaddleOCR, exported to ONNX, so accuracy
+# is basically equivalent while install/runtime footprint is much lighter.
+# Lazily built once, reused across calls.
+# ---------------------------------------------------------------------------
+_OCR_ENGINE = None
+ 
+ 
+def _get_ocr_engine():
+    global _OCR_ENGINE
+    if _OCR_ENGINE is None:
+        from rapidocr_onnxruntime import RapidOCR
+        _OCR_ENGINE = RapidOCR()
+    return _OCR_ENGINE
+ 
+ 
+def _run_ocr(file_path: Path, *, _retry_on_empty: bool = True) -> dict:
+    """
+    Run RapidOCR on a single image.
+    Returns {"text": str, "avg_confidence": float, "n_boxes": int,
+    "detected": bool, "error": str | None}.
+
+    "detected": False + no error means the engine ran cleanly but the
+    detector found zero text regions — most commonly caused by low
+    contrast, skew, blur, or an oversized/undersized image confusing the
+    detection model's input scaling. This is NOT the same as "no text
+    exists in the image" (a dense, clearly-text-heavy image scoring zero
+    boxes is a strong signal something upstream is wrong, not that OCR
+    correctly determined the image is textless).
+
+    On a first-pass empty result, retries once against a normalized copy
+    (upscaled if small, downscaled if huge, converted to plain RGB) before
+    giving up — this recovers a meaningful fraction of "text-heavy image,
+    zero boxes" cases that are really a detector input-scaling issue
+    rather than an unreadable image.
+    """
+    engine = _get_ocr_engine()
+
+    try:
+        result, _elapse = engine(str(file_path))
+    except Exception as e:
+        return {
+            "text": "", "avg_confidence": 0.0, "n_boxes": 0,
+            "detected": False, "error": f"{type(e).__name__}: {e}",
+        }
+
+    if not result and _retry_on_empty:
+        normalized = _normalize_for_ocr(file_path)
+        if normalized is not None:
+            try:
+                result, _elapse = engine(str(normalized))
+            except Exception as e:
+                return {
+                    "text": "", "avg_confidence": 0.0, "n_boxes": 0,
+                    "detected": False,
+                    "error": f"retry after normalize failed: {type(e).__name__}: {e}",
+                }
+            finally:
+                try:
+                    normalized.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    if not result:
+        # Ran cleanly (possibly twice), genuinely zero text regions detected.
+        return {
+            "text": "", "avg_confidence": 0.0, "n_boxes": 0,
+            "detected": False, "error": None,
+        }
+
+    # Each entry: [box_points, text, confidence]
+    lines = [r[1] for r in result]
+    confidences = [r[2] for r in result]
+
+    return {
+        "text": "\n".join(lines),
+        "avg_confidence": sum(confidences) / len(confidences),
+        "n_boxes": len(result),
+        "detected": True,
+        "error": None,
+    }
+
+
+def _normalize_for_ocr(file_path: Path) -> Optional[Path]:
+    """
+    Best-effort preprocessing for a rescue retry after detection finds
+    zero boxes on the first pass:
+      - convert to plain RGB (drops alpha/CMYK/palette weirdness some
+        detectors mishandle)
+      - upscale if the shorter side is small (helps detect small/dense
+        text on e.g. a photographed receipt)
+      - downscale if a dimension is huge (keeps detector input-size
+        assumptions sane on e.g. raw phone-camera photos)
+    Returns the path to a temp copy, or None if PIL isn't available or
+    preprocessing itself fails (caller just treats this as "no rescue
+    available" and keeps the original empty result).
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+
+    try:
+        with Image.open(file_path) as img:
+            img = img.convert("RGB")
+            w, h = img.size
+            short_side = min(w, h)
+            long_side = max(w, h)
+
+            if short_side < 600:
+                scale = 600 / short_side
+                img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            elif long_side > 4000:
+                scale = 4000 / long_side
+                img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+            tmp_path = file_path.with_name(f".__ocr_retry__{file_path.stem}.png")
+            img.save(tmp_path, format="PNG")
+            return tmp_path
+    except Exception:
+        return None
+ 
+ 
+# Keywords that suggest the user just wants raw text, not visual reasoning.
+_TEXT_ONLY_HINTS = (
+    "extract", "read", "transcribe", "ocr", "what does it say",
+    "what text", "copy the text", "all the text", "verbatim",
+)
+ 
+# Keywords that suggest the question needs actual visual understanding —
+# OCR text alone won't answer these, so always go to the vision LLM.
+_VISUAL_HINTS = (
+    "color", "colour", "chart", "graph", "diagram", "layout", "design",
+    "icon", "photo", "image show", "look like", "visually", "style",
+    "logo", "shape", "position", "arrange",
+)
+ 
+ 
+def _looks_text_only(question: str) -> bool:
+    q = question.lower()
+    if any(h in q for h in _VISUAL_HINTS):
+        return False
+    return any(h in q for h in _TEXT_ONLY_HINTS)
+ 
+ 
+# Confidence threshold above which we trust OCR-only output for a text-only
+# question and skip the vision LLM entirely.
+_OCR_CONFIDENCE_THRESHOLD = 0.85
+
+
+# Caps on read_file's UNRANGED ("full read") path — the one a model falls
+# into by omitting start_line/end_line/start_unit/end_unit entirely. This
+# is the actual risk surface for cost/latency: a targeted range is already
+# capped (500 lines / 50 units, enforced above), but nothing previously
+# stopped an unranged call from returning an entire 300-page PDF or
+# 500-slide deck in one shot. These constants are that backstop — past
+# them, a full read auto-downgrades to a preview + explicit paging
+# instruction instead of dumping everything.
+_FULL_READ_MAX_LINES = 500     # text files
+_FULL_READ_MAX_UNITS = 20      # binary documents (pages/slides/sheets/paragraphs)
+_FULL_READ_PREVIEW_UNITS = 3   # units shown in the preview when capped
 
 
 # DOCX: python-docx exposes doc.paragraphs and doc.tables as separate flat

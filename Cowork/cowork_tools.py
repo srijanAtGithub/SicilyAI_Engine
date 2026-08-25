@@ -10,9 +10,10 @@ import re
 import shutil
 from pathlib import Path
 import fnmatch
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Literal
 
 from langchain_core.tools import tool
+from Cowork.debug_log import log_tool_call  # adjust import path to match your project
 from Cowork.cowork_helpers import (
     _safe_path,
     _read_binary,
@@ -37,42 +38,15 @@ from Cowork.cowork_helpers import (
     _IMAGE_EXTENSIONS,
     _MAX_IMAGES_PER_CALL,
     _extract_text,
+    _get_vision_llm,
+    _looks_text_only,
+    _OCR_CONFIDENCE_THRESHOLD,
+    _run_ocr,
+    _FULL_READ_PREVIEW_UNITS,
+    _FULL_READ_MAX_UNITS,
+    _FULL_READ_MAX_LINES
 )
 from Cowork.cowork_tool_sandbox_exec import run_script, apply_change, rollback_change
-
-# One lazily-built vision sub-client, separate from the main agent LLM.
-# Kept cheap/fast on purpose — this never runs at xhigh reasoning effort,
-# it just answers a bounded visual question and returns text. Reusing the
-# main orchestrator model here would re-inject raw image tokens into the
-# expensive, long-lived agent loop for no benefit (see design note on
-# view_image below).
-_VISION_LLM = None
-
-
-def _get_vision_llm():
-    global _VISION_LLM
-    if _VISION_LLM is None:
-        from langchain_openai import ChatOpenAI
-        _VISION_LLM = ChatOpenAI(
-            model="gpt-5.6-luna",     # same model family; capability, not reasoning cost, is what's needed here
-            use_responses_api=True,
-            reasoning_effort="low",   # this is a lookup, not a plan — keep it fast/cheap
-            max_retries=0,
-        )
-    return _VISION_LLM
-
-
-# Caps on read_file's UNRANGED ("full read") path — the one a model falls
-# into by omitting start_line/end_line/start_unit/end_unit entirely. This
-# is the actual risk surface for cost/latency: a targeted range is already
-# capped (500 lines / 50 units, enforced above), but nothing previously
-# stopped an unranged call from returning an entire 300-page PDF or
-# 500-slide deck in one shot. These constants are that backstop — past
-# them, a full read auto-downgrades to a preview + explicit paging
-# instruction instead of dumping everything.
-_FULL_READ_MAX_LINES = 500     # text files
-_FULL_READ_MAX_UNITS = 20      # binary documents (pages/slides/sheets/paragraphs)
-_FULL_READ_PREVIEW_UNITS = 3   # units shown in the preview when capped
 
 
 # READ-ONLY TOOLS
@@ -357,54 +331,68 @@ def check_binary_write_libraries() -> str:
 
 
 @tool
-def view_image(paths: Union[str, List[str]], question: str) -> str:
+def view_image(
+    paths: Union[str, List[str]],
+    question: str,
+    mode: Literal["auto", "ocr", "vision"] = "auto",
+) -> str:
     """
     Ask a specific question about one or more images
     (.png/.jpg/.jpeg/.gif/.webp) and get a text answer.
-
+ 
     Pass multiple paths in one call when the question spans several images
     (compare, summarize a batch) rather than calling once per image.
     Max 8 images/call.
-
+ 
     Args:
         paths:    A single image path, or a list of paths (relative to
                   sandbox root).
         question: What you want to know about the image(s). Required —
                   a missing question wastes the call.
-
+        mode:     "auto" (default) — runs free local OCR first; if the
+                  question is purely about text and OCR confidence is high,
+                  returns the OCR result directly with no LLM call. Otherwise
+                  falls back to the vision LLM, primed with the OCR text as
+                  a hint.
+                  "ocr" — local OCR only, no LLM call, fastest/cheapest.
+                  Use when you only need raw text and don't care about
+                  layout/visual reasoning.
+                  "vision" — skip OCR, go straight to the vision LLM. Use
+                  for photos, charts, diagrams, colors, UI screenshots, or
+                  anything needing actual visual understanding.
+ 
     Returns:
         A text answer. Per-image load errors are reported inline without
         failing the whole call.
     """
     if isinstance(paths, str):
         paths = [paths]
-
+ 
     if not paths:
         return "Error: at least one image path is required."
-
+ 
     if len(paths) > _MAX_IMAGES_PER_CALL:
         return (
             f"Error: {len(paths)} images requested, max is "
             f"{_MAX_IMAGES_PER_CALL} per call. Split into multiple calls."
         )
-
+ 
     if not question or not question.strip():
         return (
             "Error: a question is required — e.g. 'what does this "
             "screenshot show?' Sending an image with no question wastes "
             "the call, since nothing is extracted from it."
         )
-
-    content_blocks = [{"type": "text", "text": question}]
-    loaded, errors = [], []
-
+ 
+    # ---- validate + collect image paths (same as before) ----
+    loaded, errors, file_paths = [], [], []
     for p in paths:
         try:
             file_path = _safe_path(p)
         except PermissionError as e:
             errors.append(f"'{p}': {e}")
             continue
-
+ 
         if not file_path.exists():
             errors.append(f"'{p}': does not exist.")
             continue
@@ -417,36 +405,140 @@ def view_image(paths: Union[str, List[str]], question: str) -> str:
                 f"({', '.join(_IMAGE_EXTENSIONS)})."
             )
             continue
+ 
+        file_paths.append((p, file_path))
+        loaded.append(p)
+ 
+    if not loaded:
+        return "Could not load any images:\n" + "\n".join(errors)
+ 
+    # -----------------------------------------------------------------
+    # Tier 0: run local OCR (needed for "ocr" mode, and for "auto" mode
+    # to decide whether the vision LLM is needed at all).
+    # -----------------------------------------------------------------
+    ocr_results = {}
+    if mode in ("ocr", "auto"):
+        for p, file_path in file_paths:
+            try:
+                ocr_results[p] = _run_ocr(file_path)
+            except Exception as e:
+                # Belt-and-suspenders: _run_ocr already catches internally,
+                # this only fires on something even more unexpected (e.g.
+                # the normalize-retry temp file itself blowing up).
+                ocr_results[p] = {
+                    "text": "", "avg_confidence": 0.0, "n_boxes": 0,
+                    "detected": False, "error": f"{type(e).__name__}: {e}",
+                }
 
+    if mode == "ocr":
+        ocr_debug = {
+            p: {"n_boxes": ocr_results[p].get("n_boxes"), "detected": ocr_results[p].get("detected"),
+                "error": ocr_results[p].get("error")}
+            for p in loaded
+        }
+        log_tool_call("view_image._route", {"path": "OCR_ONLY", "reason": "mode=ocr", "images": loaded, "ocr_debug": ocr_debug})
+        parts = [f"[OCR: {', '.join(loaded)}]"]
+        for p in loaded:
+            r = ocr_results[p]
+            if r.get("error"):
+                parts.append(f"\n--- {p} ---\nOCR failed: {r['error']}")
+            elif not r["text"]:
+                parts.append(f"\n--- {p} ---\n(no text detected — {r.get('n_boxes', 0)} regions found)")
+            else:
+                parts.append(
+                    f"\n--- {p} (confidence {r['avg_confidence']:.2f}, {r.get('n_boxes', 0)} regions) ---\n{r['text']}"
+                )
+        if errors:
+            parts.append("\nSkipped — " + "; ".join(errors))
+        return "\n".join(parts)
+
+    # -----------------------------------------------------------------
+    # Tier "auto": if it's a text-only question and OCR is confident
+    # across all images, skip the vision LLM entirely.
+    # -----------------------------------------------------------------
+    if mode == "auto" and _looks_text_only(question):
+        confidences = {p: ocr_results[p]["avg_confidence"] for p in loaded}
+        ocr_debug = {
+            p: {"n_boxes": ocr_results[p].get("n_boxes"), "detected": ocr_results[p].get("detected"),
+                "error": ocr_results[p].get("error")}
+            for p in loaded
+        }
+        all_confident = all(
+            ocr_results[p]["text"] and ocr_results[p]["avg_confidence"] >= _OCR_CONFIDENCE_THRESHOLD
+            for p in loaded
+        )
+        if all_confident:
+            log_tool_call("view_image._route", {
+                "path": "OCR_ONLY", "reason": "auto_text_only_high_confidence",
+                "images": loaded, "confidences": confidences, "threshold": _OCR_CONFIDENCE_THRESHOLD,
+            })
+            parts = [f"[OCR: {', '.join(loaded)}]"]
+            for p in loaded:
+                r = ocr_results[p]
+                parts.append(f"\n--- {p} ---\n{r['text']}")
+            if errors:
+                parts.append("\nSkipped — " + "; ".join(errors))
+            return "\n".join(parts)
+        # else: fall through to vision LLM below, OCR text still used as a hint
+        log_tool_call("view_image._route", {
+            "path": "VISION_LLM", "reason": "auto_text_only_low_confidence",
+            "images": loaded, "confidences": confidences, "threshold": _OCR_CONFIDENCE_THRESHOLD,
+            "ocr_debug": ocr_debug,
+        })
+    elif mode == "auto":
+        log_tool_call("view_image._route", {"path": "VISION_LLM", "reason": "auto_visual_question", "images": loaded})
+    elif mode == "vision":
+        log_tool_call("view_image._route", {"path": "VISION_LLM", "reason": "mode=vision", "images": loaded})
+ 
+    # -----------------------------------------------------------------
+    # Tier 1: vision LLM (mode == "vision", or "auto" falling through).
+    # If we already ran OCR, prime the prompt with it so the model
+    # doesn't have to re-derive text from raw pixels.
+    # -----------------------------------------------------------------
+    prompt_text = question
+    if ocr_results:
+        ocr_hint_parts = []
+        for p in loaded:
+            r = ocr_results[p]
+            if r["text"]:
+                ocr_hint_parts.append(f"[{p}]\n{r['text']}")
+        if ocr_hint_parts:
+            prompt_text = (
+                f"{question}\n\n"
+                "Reference — text auto-extracted via OCR from the image(s) "
+                "below (may contain errors, use the image as ground truth "
+                "if they conflict):\n" + "\n\n".join(ocr_hint_parts)
+            )
+ 
+    content_blocks = [{"type": "text", "text": prompt_text}]
+    for p, file_path in file_paths:
         try:
             data, mime = _encode_image(file_path)
         except ValueError as e:
             errors.append(f"'{p}': {e}")
+            loaded.remove(p) if p in loaded else None
             continue
-
         content_blocks.append({
             "type": "image_url",
             "image_url": {"url": f"data:{mime};base64,{data}"},
         })
-        loaded.append(p)
-
-    if not loaded:
+ 
+    if len(content_blocks) == 1:  # only the text block, all images failed encoding
         return "Could not load any images:\n" + "\n".join(errors)
-
+ 
     try:
+        import time
         from langchain_core.messages import HumanMessage
-        response = _get_vision_llm().invoke([HumanMessage(content=content_blocks)])
-        answer = response.content
-    except Exception as e:
-        return f"Vision request failed: {e}"
-
-    try:
-        from langchain_core.messages import HumanMessage
+        _t0 = time.monotonic()
         response = _get_vision_llm().invoke([HumanMessage(content=content_blocks)])
         answer = _extract_text(response.content)
+        log_tool_call("view_image._vision_llm_call", {
+            "images": loaded, "elapsed_s": round(time.monotonic() - _t0, 2),
+        })
     except Exception as e:
+        log_tool_call("view_image._vision_llm_call", {"images": loaded, "error": str(e)})
         return f"Vision request failed: {e}"
-
+ 
     prefix = f"[Viewed: {', '.join(loaded)}]\n"
     if errors:
         prefix += "Skipped — " + "; ".join(errors) + "\n"
@@ -961,6 +1053,7 @@ def find_files_by_name(
     path: str,
     pattern: str,
     exclude_patterns: list[str] = [],
+    includes: Optional[list[str]] = None,
     max_results: int = 100,
 ) -> str:
     """
@@ -975,6 +1068,8 @@ def find_files_by_name(
         pattern:          Glob pattern matched against each entry's name.
         exclude_patterns: Optional glob patterns to exclude, matched
                           against both the entry name and relative path.
+        includes:         Optional glob filters to explicitly include, e.g. 
+                          ["*.png", "*.ts", "!**/tests/*"].
         max_results:      Stop after this many matches (default 100, hard cap 200).
     """
     import fnmatch
@@ -995,6 +1090,21 @@ def find_files_by_name(
     matches: list[str] = []
     entries_scanned = 0
     scan_capped = False
+
+    def _should_include(file_rel_path: str, file_name: str) -> bool:
+        if not includes:
+            return True
+        included = False
+        for inc in includes:
+            # Support negative includes similar to search_file_contents
+            if inc.startswith("!"):
+                if fnmatch.fnmatch(file_name, inc[1:]) or fnmatch.fnmatch(file_rel_path, inc[1:]):
+                    return False
+            else:
+                if fnmatch.fnmatch(file_name, inc) or fnmatch.fnmatch(file_rel_path, inc):
+                    included = True
+        # If user only passed negative filters ("!*"), everything else defaults to True
+        return included if any(not inc.startswith("!") for inc in includes) else True
 
     def _walk(directory: Path) -> None:
         nonlocal entries_scanned, scan_capped
@@ -1018,14 +1128,17 @@ def find_files_by_name(
             entries_scanned += 1
             rel = str(child.relative_to(root))
 
+            # Exclude check
             if any(
                 fnmatch.fnmatch(child.name, xp) or fnmatch.fnmatch(rel, xp)
                 for xp in exclude_patterns
             ):
                 continue
 
+            # Inclusion and pattern match
             if fnmatch.fnmatch(child.name, pattern):
-                matches.append(rel)
+                if _should_include(rel, child.name):
+                    matches.append(rel)
 
             if child.is_dir():
                 _walk(child)
