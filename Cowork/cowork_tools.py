@@ -9,11 +9,11 @@ All tools are locked to a single root directory (the cwd `sicily start` was invo
 import re
 import shutil
 from pathlib import Path
-import json
 import fnmatch
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Literal
 
 from langchain_core.tools import tool
+from Cowork.debug_log import log_tool_call  # adjust import path to match your project
 from Cowork.cowork_helpers import (
     _safe_path,
     _read_binary,
@@ -25,55 +25,50 @@ from Cowork.cowork_helpers import (
     _list_directory_entries,
     _describe_path,
     _validate_fileops_command,
-    _move_to_trash,
     _SKIP_DIRS,
     _BINARY_EXTENSIONS,
     _ALLOWED_WRITE_EXTENSIONS,
     MANAGEABLE_EXTENSIONS,
-    TRASH_DIR_NAME,
     READABLE_EXTENSIONS,
     CommandValidationError,
     build_binary_file,
     _format_script_library_status,
     _fmt_delete_path_arg,
+    _encode_image,
+    _IMAGE_EXTENSIONS,
+    _MAX_IMAGES_PER_CALL,
+    _extract_text,
+    _get_vision_llm,
+    _looks_text_only,
+    _OCR_CONFIDENCE_THRESHOLD,
+    _run_ocr,
+    _FULL_READ_PREVIEW_UNITS,
+    _FULL_READ_MAX_UNITS,
+    _FULL_READ_MAX_LINES
 )
-
-
-# Caps on read_file's UNRANGED ("full read") path — the one a model falls
-# into by omitting start_line/end_line/start_unit/end_unit entirely. This
-# is the actual risk surface for cost/latency: a targeted range is already
-# capped (500 lines / 50 units, enforced above), but nothing previously
-# stopped an unranged call from returning an entire 300-page PDF or
-# 500-slide deck in one shot. These constants are that backstop — past
-# them, a full read auto-downgrades to a preview + explicit paging
-# instruction instead of dumping everything.
-_FULL_READ_MAX_LINES = 500     # text files
-_FULL_READ_MAX_UNITS = 20      # binary documents (pages/slides/sheets/paragraphs)
-_FULL_READ_PREVIEW_UNITS = 3   # units shown in the preview when capped
+from Cowork.cowork_tool_sandbox_exec import run_script, apply_change, rollback_change
 
 
 # READ-ONLY TOOLS
 @tool
 def search_index(query: str) -> str:
     """
-    Semantic search over the sandbox's RAG index (.txt, .md, .pdf, .docx,
-    .xlsx, .py, .json, .csv, and more). Returns top matching snippets with
-    file path and position.
+    Semantic search over the sandbox's index (.txt, .md, .pdf, .docx, .xlsx,
+    .py, .json, .csv, and more).
 
-    Prefer this over read_file for "find X in this document" on any file
-    you haven't already confirmed is short — it returns only the relevant
-    snippets instead of a full read, at a fraction of the token cost, and
-    works even when you don't know which page/slide/sheet the answer is
-    on. Use read_file instead when you already know the exact unit/line
-    range you need, or need the full unmodified text of a short file.
+    For a focused lookup ("which file has X", "where is X defined"), one or
+    two well-chosen queries should surface the answer — a soft budget of
+    ~10 tool calls total across all tools for that kind of question is a
+    signal to stop and reconsider, not push further with more queries.
+    Don't repeat this with near-synonymous phrasing; rephrase only if the
+    first query's results were clearly off-target.
 
     Args:
-        query: Plain-language description of what you're looking for,
-               e.g. "quarterly budget figures".
+        query: Plain-language description of what you're looking for.
 
     Returns:
-        Formatted top-matching snippets with file path and position, or
-        a message that the index has no relevant matches.
+        Top matching snippets with file path and position, or a message
+        that nothing matched.
     """
     from Cowork.cowork_rag import get_rag   # adjust import path to match your project
     rag = get_rag()
@@ -94,44 +89,41 @@ def read_file(
     """
     Read a file as plain text, in full or by a targeted range.
 
-    Text files: use start_line/end_line, 1-indexed inclusive, max 500
-    lines/call.
+    Text files: start_line/end_line, 1-indexed inclusive, max 500 lines/call.
 
-    Binary documents (.pdf/.docx/.xlsx/.xls/.pptx): use start_unit/
-    end_unit instead — line numbers don't apply. A unit is the format's
-    own structural division: .pdf=page, .pptx=slide, .xlsx/.xls=sheet
-    (by order, not name), .docx=paragraph (no page concept in the file
-    format). 1-indexed inclusive, max 50 units/call. Extraction per
-    format: .pdf per-page (plus trailing form fields on a full read),
-    .docx per-paragraph, .xlsx/.xls per-sheet tab-separated, .pptx
-    per-slide with text/tables/notes.
+    Binary documents (.pdf/.docx/.xlsx/.xls/.pptx): start_unit/end_unit
+    instead. A unit = the format's own division: .pdf=page, .pptx=slide,
+    .xlsx/.xls=sheet (by order), .docx=paragraph. 1-indexed inclusive,
+    max 50 units/call. Use one mechanism matching the file's type, not both.
 
-    Use one mechanism matching the file's type, not both.
+    0/0 on both (default) = full file, capped at 500 lines / 20 units —
+    past that you get a preview + true total; page through with the range
+    args. The returned header always states the true total.
 
-    0/0 on both (default) = full file/document — but only up to
-    500 lines / 20 units. Past that, you get a preview (first 3 units, or
-    the text-file equivalent) plus the true total, not the whole thing —
-    large files must be paged with start_unit/end_unit (or start_line/
-    end_line) instead of read in one call. Check the header on any full
-    read: it states the true total, so if it's larger than what a preview
-    would show, switch to a ranged call. For "find X in this document"
-    without knowing which page/slide it's on, prefer search_index — it's
-    cheaper and works regardless of document length.
+    Investigating rather than building/converting: reading the same file
+    more than twice in one investigation is a signal the answer isn't in
+    it — report what you found and move on, or ask, rather than trying a
+    third range/angle. Following a lead into another file (e.g. the
+    function this file calls) is fine; opening an unrelated subsystem
+    because it happened to come up is not — stop and confirm with the user
+    first if the question's scope is unclear.
 
     Args:
         path:       Relative path to the file.
         start_line: Text files only — first line (1-indexed). 0 for full/preview.
         end_line:   Text files only — last line (inclusive). 0 for full/preview.
-        start_unit: Binary documents only — first page/slide/sheet/paragraph (1-indexed). 0 for full/preview.
-        end_unit:   Binary documents only — last page/slide/sheet/paragraph (inclusive). 0 for full/preview.
+        start_unit: Binary documents only — first page/slide/sheet/paragraph
+                    (1-indexed). 0 for full/preview.
+        end_unit:   Binary documents only — last page/slide/sheet/paragraph
+                    (inclusive). 0 for full/preview.
 
     Returns:
-        A header line stating what was read and the true total ("lines
-        1–500 of 3200" or "pages 1–3 of 340 (PREVIEW — capped; use
+        A header line stating what was read and the true total
+        ("lines 1-500 of 3200" or "pages 1-3 of 340 (PREVIEW — capped; use
         start_unit/end_unit to page through the rest)"), followed by the
         content. On error: a plain-text explanation (bad range, wrong
-        mechanism for this file type, file not found, unsupported/legacy
-        format, missing package) — never raises.
+        mechanism, file not found, unsupported format, missing package) —
+        never raises.
     """
     line_ranged = start_line > 0 or end_line > 0
     unit_ranged = start_unit > 0 or end_unit > 0
@@ -177,6 +169,10 @@ def read_file(
             f"read. Re-save the file as {modern_ext} (e.g. via 'Save As' in "
             "Word/PowerPoint) and try again."
         )
+
+    # checking for images:
+    if suffix in _IMAGE_EXTENSIONS:
+        return f"'{path}' is an image — use view_image instead, with a question about what you need from it."
 
     is_binary = suffix in _BINARY_EXTENSIONS
 
@@ -335,6 +331,221 @@ def check_binary_write_libraries() -> str:
 
 
 @tool
+def view_image(
+    paths: Union[str, List[str]],
+    question: str,
+    mode: Literal["auto", "ocr", "vision"] = "auto",
+) -> str:
+    """
+    Ask a specific question about one or more images
+    (.png/.jpg/.jpeg/.gif/.webp) and get a text answer.
+ 
+    Pass multiple paths in one call when the question spans several images
+    (compare, summarize a batch) rather than calling once per image.
+    Max 8 images/call.
+ 
+    Args:
+        paths:    A single image path, or a list of paths (relative to
+                  sandbox root).
+        question: What you want to know about the image(s). Required —
+                  a missing question wastes the call.
+        mode:     "auto" (default) — runs free local OCR first; if the
+                  question is purely about text and OCR confidence is high,
+                  returns the OCR result directly with no LLM call. Otherwise
+                  falls back to the vision LLM, primed with the OCR text as
+                  a hint.
+                  "ocr" — local OCR only, no LLM call, fastest/cheapest.
+                  Use when you only need raw text and don't care about
+                  layout/visual reasoning.
+                  "vision" — skip OCR, go straight to the vision LLM. Use
+                  for photos, charts, diagrams, colors, UI screenshots, or
+                  anything needing actual visual understanding.
+ 
+    Returns:
+        A text answer. Per-image load errors are reported inline without
+        failing the whole call.
+    """
+    if isinstance(paths, str):
+        paths = [paths]
+ 
+    if not paths:
+        return "Error: at least one image path is required."
+ 
+    if len(paths) > _MAX_IMAGES_PER_CALL:
+        return (
+            f"Error: {len(paths)} images requested, max is "
+            f"{_MAX_IMAGES_PER_CALL} per call. Split into multiple calls."
+        )
+ 
+    if not question or not question.strip():
+        return (
+            "Error: a question is required — e.g. 'what does this "
+            "screenshot show?' Sending an image with no question wastes "
+            "the call, since nothing is extracted from it."
+        )
+ 
+    # ---- validate + collect image paths (same as before) ----
+    loaded, errors, file_paths = [], [], []
+    for p in paths:
+        try:
+            file_path = _safe_path(p)
+        except PermissionError as e:
+            errors.append(f"'{p}': {e}")
+            continue
+ 
+        if not file_path.exists():
+            errors.append(f"'{p}': does not exist.")
+            continue
+        if not file_path.is_file():
+            errors.append(f"'{p}': is a directory, not a file.")
+            continue
+        if file_path.suffix.lower() not in _IMAGE_EXTENSIONS:
+            errors.append(
+                f"'{p}': not a supported image format "
+                f"({', '.join(_IMAGE_EXTENSIONS)})."
+            )
+            continue
+ 
+        file_paths.append((p, file_path))
+        loaded.append(p)
+ 
+    if not loaded:
+        return "Could not load any images:\n" + "\n".join(errors)
+ 
+    # -----------------------------------------------------------------
+    # Tier 0: run local OCR (needed for "ocr" mode, and for "auto" mode
+    # to decide whether the vision LLM is needed at all).
+    # -----------------------------------------------------------------
+    ocr_results = {}
+    if mode in ("ocr", "auto"):
+        for p, file_path in file_paths:
+            try:
+                ocr_results[p] = _run_ocr(file_path)
+            except Exception as e:
+                # Belt-and-suspenders: _run_ocr already catches internally,
+                # this only fires on something even more unexpected (e.g.
+                # the normalize-retry temp file itself blowing up).
+                ocr_results[p] = {
+                    "text": "", "avg_confidence": 0.0, "n_boxes": 0,
+                    "detected": False, "error": f"{type(e).__name__}: {e}",
+                }
+
+    if mode == "ocr":
+        ocr_debug = {
+            p: {"n_boxes": ocr_results[p].get("n_boxes"), "detected": ocr_results[p].get("detected"),
+                "error": ocr_results[p].get("error")}
+            for p in loaded
+        }
+        log_tool_call("view_image._route", {"path": "OCR_ONLY", "reason": "mode=ocr", "images": loaded, "ocr_debug": ocr_debug})
+        parts = [f"[OCR: {', '.join(loaded)}]"]
+        for p in loaded:
+            r = ocr_results[p]
+            if r.get("error"):
+                parts.append(f"\n--- {p} ---\nOCR failed: {r['error']}")
+            elif not r["text"]:
+                parts.append(f"\n--- {p} ---\n(no text detected — {r.get('n_boxes', 0)} regions found)")
+            else:
+                parts.append(
+                    f"\n--- {p} (confidence {r['avg_confidence']:.2f}, {r.get('n_boxes', 0)} regions) ---\n{r['text']}"
+                )
+        if errors:
+            parts.append("\nSkipped — " + "; ".join(errors))
+        return "\n".join(parts)
+
+    # -----------------------------------------------------------------
+    # Tier "auto": if it's a text-only question and OCR is confident
+    # across all images, skip the vision LLM entirely.
+    # -----------------------------------------------------------------
+    if mode == "auto" and _looks_text_only(question):
+        confidences = {p: ocr_results[p]["avg_confidence"] for p in loaded}
+        ocr_debug = {
+            p: {"n_boxes": ocr_results[p].get("n_boxes"), "detected": ocr_results[p].get("detected"),
+                "error": ocr_results[p].get("error")}
+            for p in loaded
+        }
+        all_confident = all(
+            ocr_results[p]["text"] and ocr_results[p]["avg_confidence"] >= _OCR_CONFIDENCE_THRESHOLD
+            for p in loaded
+        )
+        if all_confident:
+            log_tool_call("view_image._route", {
+                "path": "OCR_ONLY", "reason": "auto_text_only_high_confidence",
+                "images": loaded, "confidences": confidences, "threshold": _OCR_CONFIDENCE_THRESHOLD,
+            })
+            parts = [f"[OCR: {', '.join(loaded)}]"]
+            for p in loaded:
+                r = ocr_results[p]
+                parts.append(f"\n--- {p} ---\n{r['text']}")
+            if errors:
+                parts.append("\nSkipped — " + "; ".join(errors))
+            return "\n".join(parts)
+        # else: fall through to vision LLM below, OCR text still used as a hint
+        log_tool_call("view_image._route", {
+            "path": "VISION_LLM", "reason": "auto_text_only_low_confidence",
+            "images": loaded, "confidences": confidences, "threshold": _OCR_CONFIDENCE_THRESHOLD,
+            "ocr_debug": ocr_debug,
+        })
+    elif mode == "auto":
+        log_tool_call("view_image._route", {"path": "VISION_LLM", "reason": "auto_visual_question", "images": loaded})
+    elif mode == "vision":
+        log_tool_call("view_image._route", {"path": "VISION_LLM", "reason": "mode=vision", "images": loaded})
+ 
+    # -----------------------------------------------------------------
+    # Tier 1: vision LLM (mode == "vision", or "auto" falling through).
+    # If we already ran OCR, prime the prompt with it so the model
+    # doesn't have to re-derive text from raw pixels.
+    # -----------------------------------------------------------------
+    prompt_text = question
+    if ocr_results:
+        ocr_hint_parts = []
+        for p in loaded:
+            r = ocr_results[p]
+            if r["text"]:
+                ocr_hint_parts.append(f"[{p}]\n{r['text']}")
+        if ocr_hint_parts:
+            prompt_text = (
+                f"{question}\n\n"
+                "Reference — text auto-extracted via OCR from the image(s) "
+                "below (may contain errors, use the image as ground truth "
+                "if they conflict):\n" + "\n\n".join(ocr_hint_parts)
+            )
+ 
+    content_blocks = [{"type": "text", "text": prompt_text}]
+    for p, file_path in file_paths:
+        try:
+            data, mime = _encode_image(file_path)
+        except ValueError as e:
+            errors.append(f"'{p}': {e}")
+            loaded.remove(p) if p in loaded else None
+            continue
+        content_blocks.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{data}"},
+        })
+ 
+    if len(content_blocks) == 1:  # only the text block, all images failed encoding
+        return "Could not load any images:\n" + "\n".join(errors)
+ 
+    try:
+        import time
+        from langchain_core.messages import HumanMessage
+        _t0 = time.monotonic()
+        response = _get_vision_llm().invoke([HumanMessage(content=content_blocks)])
+        answer = _extract_text(response.content)
+        log_tool_call("view_image._vision_llm_call", {
+            "images": loaded, "elapsed_s": round(time.monotonic() - _t0, 2),
+        })
+    except Exception as e:
+        log_tool_call("view_image._vision_llm_call", {"images": loaded, "error": str(e)})
+        return f"Vision request failed: {e}"
+ 
+    prefix = f"[Viewed: {', '.join(loaded)}]\n"
+    if errors:
+        prefix += "Skipped — " + "; ".join(errors) + "\n"
+    return prefix + answer
+
+
+@tool
 def write_file(
     path: str,
     content: str = "",
@@ -347,43 +558,40 @@ def write_file(
     """
     Create a new file, or replace a line range in an existing text file.
 
-    mode="create" (default): writes `content` to `path`; refuses if the
-    path already exists. Parent dirs auto-created when create_parents=True.
+    mode="create" (default): writes `content` to `path` verbatim; refuses
+    if the path exists. Parent dirs auto-created when create_parents=True.
 
-    mode="edit": replaces lines [start_line, end_line] (1-indexed,
-    inclusive) with `content` ("" to delete the range); file must already
-    exist. dry_run=True (default) previews as a diff; dry_run=False
-    applies. Text extensions only — not supported for .docx/.xlsx/.pptx/
-    .pdf.
+    mode="edit": replaces lines [start_line, end_line] (1-indexed inclusive)
+    with `content` ("" to delete the range); file must exist. dry_run=True
+    (default) previews as a diff. Text extensions only.
 
     --- Binary formats (.docx, .xlsx, .xls, .pptx, .pdf) ---
+    mode="create" only. `content` must be a standalone Python 3 script that
+    builds the file, not the file content itself. Requirements:
+    1. Don't read/reference any path other than the script's own working dir.
+    2. Save the result to exactly: .docx->"__cowork_output__.docx",
+       .xlsx->"__cowork_output__.xlsx", .pptx->"__cowork_output__.pptx",
+       .xls->"__cowork_output__.xls", .pdf->"__cowork_output__.pdf".
+    Validated by opening with the matching reader library, then copied to
+    `path`. Any failure (script error, timeout, missing/invalid output)
+    writes nothing and returns the specific error — read it, fix the
+    specific cause, retry. After 2 failed retries on the same file, stop
+    and show the user the exact error rather than continuing to guess.
 
-    mode="create" only. `content` is not written verbatim — it must be a
-    full standalone Python 3 script that builds the file, using whatever
-    library and structure you choose. Two hard requirements, everything
-    else is free:
-      1. The script's working directory contains nothing else — don't
-         read/reference any other path.
-      2. Save the result to exactly this filename (relative, no folders):
-           .docx -> "__cowork_output__.docx"   .xlsx -> "__cowork_output__.xlsx"
-           .pptx -> "__cowork_output__.pptx"   .xls  -> "__cowork_output__.xls"
-           .pdf  -> "__cowork_output__.pdf"
-    That file is validated by opening it with the matching reader library
-    (python-docx/python-pptx/openpyxl/pypdf), then copied to `path`. If
-    the script errors, times out, produces no file, or produces one that
-    fails to open, nothing is written to the sandbox — the error explains
-    which, with the script's own stderr or the reader's parse error; fix
-    and call write_file again.
+    Call check_binary_write_libraries() once per session before your first
+    binary build to see which libraries are importable.
 
-    Call check_binary_write_libraries() once per session, before your
-    first binary build, to see which libraries are actually importable
-    here.
+    Read source material once to extract what you need for the content —
+    don't re-read a source file "just to be sure" after you've already
+    pulled what's needed from it. Build only what was asked: don't
+    proactively add alternate formats, extra slides/sheets, or a summary
+    doc that wasn't requested.
 
     Args:
         path:           Relative path to the file.
-        content:        mode="create" + text extension: full file content, written verbatim.
-                        mode="create" + binary extension: a Python build script (see above).
-                        mode="edit": replacement text for the line range ("" to delete it).
+        content:        mode="create" + text: full file content, written verbatim.
+                        mode="create" + binary: a Python build script (see above).
+                        mode="edit": replacement text for the line range ("" to delete).
         mode:           "create" or "edit".
         start_line:     mode="edit" only — first line to replace (1-indexed).
         end_line:       mode="edit" only — last line to replace (inclusive).
@@ -391,14 +599,13 @@ def write_file(
         dry_run:        mode="edit" only — True (default) previews without writing.
 
     Returns:
-        Success: "Created '{path}'.\\nSize: N bytes" (text writes also
+        Success: "Created '{path}'.\nSize: N bytes" (text writes also
         append "| Encoding: utf-8"). mode="edit" success: a diff preview
         (dry_run=True) or confirmation of applied lines (dry_run=False).
         Failure: a plain-text explanation of exactly what went wrong —
-        already-exists, missing extension, disallowed extension, missing
-        parent dir, or (binary only) the build script's stderr or the
-        reader library's validation error. Never raises; always returns
-        a string either way.
+        already-exists, missing/disallowed extension, missing parent, or
+        (binary) the build script's stderr or the reader library's
+        validation error. Never raises.
     """
     if mode not in ("create", "edit"):
         return f"Error: mode must be 'create' or 'edit', got '{mode}'."
@@ -562,17 +769,12 @@ def write_file(
 @tool
 def run_file_command(command: str) -> str:
     """
-    Run a filesystem command inside the sandbox: `cp`, `mv`, `mkdir`, `ls`,
-    or `info` — for copying, moving/renaming, creating directories, listing
-    directory contents, and reading file/folder metadata. Supports multiple
-    paths per call (e.g. `ls reports/q3 reports/q4`, `info a.pdf b.md`) —
-    batch paths together rather than calling this once per path.
+    Run one filesystem command inside the sandbox: `cp`, `mv`, `mkdir`,
+    `ls`, or `info`. Batch multiple paths in one call
+    (e.g. `ls reports/q3 reports/q4`) instead of one call per path.
 
-    Not a general shell: only these five commands, limited flags (`-n`/`-r`/
-    `-p`), no globs, no piping/chaining. Since it's still a command line,
-    feel free to write the exact invocation for what you need rather than
-    defaulting to a generic one — precise flags/paths get you a more
-    targeted result and less to filter through.
+    Only these five commands, limited flags (`-n`/`-r`/`-p`), no globs,
+    no piping/chaining.
 
     Args:
         command: A single cp/mv/mkdir/ls/info invocation, e.g.
@@ -692,7 +894,7 @@ def run_file_command(command: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# DELETE (soft — trash, never unlink)
+# DELETE (permanent — dry_run confirmation required)
 # ---------------------------------------------------------------------------
 
 @tool
@@ -702,31 +904,25 @@ def delete_path(
     dry_run: bool = True,
 ) -> str:
     """
-    Delete one or more files/directories — soft delete, moved to
-    .sicily-trash/, never unlinked. `path` may be a single string or a
-    list; files and directories can be freely mixed in one call.
+    Permanently delete one or more files/directories (string or list,
+    can mix files and dirs).
 
-    Every path is validated independently: must exist, files must be a
-    manageable type, non-empty directories need recursive=True, sandbox
-    root is always refused. Any single failure refuses the ENTIRE
-    batch — never a partial delete — with the specific reason per failing
-    path.
+    Every path is validated independently; any single failure refuses the
+    ENTIRE batch (never a partial delete), naming the reason per path.
 
-    dry_run=True (default) previews every path's effect without deleting
-    anything; dry_run=False applies the whole validated batch at once. No
-    cap on batch size.
+    dry_run=True (default) previews; dry_run=False applies the whole
+    validated batch at once (irreversible).
 
     Args:
-        path:      A single path, or a list of paths, to delete.
-        recursive: Must be True if ANY directory in the batch is non-empty.
-                   Ignored for files.
-        dry_run:   If True (default), preview only — nothing is deleted.
+        path:      A single path, or list of paths, to delete.
+        recursive: Must be True if ANY directory in the batch is
+                   non-empty. Ignored for files.
+        dry_run:   If True (default), preview only.
 
     Returns:
-        dry_run=True: "[DRY RUN — nothing deleted]" + per-path preview
-        and counts. dry_run=False success: per-path confirmation with
-        each new trash location. Any validation failure: a report naming
-        each failing path and its reason — nothing deleted in this case.
+        dry_run=True: preview + counts, nothing deleted. dry_run=False
+        success: per-path confirmation of permanent deletion.
+        Validation failure: reason per failing path, nothing deleted.
     """
     paths = [path] if isinstance(path, str) else list(path)
 
@@ -804,7 +1000,7 @@ def delete_path(
         lines = [f"[DRY RUN — nothing deleted, {len(resolved)} path(s) validated]\n"]
         for item in resolved:
             if item["kind"] == "file":
-                lines.append(f"  FILE  '{item['path']}' -> {TRASH_DIR_NAME}/")
+                lines.append(f"  FILE  '{item['path']}' (permanent delete)")
             else:
                 preview = "\n".join(
                     f"      - {c.relative_to(root)}" for c in item["contents"][:10]
@@ -814,37 +1010,36 @@ def delete_path(
                     if len(item["contents"]) > 10 else ""
                 )
                 lines.append(
-                    f"  DIR   '{item['path']}' -> {TRASH_DIR_NAME}/ "
+                    f"  DIR   '{item['path']}' (permanent delete) "
                     f"({item['file_count']} file(s), {item['dir_count']} subfolder(s))"
                     + (f"\n{preview}{more}" if item["contents"] else "")
                 )
-        lines.append("\nCall again with dry_run=False to apply.")
+        lines.append("\nCall again with dry_run=False to apply (irreversible).")
         return "\n".join(lines)
 
-    # ── Apply the entire validated batch.
+    # ── Apply the entire validated batch (permanent).
     results = []
     for item in resolved:
         try:
-            trashed = _move_to_trash(item["target"])
+            if item["kind"] == "file":
+                item["target"].unlink()
+                results.append(f"  Deleted '{item['path']}'")
+            else:
+                shutil.rmtree(str(item["target"]))
+                results.append(
+                    f"  Deleted '{item['path']}' and its contents "
+                    f"({item['file_count']} file(s), {item['dir_count']} "
+                    f"subfolder(s))"
+                )
         except Exception as e:
             # A failure here is a filesystem-level surprise happening
             # AFTER validation passed (e.g. permissions changed, disk
             # error) — surface it per-item rather than silently stopping,
-            # since prior items in this loop may already be trashed.
+            # since prior items in this loop may already be deleted.
             results.append(f"  FAILED '{item['path']}': {e}")
             continue
 
-        rel_trashed = trashed.relative_to(root)
-        if item["kind"] == "file":
-            results.append(f"  Deleted '{item['path']}' -> '{rel_trashed}'")
-        else:
-            results.append(
-                f"  Deleted '{item['path']}' and its contents "
-                f"({item['file_count']} file(s), {item['dir_count']} "
-                f"subfolder(s)) -> '{rel_trashed}'"
-            )
-
-    header = f"Deleted {len(resolved)} path(s):\n\n"
+    header = f"Permanently deleted {len(resolved)} path(s):\n\n"
     return header + "\n".join(results)
 
 
@@ -854,16 +1049,28 @@ def delete_path(
 # ---------------------------------------------------------------------------
 
 @tool
-def find_files_by_name(path: str, pattern: str, exclude_patterns: list[str] = []) -> str:
+def find_files_by_name(
+    path: str,
+    pattern: str,
+    exclude_patterns: list[str] = [],
+    includes: Optional[list[str]] = None,
+    max_results: int = 100,
+) -> str:
     """
     Recursively find files by NAME/GLOB (e.g. "*.py", "invoice_*"), not
-    content. Returns relative paths only — reads no file content.
+    content. Returns relative paths only.
+
+    Caps: max_results<=200, ~2000 entries walked — narrow `path`/`pattern`
+    for full results on a large tree.
 
     Args:
         path:             Starting directory (relative path).
         pattern:          Glob pattern matched against each entry's name.
         exclude_patterns: Optional glob patterns to exclude, matched
                           against both the entry name and relative path.
+        includes:         Optional glob filters to explicitly include, e.g. 
+                          ["*.png", "*.ts", "!**/tests/*"].
+        max_results:      Stop after this many matches (default 100, hard cap 200).
     """
     import fnmatch
 
@@ -877,29 +1084,61 @@ def find_files_by_name(path: str, pattern: str, exclude_patterns: list[str] = []
     if not start.is_dir():
         return f"'{path}' is not a directory."
 
+    max_results = max(1, min(max_results, _MAX_NAME_RESULTS_CEILING))
+
     root = _get_sandbox_root()
     matches: list[str] = []
+    entries_scanned = 0
+    scan_capped = False
+
+    def _should_include(file_rel_path: str, file_name: str) -> bool:
+        if not includes:
+            return True
+        included = False
+        for inc in includes:
+            # Support negative includes similar to search_file_contents
+            if inc.startswith("!"):
+                if fnmatch.fnmatch(file_name, inc[1:]) or fnmatch.fnmatch(file_rel_path, inc[1:]):
+                    return False
+            else:
+                if fnmatch.fnmatch(file_name, inc) or fnmatch.fnmatch(file_rel_path, inc):
+                    included = True
+        # If user only passed negative filters ("!*"), everything else defaults to True
+        return included if any(not inc.startswith("!") for inc in includes) else True
 
     def _walk(directory: Path) -> None:
+        nonlocal entries_scanned, scan_capped
+        if len(matches) >= max_results or scan_capped:
+            return
         try:
             children = sorted(directory.iterdir(), key=lambda p: (p.is_file(), p.name))
         except PermissionError:
             return
 
         for child in children:
+            if len(matches) >= max_results:
+                return
+            if entries_scanned >= _MAX_NAME_FILES_SCANNED:
+                scan_capped = True
+                return
+
             if _is_skipped(child):
                 continue
 
+            entries_scanned += 1
             rel = str(child.relative_to(root))
 
+            # Exclude check
             if any(
                 fnmatch.fnmatch(child.name, xp) or fnmatch.fnmatch(rel, xp)
                 for xp in exclude_patterns
             ):
                 continue
 
+            # Inclusion and pattern match
             if fnmatch.fnmatch(child.name, pattern):
-                matches.append(rel)
+                if _should_include(rel, child.name):
+                    matches.append(rel)
 
             if child.is_dir():
                 _walk(child)
@@ -907,9 +1146,16 @@ def find_files_by_name(path: str, pattern: str, exclude_patterns: list[str] = []
     _walk(start)
 
     if not matches:
-        return f"No files matching '{pattern}' found under '{path}'."
+        note = " (stopped early — narrow `path`/`pattern` to search the rest)" if scan_capped else ""
+        return f"No files matching '{pattern}' found under '{path}'{note}."
 
-    return f"Found {len(matches)} match(es):\n" + "\n".join(matches)
+    cap_note = ""
+    if len(matches) >= max_results:
+        cap_note = f" (capped at max_results={max_results})"
+    elif scan_capped:
+        cap_note = " (stopped scanning early — narrow `path`/`pattern` for full results)"
+
+    return f"Found {len(matches)} match(es){cap_note}:\n" + "\n".join(matches)
 
 
 # Hard server-side ceilings — independent of whatever the caller passes.
@@ -917,70 +1163,57 @@ def find_files_by_name(path: str, pattern: str, exclude_patterns: list[str] = []
 # fraction of a monorepo in one call. Args are clamped, not rejected, so a call never fails — it just can't blow the budget.
 _MAX_RESULTS_CEILING = 40
 _MAX_FILES_SCANNED = 400          # stop walking after this many readable files, matches or not
-_MAX_CONTEXT_LINES = 4
 _MAX_OUTPUT_CHARS = 6_000         # hard cap on the returned string; truncated with a note past this
+_MAX_PATTERNS = 8                 # cap on how many patterns one search_file_contents call can OR together
+
+# find_files_by_name ceilings — mirrors the caps above so every tool in the
+# search tier degrades the same way (clamp + note, never a hard failure).
+_MAX_NAME_RESULTS_CEILING = 200
+_MAX_NAME_FILES_SCANNED = 2000
 
 
 @tool
 def search_file_contents(
-    pattern: str,
+    pattern: Union[str, List[str]],
     path: str = ".",
     regex: bool = False,
     case_sensitive: bool = False,
-    context_lines: int = 0,
     match_per_line: bool = True,
     includes: Optional[List[str]] = None,
     max_results: int = 20,
-    return_json: bool = False,
 ) -> str:
     """
-    Grep-equivalent literal/regex search inside file content under `path`
-    — plain text/code by line; PDF/docx/xlsx/pptx by real structure
-    (page/slide/sheet/paragraph) instead of a flattened blob. `path` may
-    be a single file OR a directory — a single file searches only that
-    file (nothing else in its folder is touched); a directory recurses.
+    Grep-equivalent literal/regex search under `path` (single file or
+    recursive directory). Text/code by line; PDF/docx/xlsx/pptx by real
+    structure (page/slide/sheet/paragraph). Reported line/unit numbers feed
+    directly into read_file's start_line/end_line or start_unit/end_unit.
 
-    Binary matches report a unit number (page/slide/sheet/paragraph) plus
-    a finer locator where the format supports one (in-page line, slide
-    part, or cell reference). That unit number is what read_file's
-    start_unit/end_unit takes — workflow is: search here to find which
-    unit has the evidence, then read_file(path, start_unit=N, end_unit=N)
-    for that unit's full content, not the whole document. context_lines
-    is text-files-only; for binary matches, get context via read_file.
+    `pattern` takes a string or list of up to 8 (OR'd together, prefer this
+    over regex alternation AND over multiple separate calls — put every term
+    you want to check for in one call's pattern list rather than searching
+    the same path repeatedly with near-synonymous terms; same-line/unit hits
+    across patterns are merged into one result, not duplicated). If a search
+    already returned matches for a file, don't search that file again —
+    read_file the relevant range directly instead of grepping it further.
 
-    If you already know or suspect the specific file, pass that file
-    directly as `path` — don't pass its parent directory, which would
-    also search every other file there. Pass a directory only when
-    searching across multiple files or you don't yet know which one has
-    it. Server-side caps apply regardless of arguments passed: max_results
-    <=40, ~400 files walked (directory mode only), context_lines<=4,
-    output truncated ~6000 chars — an unscoped call gets clamped/
-    truncated, not a full result, so narrowing the query is the only way
-    to get everything back.
+    Caps: max_results<=40, 8 patterns/call, ~400 files walked (directory
+    mode), output truncated ~6000 chars — narrow path/pattern/includes for
+    full results.
 
     Args:
-        pattern:        Text or regex pattern to search for.
-        path:           A single file to search, or a directory to search recursively. Defaults to ".".
-        regex:          If True, `pattern` is a regular expression.
+        pattern:        Text or regex, or list of up to 8 (OR'd, merged).
+        path:           File or directory to search. Default ".".
+        regex:          Treat pattern(s) as regex.
         case_sensitive: Default False.
-        context_lines:  Lines of context per match (default 0, max 4). Text files only.
-        match_per_line: True (default): matching lines + line numbers.
-                        False: matching file paths only (git grep -l) — cheaper, use to
-                        locate candidates before requesting line content.
-        includes:       Glob filters (e.g. ["*.py", "!**/node_modules/*"]). Directory mode
-                        only — ignored when `path` is a single file. Use whenever file
-                        type/area is known.
-        max_results:    Stop after this many matches (default 20, hard cap 40).
-        return_json:    Return raw JSON match objects instead of formatted text.
+        match_per_line: True (default): lines + numbers. False: matching
+                        file paths only (cheaper).
+        includes:       Glob filters, e.g. ["*.py", "!**/node_modules/*"].
+                        Directory mode only.
+        max_results:    Default 20, hard cap 40.
 
     Returns:
-        Plain text (default): a header line ("Found N match(es) across
-        M file(s) (K scanned)") followed by one block per match —
-        "[path:line]  text" for text files, "[path | location]  text"
-        for binary units — or "No matches across N readable file(s)."
-        if none. return_json=True: a JSON array of match objects
-        (Filename, LineNumber/Unit/UnitLabel/Location, LineContent)
-        instead of formatted text.
+        Header line + one block per match ("[path:line] text" / "[path |
+        location] text").
     """
     try:
         start = _safe_path(path)
@@ -1005,14 +1238,28 @@ def search_file_contents(
     # Clamp caller-supplied limits to server-side ceilings rather than
     # trusting them — this is what actually bounds worst-case cost.
     max_results = max(1, min(max_results, _MAX_RESULTS_CEILING))
-    context_lines = max(0, min(context_lines, _MAX_CONTEXT_LINES))
 
-    # Compile regex pattern
+    patterns = [pattern] if isinstance(pattern, str) else list(pattern)
+    if not patterns:
+        return "Error: pattern must be a non-empty string or list of strings."
+    if len(patterns) > _MAX_PATTERNS:
+        return f"Error: at most {_MAX_PATTERNS} patterns per call — got {len(patterns)}. Narrow the list or split into separate calls."
+
+    # Compile one regex per pattern (not one combined regex) so we can
+    # report which specific pattern(s) matched a given line/unit — that's
+    # what powers the same-line merge/dedup below.
     flags = 0 if case_sensitive else re.IGNORECASE
-    try:
-        search_regex = re.compile(pattern if regex else re.escape(pattern), flags)
-    except re.error as e:
-        return f"Invalid regex pattern: {e}"
+    compiled = []  # list of (pattern_text, compiled_regex)
+    for p in patterns:
+        try:
+            compiled.append((p, re.compile(p if regex else re.escape(p), flags)))
+        except re.error as e:
+            return f"Invalid regex pattern '{p}': {e}"
+
+    def _matched_patterns(text: str) -> list:
+        """Every pattern (in caller order) that hits `text`, deduplicating
+        multi-pattern hits on the same line/unit into one match entry."""
+        return [p for p, rx in compiled if rx.search(text)]
 
     root = _get_sandbox_root()
     matches = []
@@ -1081,8 +1328,13 @@ def search_file_contents(
         #    results in sync with read_file's start_unit/end_unit, which
         #    addresses the same page/slide/sheet/paragraph numbering.
         if ext in _BINARY_EXTENSIONS:
+            # _search_binary_units takes the full pattern list and does the
+            # multi-pattern merge itself, on a single parse of the file —
+            # keeping that here (rather than looping over it once per
+            # pattern) is what keeps an 8-pattern search from re-opening
+            # and re-extracting the same PDF/workbook/deck 8 times.
             try:
-                unit_matches = _search_binary_units(file_path, search_regex)
+                unit_matches = _search_binary_units(file_path, compiled)
             except Exception:
                 files_skipped.append(rel_str)
                 continue
@@ -1092,6 +1344,7 @@ def search_file_contents(
                 if len(matches) >= max_results:
                     break
 
+                hit_patterns = m["matched_patterns"]
                 matching_files.add(rel_str)
 
                 if not match_per_line:
@@ -1099,16 +1352,8 @@ def search_file_contents(
                         matches.append(rel_str)
                     break
 
-                if return_json:
-                    matches.append({
-                        "Filename": rel_str,
-                        "Unit": m["unit"],
-                        "UnitLabel": m["unit_label"],
-                        "Location": m["location"],
-                        "LineContent": m["line_text"],
-                    })
-                else:
-                    matches.append(f"[{rel_str} | {m['location']}]  {m['line_text']}")
+                suffix = f"  (matched: {', '.join(hit_patterns)})" if len(patterns) > 1 and len(hit_patterns) > 1 else ""
+                matches.append(f"[{rel_str} | {m['location']}]  {m['line_text']}{suffix}")
 
             continue
 
@@ -1126,7 +1371,8 @@ def search_file_contents(
             if len(matches) >= max_results:
                 break
 
-            if search_regex.search(line):
+            hit_patterns = _matched_patterns(line)
+            if hit_patterns:
                 matching_files.add(rel_str)
 
                 # If only file listing requested (git grep -l behavior)
@@ -1137,27 +1383,12 @@ def search_file_contents(
 
                 line_num = i + 1
 
-                if return_json:
-                    matches.append({
-                        "Filename": rel_str,
-                        "LineNumber": line_num,
-                        "LineContent": line.strip()
-                    })
-                else:
-                    if context_lines > 0:
-                        lo = max(0, i - context_lines)
-                        hi = min(len(lines), i + context_lines + 1)
-                        snippet_lines = lines[lo:hi]
-                        snippet = "\n".join(
-                            f"{'>' if lo + j == i else ' '} {lo + j + 1:>5}  {l}"
-                            for j, l in enumerate(snippet_lines)
-                        )
-                        matches.append(f"[{rel_str}]\n{snippet}")
-                    else:
-                        matches.append(f"[{rel_str}:{line_num}]  {line.strip()}")
+                suffix = f"  (matched: {', '.join(hit_patterns)})" if len(patterns) > 1 and len(hit_patterns) > 1 else ""
+                matches.append(f"[{rel_str}:{line_num}]  {line.strip()}{suffix}")
 
+    pattern_desc = f"pattern '{patterns[0]}'" if len(patterns) == 1 else f"{len(patterns)} patterns {patterns}"
     search_desc = (
-        f"Searched for {'regex' if regex else 'literal'} pattern '{pattern}' "
+        f"Searched for {'regex' if regex else 'literal'} {pattern_desc} "
         f"({'case-sensitive' if case_sensitive else 'case-insensitive'}) under '{path}'"
     )
     cap_note = (
@@ -1171,12 +1402,6 @@ def search_file_contents(
             f"{search_desc}\n"
             f"No matches across {files_scanned} readable file(s){note}{cap_note}."
         )
-
-    if return_json:
-        out = json.dumps(matches, indent=2)
-        if len(out) > _MAX_OUTPUT_CHARS:
-            out = out[:_MAX_OUTPUT_CHARS] + f"\n... [truncated at {_MAX_OUTPUT_CHARS} chars — narrow the query for full results]"
-        return out
 
     header = f"{search_desc}\nFound {len(matches)} match(es) across {len(matching_files)} file(s) ({files_scanned} scanned{cap_note})"
     if len(matches) >= max_results:
@@ -1198,6 +1423,7 @@ LOCAL_TOOLS = [
     # Read-only (safe)
     search_index,
     read_file,
+    view_image,
 
     # Write (safe-ish)
     write_file,
@@ -1211,6 +1437,12 @@ LOCAL_TOOLS = [
 
     # Delete (soft — trash, dry_run by default)
     delete_path,
+
+    # Tier 1 escape hatch — arbitrary scripts, staged + diffed + human-gated. 
+    # Only reached for tasks run_file_command can't express (see run_script's docstring for when to prefer which).
+    run_script,
+    apply_change,
+    rollback_change,
 ]
 
 
@@ -1229,6 +1461,10 @@ TOOL_STATUS_MAP = {
             else f"Reading file [white]'{args.get('path')}'[/white]"
         )
     ),
+    "view_image": lambda args: (
+        f"Viewing [white]{len(args.get('paths')) if isinstance(args.get('paths'), list) else 1} "
+        f"image(s)[/white] — [white]'{args.get('question', '')[:60]}'[/white]"
+    ),
     "write_file": lambda args: (
         f"Creating [white]'{args.get('path')}'[/white]"
         if args.get("mode", "create") == "create"
@@ -1245,8 +1481,11 @@ TOOL_STATUS_MAP = {
         f"under [white]'{args.get('path')}'[/white]"
     ),
     "search_file_contents": lambda args: (
-        f"Searching for [white]'{args.get('pattern')}'[/white] "
+        f"Searching for [white]{', '.join(repr(p) for p in args.get('pattern'))}[/white] "
         f"under [white]'{args.get('path', '.')}'[/white]"
+        if isinstance(args.get("pattern"), list)
+        else f"Searching for [white]'{args.get('pattern')}'[/white] "
+             f"under [white]'{args.get('path', '.')}'[/white]"
     ),
     "run_file_command": lambda args: (
         f"Running [white]'{args.get('command')}'[/white]"
@@ -1256,6 +1495,16 @@ TOOL_STATUS_MAP = {
         if args.get("dry_run", True)
         else f"Deleting {_fmt_delete_path_arg(args.get('path'))} (-> trash)"
     ),
+    "run_script": lambda args: (
+         f"Running a {args.get('interpreter', 'python3')} script against "
+         f"[white]'{args.get('scope', '.')}'[/white] (staged copy only)"
+     ),
+     "apply_change": lambda args: (
+         f"Applying change [white]'{args.get('change_id')}'[/white] to real files"
+     ),
+     "rollback_change": lambda args: (
+         f"Rolling back change [white]'{args.get('change_id')}'[/white]"
+     ),
 }
 
 
