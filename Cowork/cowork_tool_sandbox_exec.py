@@ -33,34 +33,32 @@ def run_script(script: str, interpreter: str = "python3", scope: str = ".", time
     """
     Run a script for tasks run_file_command can't express — bulk content
     edits, pattern-based transforms across many files, anything needing
-    real logic rather than a single cp/mv/mkdir call.
+    real logic.
 
-    SAFETY MODEL: this NEVER touches the real sandbox. `script` runs only
-    against a disposable COPY of `scope`. You get a diff of what the
-    script would change. Nothing is written until you separately call
-    apply_change() with the exact change_id this returns — and only after
-    you have actually read the diff. A broken or half-working script still
-    produces a diff; applying it blindly defeats the point of this tool.
+    Never touches real sandbox files: `script` runs against a disposable
+    COPY of `scope`. Returns a diff only. Nothing is written until you
+    separately call apply_change() with the returned change_id, after
+    actually reading the diff — a broken script still produces a diff, so
+    don't apply without reading it.
 
-    Only python3, node, bash, and sh are supported. Runs in SOFT JAIL
-    (no Docker): real wall-clock timeout (default 30s, max 120s) and a
-    real memory cap are enforced, but network is NOT blocked. Never use
-    this on a script whose intent you don't already trust; call
-    jail_status() if you need the exact wording of what's enforced.
+    python3, node, bash, or sh only. Soft jail (no Docker): real wall-clock
+    timeout and memory cap enforced; network is NOT blocked. Only run
+    scripts whose intent you trust. jail_status() gives exact enforced limits.
 
-    Prefer the smallest `scope` that covers the task — smaller scope means
-    a faster stage/diff and a readable diff.
+    Prefer the smallest `scope` that covers the task — a broad first
+    attempt that fails costs more to stage/diff than a narrow one that
+    succeeds. If you're iterating run_script to refine the same transform
+    and it's not converging after ~3 tries, stop, show the current diff,
+    and ask the user for direction instead of continuing to adjust it.
 
     Args:
         script:      Full source, passed via `-c`. Operate on the CURRENT
-                    DIRECTORY (`.`, Path("."), os.getcwd()) — the working
-                    directory IS ALREADY the staged copy of `scope`. If
-                    scope="apps", iterate Path(".").iterdir() for the
-                    module folders; do NOT do Path("apps").iterdir() —
-                    that path does not exist inside the staged copy.
+                    DIRECTORY (`.`, Path("."), os.getcwd()) — it IS the
+                    staged copy of `scope` already. If scope="apps",
+                    iterate Path(".").iterdir(), NOT Path("apps").iterdir()
+                    — that path doesn't exist inside the staged copy.
         interpreter: One of "python3", "node", "bash", "sh". Default python3.
-        scope:       Subpath within the sandbox to stage (e.g. "apps",
-                    "reports/q3"). Default "." = whole sandbox.
+        scope:       Subpath to stage (e.g. "apps"). Default "." = whole sandbox.
         timeout_s:   Wall-clock limit in seconds (max 120). Default 30.
 
     Returns:
@@ -80,20 +78,16 @@ def run_script(script: str, interpreter: str = "python3", scope: str = ".", time
 def apply_change(change_id: str) -> str:
     """
     Write a previously proposed run_script change to the REAL sandbox
-    files. Only works with a change_id that came from an actual
-    run_script call's diff output — you cannot invent one.
+    files. Requires a change_id from an actual run_script diff — cannot
+    be invented.
 
-    Only call this after you (and ideally the person you're working for)
-    have actually looked at the diff and confirmed it is correct. This is
-    the irreversible-until-rollback step; treat it with the same care as
-    delete_path(dry_run=False).
+    Only call after the diff has actually been read and confirmed correct
+    (same care as delete_path(dry_run=False)) — irreversible until
+    rollback_change(). A pre-apply snapshot is taken automatically so
+    rollback_change() can undo it.
 
-    A pre-apply snapshot is taken automatically, so rollback_change() can
-    undo this if the applied change turns out to be wrong.
-
-    If the change has not been confirmed by the user yet, this call is
-    refused. Show the diff and wait for their explicit go-ahead in their
-    NEXT message — do not call apply_change again in the same turn.
+    Refused if not yet confirmed by the user: show the diff and wait for
+    their go-ahead in their NEXT message — don't call this again same-turn.
 
     Args:
         change_id: The id shown in a prior run_script diff output.

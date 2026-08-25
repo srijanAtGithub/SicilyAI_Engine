@@ -9,7 +9,6 @@ All tools are locked to a single root directory (the cwd `sicily start` was invo
 import re
 import shutil
 from pathlib import Path
-import json
 import fnmatch
 from typing import List, Optional, Union
 
@@ -80,24 +79,22 @@ _FULL_READ_PREVIEW_UNITS = 3   # units shown in the preview when capped
 @tool
 def search_index(query: str) -> str:
     """
-    Semantic search over the sandbox's RAG index (.txt, .md, .pdf, .docx,
-    .xlsx, .py, .json, .csv, and more). Returns top matching snippets with
-    file path and position.
+    Semantic search over the sandbox's index (.txt, .md, .pdf, .docx, .xlsx,
+    .py, .json, .csv, and more).
 
-    Prefer this over read_file for "find X in this document" on any file
-    you haven't already confirmed is short — it returns only the relevant
-    snippets instead of a full read, at a fraction of the token cost, and
-    works even when you don't know which page/slide/sheet the answer is
-    on. Use read_file instead when you already know the exact unit/line
-    range you need, or need the full unmodified text of a short file.
+    For a focused lookup ("which file has X", "where is X defined"), one or
+    two well-chosen queries should surface the answer — a soft budget of
+    ~10 tool calls total across all tools for that kind of question is a
+    signal to stop and reconsider, not push further with more queries.
+    Don't repeat this with near-synonymous phrasing; rephrase only if the
+    first query's results were clearly off-target.
 
     Args:
-        query: Plain-language description of what you're looking for,
-               e.g. "quarterly budget figures".
+        query: Plain-language description of what you're looking for.
 
     Returns:
-        Formatted top-matching snippets with file path and position, or
-        a message that the index has no relevant matches.
+        Top matching snippets with file path and position, or a message
+        that nothing matched.
     """
     from Cowork.cowork_rag import get_rag   # adjust import path to match your project
     rag = get_rag()
@@ -118,23 +115,24 @@ def read_file(
     """
     Read a file as plain text, in full or by a targeted range.
 
-    Text files: use start_line/end_line, 1-indexed inclusive, max 500
-    lines/call.
+    Text files: start_line/end_line, 1-indexed inclusive, max 500 lines/call.
 
-    Binary documents (.pdf/.docx/.xlsx/.xls/.pptx): use start_unit/
-    end_unit instead — line numbers don't apply. A unit is the format's
-    own structural division: .pdf=page, .pptx=slide, .xlsx/.xls=sheet
-    (by order, not name), .docx=paragraph. 1-indexed inclusive, max 50
-    units/call.
+    Binary documents (.pdf/.docx/.xlsx/.xls/.pptx): start_unit/end_unit
+    instead. A unit = the format's own division: .pdf=page, .pptx=slide,
+    .xlsx/.xls=sheet (by order), .docx=paragraph. 1-indexed inclusive,
+    max 50 units/call. Use one mechanism matching the file's type, not both.
 
-    Use one mechanism matching the file's type, not both.
+    0/0 on both (default) = full file, capped at 500 lines / 20 units —
+    past that you get a preview + true total; page through with the range
+    args. The returned header always states the true total.
 
-    0/0 on both (default) = full file/document, but only up to 500 lines /
-    20 units. Past that you get a preview (first 3 units, or the text
-    equivalent) plus the true total — large files must be paged. Check the
-    header on any full read: it states the true total. For "find X in this
-    document" without knowing which page/slide it's on, prefer
-    search_index — cheaper and length-independent.
+    Investigating rather than building/converting: reading the same file
+    more than twice in one investigation is a signal the answer isn't in
+    it — report what you found and move on, or ask, rather than trying a
+    third range/angle. Following a lead into another file (e.g. the
+    function this file calls) is fine; opening an unrelated subsystem
+    because it happened to come up is not — stop and confirm with the user
+    first if the question's scope is unclear.
 
     Args:
         path:       Relative path to the file.
@@ -361,31 +359,22 @@ def check_binary_write_libraries() -> str:
 @tool
 def view_image(paths: Union[str, List[str]], question: str) -> str:
     """
-    Ask a question about one or more images (.png/.jpg/.jpeg/.gif/.webp)
-    and get a text answer back. Use this for screenshots, diagrams,
-    scanned pages, photos — anything read_file can't parse as text.
+    Ask a specific question about one or more images
+    (.png/.jpg/.jpeg/.gif/.webp) and get a text answer.
 
-    Always pass a specific question — what you actually need to know
-    (e.g. "what error message is shown?", "list the values in this
-    chart", "transcribe the handwritten note", "which of these two
-    screenshots shows the bug?"). A vague or missing question wastes the
-    call.
-
-    Pass multiple paths when the question spans several images at once
-    (compare two screenshots, summarize a folder of charts, etc.) instead
-    of calling this once per image — one multi-image call is cheaper and
-    lets the answer reason across all of them together. Cap: 8 images per
-    call.
+    Pass multiple paths in one call when the question spans several images
+    (compare, summarize a batch) rather than calling once per image.
+    Max 8 images/call.
 
     Args:
-        paths:    A single image path, or a list of image paths (all
-                  relative to the sandbox root).
-        question: What you want to know about the image(s).
+        paths:    A single image path, or a list of paths (relative to
+                  sandbox root).
+        question: What you want to know about the image(s). Required —
+                  a missing question wastes the call.
 
     Returns:
-        A text answer. Per-image errors (missing file, wrong format, too
-        large) are reported inline and don't fail the whole call — the
-        answer is still generated from whichever images loaded fine.
+        A text answer. Per-image load errors are reported inline without
+        failing the whole call.
     """
     if isinstance(paths, str):
         paths = [paths]
@@ -477,33 +466,34 @@ def write_file(
     """
     Create a new file, or replace a line range in an existing text file.
 
-    mode="create" (default): writes `content` to `path`; refuses if the
-    path already exists. Parent dirs auto-created when create_parents=True.
+    mode="create" (default): writes `content` to `path` verbatim; refuses
+    if the path exists. Parent dirs auto-created when create_parents=True.
 
-    mode="edit": replaces lines [start_line, end_line] (1-indexed,
-    inclusive) with `content` ("" to delete the range); file must already
-    exist. dry_run=True (default) previews as a diff; dry_run=False
-    applies. Text extensions only — not supported for .docx/.xlsx/.pptx/
-    .pdf.
+    mode="edit": replaces lines [start_line, end_line] (1-indexed inclusive)
+    with `content` ("" to delete the range); file must exist. dry_run=True
+    (default) previews as a diff. Text extensions only.
 
     --- Binary formats (.docx, .xlsx, .xls, .pptx, .pdf) ---
+    mode="create" only. `content` must be a standalone Python 3 script that
+    builds the file, not the file content itself. Requirements:
+    1. Don't read/reference any path other than the script's own working dir.
+    2. Save the result to exactly: .docx->"__cowork_output__.docx",
+       .xlsx->"__cowork_output__.xlsx", .pptx->"__cowork_output__.pptx",
+       .xls->"__cowork_output__.xls", .pdf->"__cowork_output__.pdf".
+    Validated by opening with the matching reader library, then copied to
+    `path`. Any failure (script error, timeout, missing/invalid output)
+    writes nothing and returns the specific error — read it, fix the
+    specific cause, retry. After 2 failed retries on the same file, stop
+    and show the user the exact error rather than continuing to guess.
 
-    mode="create" only. `content` is not written verbatim — it must be a
-    full standalone Python 3 script that builds the file. Two hard
-    requirements, everything else is free:
-    1. The script's working directory contains nothing else — don't
-        read/reference any other path.
-    2. Save the result to exactly this filename (relative, no folders):
-        .docx -> "__cowork_output__.docx"   .xlsx -> "__cowork_output__.xlsx"
-        .pptx -> "__cowork_output__.pptx"   .xls  -> "__cowork_output__.xls"
-        .pdf  -> "__cowork_output__.pdf"
-    That file is validated by opening it with the matching reader library,
-    then copied to `path`. If the script errors, times out, produces no
-    file, or produces one that fails to open, nothing is written — the
-    error explains which. Fix and call write_file again.
+    Call check_binary_write_libraries() once per session before your first
+    binary build to see which libraries are importable.
 
-    Call check_binary_write_libraries() once per session, before your
-    first binary build, to see which libraries are actually importable.
+    Read source material once to extract what you need for the content —
+    don't re-read a source file "just to be sure" after you've already
+    pulled what's needed from it. Build only what was asked: don't
+    proactively add alternate formats, extra slides/sheets, or a summary
+    doc that wasn't requested.
 
     Args:
         path:           Relative path to the file.
@@ -687,17 +677,12 @@ def write_file(
 @tool
 def run_file_command(command: str) -> str:
     """
-    Run a filesystem command inside the sandbox: `cp`, `mv`, `mkdir`, `ls`,
-    or `info` — for copying, moving/renaming, creating directories, listing
-    directory contents, and reading file/folder metadata. Supports multiple
-    paths per call (e.g. `ls reports/q3 reports/q4`, `info a.pdf b.md`) —
-    batch paths together rather than calling this once per path.
+    Run one filesystem command inside the sandbox: `cp`, `mv`, `mkdir`,
+    `ls`, or `info`. Batch multiple paths in one call
+    (e.g. `ls reports/q3 reports/q4`) instead of one call per path.
 
-    Not a general shell: only these five commands, limited flags (`-n`/`-r`/
-    `-p`), no globs, no piping/chaining. Since it's still a command line,
-    feel free to write the exact invocation for what you need rather than
-    defaulting to a generic one — precise flags/paths get you a more
-    targeted result and less to filter through.
+    Only these five commands, limited flags (`-n`/`-r`/`-p`), no globs,
+    no piping/chaining.
 
     Args:
         command: A single cp/mv/mkdir/ls/info invocation, e.g.
@@ -827,16 +812,14 @@ def delete_path(
     dry_run: bool = True,
 ) -> str:
     """
-    Permanently delete one or more files/directories. `path` may be a
-    string or list; files and directories can be mixed in one call.
+    Permanently delete one or more files/directories (string or list,
+    can mix files and dirs).
 
-    Every path is validated independently (must exist, file must be a
-    manageable type, non-empty dirs need recursive=True). Any single
-    failure refuses the ENTIRE batch — never a partial delete — naming
-    the reason per failing path.
+    Every path is validated independently; any single failure refuses the
+    ENTIRE batch (never a partial delete), naming the reason per path.
 
-    dry_run=True (default) previews without deleting; dry_run=False
-    applies the whole validated batch at once (irreversible).
+    dry_run=True (default) previews; dry_run=False applies the whole
+    validated batch at once (irreversible).
 
     Args:
         path:      A single path, or list of paths, to delete.
@@ -982,12 +965,10 @@ def find_files_by_name(
 ) -> str:
     """
     Recursively find files by NAME/GLOB (e.g. "*.py", "invoice_*"), not
-    content. Returns relative paths only — reads no file content.
+    content. Returns relative paths only.
 
-    Server-side caps apply regardless of arguments: max_results<=200,
-    ~2000 entries walked — a broad pattern over a large tree gets
-    clamped/stopped early rather than returning everything, so narrow
-    `path` and/or `pattern`/`exclude_patterns` for full results on a big tree.
+    Caps: max_results<=200, ~2000 entries walked — narrow `path`/`pattern`
+    for full results on a large tree.
 
     Args:
         path:             Starting directory (relative path).
@@ -1087,70 +1068,39 @@ def search_file_contents(
     match_per_line: bool = True,
     includes: Optional[List[str]] = None,
     max_results: int = 20,
-    return_json: bool = False,
 ) -> str:
     """
-    Grep-equivalent literal/regex search inside file content under `path`
-    — plain text/code by line; PDF/docx/xlsx/pptx by real structure
-    (page/slide/sheet/paragraph) instead of a flattened blob. `path` may
-    be a single file OR a directory — a single file searches only that
-    file; a directory recurses.
+    Grep-equivalent literal/regex search under `path` (single file or
+    recursive directory). Text/code by line; PDF/docx/xlsx/pptx by real
+    structure (page/slide/sheet/paragraph). Reported line/unit numbers feed
+    directly into read_file's start_line/end_line or start_unit/end_unit.
 
-    `pattern` accepts a single string OR a list of strings (max 8) — pass
-    a list to search for several terms in one call instead of one call
-    per term (e.g. pattern=["invoice", "purchase order", "PO#"]). All
-    patterns are OR'd together: a line/unit matching ANY of them is a hit.
-    If a line matches more than one pattern, it is still reported once
-    (not once per pattern) — the match entry names every pattern that hit
-    it, so results stay deduplicated regardless of how many terms overlap.
+    `pattern` takes a string or list of up to 8 (OR'd together, prefer this
+    over regex alternation AND over multiple separate calls — put every term
+    you want to check for in one call's pattern list rather than searching
+    the same path repeatedly with near-synonymous terms; same-line/unit hits
+    across patterns are merged into one result, not duplicated). If a search
+    already returned matches for a file, don't search that file again —
+    read_file the relevant range directly instead of grepping it further.
 
-    Binary matches report a unit number (page/slide/sheet/paragraph) plus
-    a finer locator where the format supports one. That unit number is
-    what read_file's start_unit/end_unit takes. Text matches report a line
-    number the same way. Workflow: search here to find which line/unit has
-    the evidence, then read_file(...) with that line/unit range (plus a
-    little padding, e.g. a handful of lines either side, if you want
-    surrounding context) to get the full area — read_file is the intended
-    next step for context, not this tool.
-
-    If you already know or suspect the specific file, pass that file
-    directly as `path` — don't pass its parent directory. Pass a directory
-    only when searching across multiple files or you don't yet know which
-    one has it. For OR-searches across multiple literal terms, prefer the
-    list form of `pattern` over regex alternation — it merges same-line
-    hits for you and reports which term(s) matched. Server-side caps apply
-    regardless of arguments: max_results<=40, up to 8 patterns/call, ~400
-    files walked (directory mode only), output truncated ~6000 chars — an
-    unscoped call gets clamped/truncated, so narrowing the query is the
-    only way to get everything.
+    Caps: max_results<=40, 8 patterns/call, ~400 files walked (directory
+    mode), output truncated ~6000 chars — narrow path/pattern/includes for
+    full results.
 
     Args:
-        pattern:        Text or regex pattern to search for, or a list of
-                        up to 8 to search for together (results merged,
-                        not duplicated, when several match the same line).
-        path:           A single file to search, or a directory to search
-                        recursively. Defaults to ".".
-        regex:          If True, every pattern in `pattern` is treated as
-                        a regular expression.
+        pattern:        Text or regex, or list of up to 8 (OR'd, merged).
+        path:           File or directory to search. Default ".".
+        regex:          Treat pattern(s) as regex.
         case_sensitive: Default False.
-        match_per_line: True (default): matching lines + line numbers.
-                        False: matching file paths only (cheaper, use to
-                        locate candidates before requesting line content).
-        includes:       Glob filters (e.g. ["*.py", "!**/node_modules/*"]).
-                        Directory mode only — ignored when `path` is a
-                        single file. Use whenever file type/area is known.
-        max_results:    Stop after this many matches (default 20, hard cap 40).
-        return_json:    Return raw JSON match objects instead of formatted text.
+        match_per_line: True (default): lines + numbers. False: matching
+                        file paths only (cheaper).
+        includes:       Glob filters, e.g. ["*.py", "!**/node_modules/*"].
+                        Directory mode only.
+        max_results:    Default 20, hard cap 40.
 
     Returns:
-        Plain text (default): a header line ("Found N match(es) across
-        M file(s) (K scanned)") followed by one block per match —
-        "[path:line]  text" for text files, "[path | location]  text"
-        for binary units — with a "(matched: term1, term2)" suffix when
-        more than one pattern was searched and more than one hit that
-        line/unit — or "No matches across N readable file(s)." if none.
-        return_json=True: a JSON array of match objects (Filename,
-        LineNumber/Unit/UnitLabel/Location, LineContent, MatchedPatterns).
+        Header line + one block per match ("[path:line] text" / "[path |
+        location] text").
     """
     try:
         start = _safe_path(path)
@@ -1289,18 +1239,8 @@ def search_file_contents(
                         matches.append(rel_str)
                     break
 
-                if return_json:
-                    matches.append({
-                        "Filename": rel_str,
-                        "Unit": m["unit"],
-                        "UnitLabel": m["unit_label"],
-                        "Location": m["location"],
-                        "LineContent": m["line_text"],
-                        "MatchedPatterns": hit_patterns,
-                    })
-                else:
-                    suffix = f"  (matched: {', '.join(hit_patterns)})" if len(patterns) > 1 and len(hit_patterns) > 1 else ""
-                    matches.append(f"[{rel_str} | {m['location']}]  {m['line_text']}{suffix}")
+                suffix = f"  (matched: {', '.join(hit_patterns)})" if len(patterns) > 1 and len(hit_patterns) > 1 else ""
+                matches.append(f"[{rel_str} | {m['location']}]  {m['line_text']}{suffix}")
 
             continue
 
@@ -1330,16 +1270,8 @@ def search_file_contents(
 
                 line_num = i + 1
 
-                if return_json:
-                    matches.append({
-                        "Filename": rel_str,
-                        "LineNumber": line_num,
-                        "LineContent": line.strip(),
-                        "MatchedPatterns": hit_patterns,
-                    })
-                else:
-                    suffix = f"  (matched: {', '.join(hit_patterns)})" if len(patterns) > 1 and len(hit_patterns) > 1 else ""
-                    matches.append(f"[{rel_str}:{line_num}]  {line.strip()}{suffix}")
+                suffix = f"  (matched: {', '.join(hit_patterns)})" if len(patterns) > 1 and len(hit_patterns) > 1 else ""
+                matches.append(f"[{rel_str}:{line_num}]  {line.strip()}{suffix}")
 
     pattern_desc = f"pattern '{patterns[0]}'" if len(patterns) == 1 else f"{len(patterns)} patterns {patterns}"
     search_desc = (
@@ -1357,12 +1289,6 @@ def search_file_contents(
             f"{search_desc}\n"
             f"No matches across {files_scanned} readable file(s){note}{cap_note}."
         )
-
-    if return_json:
-        out = json.dumps(matches, indent=2)
-        if len(out) > _MAX_OUTPUT_CHARS:
-            out = out[:_MAX_OUTPUT_CHARS] + f"\n... [truncated at {_MAX_OUTPUT_CHARS} chars — narrow the query for full results]"
-        return out
 
     header = f"{search_desc}\nFound {len(matches)} match(es) across {len(matching_files)} file(s) ({files_scanned} scanned{cap_note})"
     if len(matches) >= max_results:
