@@ -46,7 +46,7 @@ from Cowork.cowork_helpers import (
     _FULL_READ_MAX_UNITS,
     _FULL_READ_MAX_LINES
 )
-from Cowork.cowork_tool_sandbox_exec import run_script, apply_change, rollback_change
+from Cowork.cowork_tool_sandbox_exec import run_script, rollback_change
 
 
 # READ-ONLY TOOLS
@@ -301,36 +301,6 @@ def read_file(
 
 # WRITE TOOLS
 @tool
-def check_binary_write_libraries() -> str:
-    """
-    Report which Python libraries (and pandoc) are actually importable in
-    THIS sandbox right now, for building .docx/.pptx/.xlsx/.xls/.pdf files
-    via write_file's binary-script mode.
-
-    Call this ONCE, before writing your first binary-build script this
-    session — it tells you which library to reach for without guessing or
-    discovering a missing import from a failed run. The result is valid
-    for the rest of the session (nothing installs/uninstalls itself
-    mid-session), so there's no need to call this again per file.
-
-    Takes no arguments and does not touch the filesystem.
-    """
-    lines = ["Library availability for binary file creation in this sandbox:\n"]
-    for ext in (".docx", ".pptx", ".xlsx", ".xls", ".pdf"):
-        lines.append(f"{ext}:")
-        lines.append(_format_script_library_status(ext))
-        lines.append("")
-    lines.append(
-        "Any library shown as NOT available can still be installed from "
-        "inside your build script (e.g. `subprocess.check_call([sys.executable, "
-        "'-m', 'pip', 'install', 'PACKAGE', '--break-system-packages'])` "
-        "before importing it) — but preferring an already-available library "
-        "avoids that extra install step and its runtime cost."
-    )
-    return "\n".join(lines)
-
-
-@tool
 def view_image(
     paths: Union[str, List[str]],
     question: str,
@@ -578,8 +548,14 @@ def write_file(
     specific cause, retry. After 2 failed retries on the same file, stop
     and show the user the exact error rather than continuing to guess.
 
-    Call check_binary_write_libraries() once per session before your first
-    binary build to see which libraries are importable.
+    If the script fails because a required library isn't installed, the
+    error names the missing library and the exact `pip install` command
+    for it, without the environment-modifying `--break-system-packages`
+    flag baked in. Don't run that install yourself — tell the user which
+    library is missing and why, show them the command, and ask whether
+    they'd like you to install it now or would rather install it
+    themselves before you retry. Only add flags like
+    --break-system-packages if the user asks for that.
 
     Read source material once to extract what you need for the content —
     don't re-read a source file "just to be sure" after you've already
@@ -1058,21 +1034,33 @@ def find_files_by_name(
 ) -> str:
     """
     Recursively find files by NAME/GLOB (e.g. "*.py", "invoice_*"), not
-    content. Returns relative paths only.
+    content. Matching is case-insensitive (e.g. pattern "*bio*" matches
+    "Sristi_BioData.png"). Returns relative paths only.
 
     Caps: max_results<=200, ~2000 entries walked — narrow `path`/`pattern`
     for full results on a large tree.
 
     Args:
         path:             Starting directory (relative path).
-        pattern:          Glob pattern matched against each entry's name.
+        pattern:          Glob pattern matched against each entry's name,
+                          case-insensitively.
         exclude_patterns: Optional glob patterns to exclude, matched
-                          against both the entry name and relative path.
-        includes:         Optional glob filters to explicitly include, e.g. 
-                          ["*.png", "*.ts", "!**/tests/*"].
+                          case-insensitively against both the entry name
+                          and relative path.
+        includes:         Optional glob filters to explicitly include,
+                          case-insensitively, e.g. ["*.png", "*.ts", "!**/tests/*"].
         max_results:      Stop after this many matches (default 100, hard cap 200).
     """
     import fnmatch
+
+    def _glob_match(name: str, pat: str) -> bool:
+        # fnmatch.fnmatch's case sensitivity depends on the host OS
+        # (case-insensitive on Windows/macOS, case-sensitive on Linux),
+        # which made this tool silently miss real matches like
+        # "Sristi_BioData.png" for pattern "*bio*" on a Linux sandbox.
+        # Force case-insensitivity everywhere, regardless of OS, by
+        # lower-casing both sides and using the case-sensitive matcher.
+        return fnmatch.fnmatchcase(name.lower(), pat.lower())
 
     try:
         start = _safe_path(path)
@@ -1098,10 +1086,10 @@ def find_files_by_name(
         for inc in includes:
             # Support negative includes similar to search_file_contents
             if inc.startswith("!"):
-                if fnmatch.fnmatch(file_name, inc[1:]) or fnmatch.fnmatch(file_rel_path, inc[1:]):
+                if _glob_match(file_name, inc[1:]) or _glob_match(file_rel_path, inc[1:]):
                     return False
             else:
-                if fnmatch.fnmatch(file_name, inc) or fnmatch.fnmatch(file_rel_path, inc):
+                if _glob_match(file_name, inc) or _glob_match(file_rel_path, inc):
                     included = True
         # If user only passed negative filters ("!*"), everything else defaults to True
         return included if any(not inc.startswith("!") for inc in includes) else True
@@ -1130,13 +1118,13 @@ def find_files_by_name(
 
             # Exclude check
             if any(
-                fnmatch.fnmatch(child.name, xp) or fnmatch.fnmatch(rel, xp)
+                _glob_match(child.name, xp) or _glob_match(rel, xp)
                 for xp in exclude_patterns
             ):
                 continue
 
             # Inclusion and pattern match
-            if fnmatch.fnmatch(child.name, pattern):
+            if _glob_match(child.name, pattern):
                 if _should_include(rel, child.name):
                     matches.append(rel)
 
@@ -1441,7 +1429,6 @@ LOCAL_TOOLS = [
     # Tier 1 escape hatch — arbitrary scripts, staged + diffed + human-gated. 
     # Only reached for tasks run_file_command can't express (see run_script's docstring for when to prefer which).
     run_script,
-    apply_change,
     rollback_change,
 ]
 

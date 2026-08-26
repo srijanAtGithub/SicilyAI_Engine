@@ -847,38 +847,40 @@ _SCRIPTED_BINARY_OUTPUT_NAME: dict[str, str] = {
 # Candidate libraries per extension, in the order we'd recommend trying
 # them. `module` is what actually gets import-checked (may differ from the
 # pip/uv package name — e.g. "docx" vs "python-docx"). `install` is the
-# real install instruction shown when a library is missing, so a model
-# never has to guess the pip name or discover --break-system-packages the
-# hard way via a failed subprocess call.
+# plain pip install instruction shown when a library is missing, so a
+# model never has to guess the pip name. Deliberately does NOT include
+# `--break-system-packages` — whether to force an install into a
+# system-managed Python environment is a call for the user to make, not
+# something baked into a command the model runs unprompted.
 _SCRIPT_LIBRARY_CANDIDATES: dict[str, list[dict[str, str]]] = {
     ".docx": [
         {"module": "docx", "package": "python-docx",
-         "install": "pip install python-docx --break-system-packages"},
+         "install": "pip install python-docx"},
         {"module": None, "package": "pandoc",
          "install": "(system binary, not pip) apt-get install pandoc / brew install pandoc / winget install JohnMacFarlane.Pandoc",
          "note": "Markdown -> docx via subprocess, no Python import needed"},
     ],
     ".pptx": [
         {"module": "pptx", "package": "python-pptx",
-         "install": "pip install python-pptx --break-system-packages"},
+         "install": "pip install python-pptx"},
     ],
     ".xlsx": [
         {"module": "openpyxl", "package": "openpyxl",
-         "install": "pip install openpyxl --break-system-packages"},
+         "install": "pip install openpyxl"},
         {"module": "pandas", "package": "pandas",
-         "install": "pip install pandas --break-system-packages"},
+         "install": "pip install pandas"},
     ],
     ".xls": [
         {"module": "openpyxl", "package": "openpyxl",
-         "install": "pip install openpyxl --break-system-packages"},
+         "install": "pip install openpyxl"},
         {"module": "pandas", "package": "pandas",
-         "install": "pip install pandas --break-system-packages"},
+         "install": "pip install pandas"},
     ],
     ".pdf": [
         {"module": "reportlab", "package": "reportlab",
-         "install": "pip install reportlab --break-system-packages"},
+         "install": "pip install reportlab"},
         {"module": "pypdf", "package": "pypdf",
-         "install": "pip install pypdf --break-system-packages"},
+         "install": "pip install pypdf"},
     ],
 }
 
@@ -960,6 +962,64 @@ def _format_script_library_status(ext: str) -> str:
 
 _SCRIPT_TIMEOUT_SECONDS = 120
 
+# Matches CPython's standard "No module named 'X'" text from both
+# ImportError and ModuleNotFoundError tracebacks.
+_MISSING_MODULE_RE = re.compile(r"No module named ['\"]([A-Za-z0-9_\.]+)['\"]")
+
+
+def _detect_missing_library(ext: str, stderr: str) -> Optional[dict[str, str]]:
+    """
+    Inspect a failed build script's stderr for a missing-import error and,
+    if found, match it back to a known candidate for this extension.
+
+    Returns the matching candidate dict (module/package/install/[note])
+    from _SCRIPT_LIBRARY_CANDIDATES, or None if the failure wasn't a
+    recognizable missing-library import (in which case the caller should
+    fall back to showing the raw error, not guess at a library problem).
+    """
+    match = _MISSING_MODULE_RE.search(stderr)
+    if not match:
+        return None
+    missing_module = match.group(1).split(".")[0]
+
+    for cand in _SCRIPT_LIBRARY_CANDIDATES.get(ext, []):
+        if cand["module"] == missing_module:
+            return cand
+
+    # Not one of our known candidates (could be some other import the
+    # model's script used) — still useful to know the name, but there's
+    # no known install command to offer, so let the generic error show.
+    return None
+
+
+def _format_missing_library_message(ext: str, package: str, install_cmd: str, note: str = "") -> str:
+    """
+    Build the message shown to the model (and, via it, the user) when a
+    build script fails because a required library isn't installed.
+
+    Deliberately does NOT install anything itself and does NOT tell the
+    model to just go run the install command. It asks the model to put
+    the choice to the user: install it now (with the exact command and
+    why it's needed), or install it manually and retry. This keeps the
+    user in control of what gets installed into their environment,
+    rather than a script silently installing a package with an
+    environment-modifying flag like --break-system-packages.
+    """
+    note_str = f" ({note})" if note else ""
+    return (
+        f"Build script for '{ext}' failed: the '{package}' library is not "
+        f"installed in this sandbox{note_str}.\n\n"
+        f"Suggested install command:\n  {install_cmd}\n\n"
+        "Do not run this install automatically. Tell the user which "
+        f"library is missing and why it's needed (building this '{ext}' "
+        f"file), show them the exact command above, and ask whether "
+        "they'd like you to install it now or would rather install it "
+        "themselves (and let you know when it's ready) before retrying. "
+        "If they ask you to install it, run that exact command as given — "
+        "don't add flags like --break-system-packages unless the user "
+        "specifically asks for that."
+    )
+
 
 def _run_binary_build_script(ext: str, script: str) -> Path:
     """
@@ -1005,9 +1065,19 @@ def _run_binary_build_script(ext: str, script: str) -> Path:
             )
 
         if proc.returncode != 0:
+            stderr = proc.stderr.strip()
+            missing = _detect_missing_library(ext, stderr)
+            if missing is not None:
+                raise ValueError(_format_missing_library_message(
+                    ext,
+                    package=missing["package"],
+                    install_cmd=missing["install"],
+                    note=missing.get("note", ""),
+                ))
+
             raise ValueError(
                 f"Build script for '{ext}' failed (exit {proc.returncode}).\n\n"
-                f"--- stderr ---\n{proc.stderr.strip()[-4000:]}\n\n"
+                f"--- stderr ---\n{stderr[-4000:]}\n\n"
                 f"--- stdout ---\n{proc.stdout.strip()[-2000:]}\n\n"
                 f"Fix the script and call write_file again. The script must "
                 f"save its result to exactly '{output_name}' in its working "
@@ -1121,8 +1191,7 @@ def _validate_binary_output(ext: str, path: Path) -> None:
     If the reader library itself isn't installed in this sandbox, this
     silently skips validation rather than failing the build — an
     unrelated missing dependency on the READ side shouldn't block a WRITE
-    that otherwise looks fine; check_binary_write_libraries() covers read-
-    side availability separately if that ever needs surfacing.
+    that otherwise looks fine.
     """
     validator = _BINARY_VALIDATORS.get(ext)
     if validator is None:

@@ -31,11 +31,15 @@ Pipeline, every call, no exceptions:
               with real content diffs for text, and byte-size deltas for
               binary. This is what the model (and the human) actually see
               — never "trust me, it worked."
-    apply()   ONLY callable with the exact change_id returned by execute(),
-              which only exists once a diff has been produced. Copies the
-              changed files back over the real sandbox, after snapshotting
-              every file it's about to overwrite or delete.
-    rollback() restore the pre-apply snapshot for a given change_id.
+    apply()   called automatically, immediately after diff() produces a
+              clean result (no error, no timeout, not symlink-only) —
+              there is no separate confirm call. Copies the changed files
+              back over the real sandbox, after snapshotting every file
+              it's about to overwrite or delete, so it's still reversible.
+    rollback() restore the pre-apply snapshot for a given change_id. This
+              is now the ONLY undo path (no pre-write confirmation gate
+              exists anymore) — use it any time the diff or a later check
+              shows the script did the wrong thing.
 
 Every stage/execute/diff/apply/rollback call is appended to an on-disk
 audit log that this module owns — the calling tool layer never gets a
@@ -127,9 +131,9 @@ class ChangeSet:
     diffs: list = field(default_factory=list)   # list[FileDiff]
     applied: bool = False
     applied_at: Optional[float] = None
+    apply_error: Optional[str] = None   # set when propose_script's write-through was refused (see propose_script)
     snapshot_dir: Optional[str] = None   # pre-apply backup, for rollback
     rolled_back: bool = False
-    confirmed: bool = False   # set True only by the session loop, on a genuinely new human turn
 
 
 # In-memory registry for this process. change_id is also durably recorded
@@ -612,10 +616,15 @@ def propose_script(
 ) -> ChangeSet:
     """
     Stage `scope_rel`, run `script` against the STAGED COPY ONLY, diff the
-    result against the real files, and return a ChangeSet. Nothing in the
-    real sandbox is touched by this call, regardless of what the script
-    does — even a malicious/buggy script only ever affects the disposable
-    copy_dir.
+    result against the real files — then, if the diff is clean (no error,
+    no timeout, no changes-only-to-symlinks), immediately write it
+    through to the real sandbox via apply_change(), snapshotting first so
+    rollback_change() can undo it. There is no separate human-confirmed
+    apply step: the diff returned here IS the record of what was written,
+    not a proposal awaiting approval. A script that errors, times out, or
+    produces only symlink changes is diffed but left unapplied, exactly
+    as apply_change() would itself refuse it — that failure path is
+    unchanged.
     """
     timeout_s = min(max(1, timeout_s), _MAX_TIMEOUT_S)
     _validate_interpreter(interpreter)
@@ -648,15 +657,31 @@ def propose_script(
     _audit(sandbox_root, "propose_done", change_id=change_id, exit_code=exit_code,
            timed_out=timed_out, files_changed=len(diffs))
 
+    # Write-through: apply immediately rather than waiting for a separate
+    # confirm call. apply_change() already refuses cleanly on its own
+    # (timed out / non-zero exit / no diffs / symlink-only diffs) via the
+    # cs state set above — reuse that same refusal path here instead of
+    # re-checking the same conditions twice. cs.applied stays False and
+    # cs.apply_error carries the reason whenever this happens, so
+    # format_diff_for_model() can report "not written" accurately.
+    cs.apply_error = None
+    if diffs:
+        try:
+            apply_change(sandbox_root, change_id)
+        except SandboxExecError as e:
+            cs.apply_error = str(e)
+
     return cs
 
 
 def apply_change(sandbox_root: Path, change_id: str) -> str:
     """
     Copy the staged, already-diffed result back over the real sandbox.
-    Refuses if change_id is unknown, already applied, the script errored
-    or timed out, or there's nothing to apply. Snapshots every real file
-    it's about to overwrite/delete first, so rollback_change() can undo it.
+    Called automatically by propose_script() right after a successful
+    diff — there is no separate confirm step at this layer. Refuses if
+    change_id is unknown, already applied, the script errored or timed
+    out, or there's nothing to apply. Snapshots every real file it's
+    about to overwrite/delete first, so rollback_change() can undo it.
     """
     cs = _CHANGES.get(change_id)
     if cs is None:
@@ -779,13 +804,25 @@ def rollback_change(sandbox_root: Path, change_id: str) -> str:
 
 
 def format_diff_for_model(cs: ChangeSet, max_files_shown: int = 25) -> str:
-    """Human/model-readable rendering of a ChangeSet's diff — this is what
-    the agent should show the person before ever calling apply_change."""
-    lines = [f"[Proposed change '{cs.change_id}' — scope '{cs.scope_rel}', {cs.interpreter}]"]
+    """
+    Human/model-readable rendering of a ChangeSet — this is what the
+    agent shows the person AFTER the fact. By the time this runs,
+    propose_script() has already attempted the write-through, so the
+    header reflects what actually happened to real files, not a pending
+    proposal awaiting a separate apply call.
+    """
+    if cs.applied:
+        header = f"[Change '{cs.change_id}' — scope '{cs.scope_rel}', {cs.interpreter} — WRITTEN to real files]"
+    else:
+        header = f"[Change '{cs.change_id}' — scope '{cs.scope_rel}', {cs.interpreter} — NOT written]"
+    lines = [header]
+
     if cs.timed_out:
-        lines.append(f"TIMED OUT after execution limit — not applyable.")
+        lines.append("TIMED OUT after execution limit — not written.")
     elif cs.exit_code not in (0, None):
-        lines.append(f"Script exited with code {cs.exit_code} — not applyable.")
+        lines.append(f"Script exited with code {cs.exit_code} — not written.")
+    elif cs.apply_error:
+        lines.append(f"Write-through was refused: {cs.apply_error}")
     if cs.stderr.strip():
         lines.append(f"stderr:\n{cs.stderr.strip()[:1000]}")
 
@@ -806,10 +843,12 @@ def format_diff_for_model(cs: ChangeSet, max_files_shown: int = 25) -> str:
     if len(cs.diffs) > max_files_shown:
         lines.append(f"  ... and {len(cs.diffs) - max_files_shown} more file(s)")
 
-    if not (cs.timed_out or cs.exit_code not in (0, None)):
+    if cs.applied:
         lines.append(
-            f"\nNothing has been applied yet. Call apply_change('{cs.change_id}') "
-            "to write these changes to the real files, or discard by simply not calling it."
+            f"\nAlready written to the real sandbox. Show this diff to the user for "
+            f"review. If it's wrong, call rollback_change('{cs.change_id}') to undo it — "
+            "no need to wait for the user to ask, if you can tell from the diff or a "
+            "follow-up check that the result is wrong."
         )
     return "\n".join(lines)
 
@@ -880,18 +919,26 @@ def format_diff_for_model(cs: ChangeSet, max_files_shown: int = 25) -> str:
 #     need to change, only what _execute() shells out to.
 #   - Protection against a script that's simply WRONG in a way the diff
 #     doesn't make obvious (e.g. subtly corrupts every 100th row of a
-#     CSV). The diff shows what changed; deciding whether that change is
-#     *correct* is still a human judgment call at the apply_change step.
-#   - A structural, un-bypassable human-in-the-loop gate. apply_change
-#     requires a change_id that only exists after a real propose_script
-#     call, which prevents an agent from fabricating one — but if the
-#     SAME agent turn can call propose_script and then immediately
-#     apply_change without a person reading the diff in between, the gate
-#     is procedural, not physical. For a genuine Ring-4 guarantee, the
-#     calling application (cowork_session.py's turn loop) should require
-#     apply_change to come from a NEW user turn after the diff was shown
-#     — i.e. treat a pending change_id like a confirmation prompt the
-#     model can propose but not resolve on its own, the same shape as
-#     end_conversation's two-call pattern, except the second call must
-#     originate from the human's next message, not the model's next
-#     tool call in the same turn.
+#     CSV). The diff shows what changed; catching that is now on
+#     post-hoc review (the human reading the diff after the fact, or the
+#     model verifying its own result) via rollback_change(), not on a
+#     pre-write approval gate.
+#   - A pre-write human-in-the-loop gate. propose_script() now applies
+#     automatically the moment it produces a clean diff — there is no
+#     window where a change_id exists but the real files are untouched,
+#     and no separate confirmation step the calling application needs to
+#     enforce across turns. This is a deliberate trade made on 2026 for
+#     workflow speed: write-then-show-diff instead of show-diff-then-wait
+#     -then-write. The previous design (ChangeSet.confirmed, gated behind
+#     a NEW user turn in cowork_session.py's loop) is what implemented
+#     the pre-write gate; both the flag and the session-loop code that
+#     flipped it have been removed. Revert by reintroducing a `confirmed`
+#     field, having propose_script() skip the apply_change() call at the
+#     end instead of invoking it, and restoring a tool-layer apply_change
+#     that checks `confirmed` the way the old cowork_tool_sandbox_exec.py
+#     did — none of the stage/diff/snapshot/rollback logic above needs to
+#     change either way, only where along this pipeline the write happens.
+#   - Note this raises the bar on rollback_change() correctness: since
+#     there's no human checkpoint before the first write anymore,
+#     rollback is the only undo path, and needs to be right the first
+#     time, not just eventually.
