@@ -53,7 +53,7 @@ graph = None
 
 # tokeniser helpers to count tokens
 enc = tiktoken.get_encoding("cl100k_base")
-TOKEN_THRESHOLD = 15_000
+TOKEN_THRESHOLD = 10_000
 
 # Number of recent conversational "units" we try to preserve fresh.
 # Actual preserved count may be slightly larger because we keep

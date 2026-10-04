@@ -81,12 +81,12 @@ class ToolManager:
         # to the LLM calls already happening per turn.
         self._embedder = OpenAIEmbeddings(model="text-embedding-3-large")
         self._router   = ChatOpenAI(
-            model="gpt-5.6-luna",
+            model="gpt-6-luna",
             use_responses_api=True,
             reasoning_effort="medium",
         ).with_structured_output(RouterOutput, include_raw=True)
         self._describer = ChatOpenAI(
-            model="gpt-5.6-luna",
+            model="gpt-6-luna",
             use_responses_api=True,
             reasoning_effort="medium",
         )
@@ -213,7 +213,7 @@ class ToolManager:
                 try:
                     from usage_tracker import record_usage
                     usage_meta = result.usage_metadata
-                    model_name = getattr(result, "response_metadata", {}).get("model_name", "gpt-5.6-luna")
+                    model_name = getattr(result, "response_metadata", {}).get("model_name", "gpt-6-luna")
                     msg_id = getattr(result, "id", None)
                     record_usage(
                         dimension="agent",
@@ -323,7 +323,7 @@ class ToolManager:
                 try:
                     from usage_tracker import record_usage
                     usage_meta = raw_msg.usage_metadata
-                    model_name = getattr(raw_msg, "response_metadata", {}).get("model_name", "gpt-5.6-luna")
+                    model_name = getattr(raw_msg, "response_metadata", {}).get("model_name", "gpt-6-luna")
                     msg_id = getattr(raw_msg, "id", None)
                     record_usage(
                         dimension="agent",

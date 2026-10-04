@@ -3,243 +3,72 @@ cowork_tools.py
 --------------
 Sandboxed filesystem tools for `sicily start`.
 
-Mirrors the @modelcontextprotocol/server-filesystem interface,
-re-implemented in pure Python with zero extra dependencies.
-
-ALL tools are locked to a single root directory (the cwd where
-`sicily start` was invoked). No path can escape that root.
-
-Tool tiers
-----------
-Read-only tools  — safe:      read_file, list_directory, file_tree_shallow,
-                              get_file_info, list_allowed_directories, read_file_lines
-Write tools      — safe-ish: create_text_file, make_directory, edit_file_lines
-                  Guarantee: never delete existing content.
-                  edit_file_lines requires dry_run=False to apply changes.
-Path pins        — memory:   pin_path, recall_path, recall_all_pins
-                  Survive context summarisation — stored in process memory,
-                  not in the message list.
+All tools are locked to a single root directory (the cwd `sicily start` was invoked from); no path can escape it.
 """
 
-import datetime
-import stat
+import re
+import shutil
 from pathlib import Path
-from typing import Optional
-import importlib
+import fnmatch
+from typing import List, Optional, Union, Literal
 
 from langchain_core.tools import tool
-
-# Noise directories — skipped in trees and searches
-SKIP_DIRS = {
-    ".venv", "venv", "env", ".env",
-    "node_modules",
-    "__pycache__",
-    ".git",
-    ".mypy_cache", ".pytest_cache", ".ruff_cache",
-    "dist", "build", ".eggs",
-    ".tox", ".nox",
-    ".idea", ".vscode",
-    ".sicily-trash",
-}
-
-
-# Allowed extensions for text-based file CONTENT reads/writes only
-# (write_file, edit_file_lines, etc. in THIS file).
-# Binary formats (.docx, .xlsx, .pdf, …) are intentionally excluded from
-# these content write operations — they require structured serialisation,
-# not raw text I/O.
-#
-# NOTE: this restriction is scoped to reading/writing file CONTENT. It does
-# NOT apply to filesystem operations like move/copy/rename/delete, which
-# never touch content — see cowork_tool_fileops.py's READABLE_EXTENSIONS,
-# which deliberately includes .pdf/.docx/.xlsx/.xls/.doc for exactly that
-# reason. Don't infer from this set alone that binary files are unsupported
-# sandbox-wide.
-ALLOWED_WRITE_EXTENSIONS: frozenset[str] = frozenset({
-    # Documents & notes
-    ".txt", ".md", ".markdown", ".rst", ".org", ".tex",
-    # Config & data interchange
-    ".json", ".jsonl", ".ndjson",
-    ".yaml", ".yml", ".toml",
-    ".ini", ".cfg", ".conf", ".env",
-    # Web & markup
-    ".html", ".htm", ".css", ".scss", ".sass", ".xml", ".svg",
-    # Source code — common languages
-    ".py", ".pyi",
-    ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
-    ".sh", ".bash", ".zsh", ".fish",
-    ".rb", ".go", ".rs",
-    ".java", ".kt", ".scala",
-    ".c", ".cpp", ".cc", ".h", ".hpp",
-    ".cs", ".fs",
-    ".php", ".lua", ".r", ".sql",
-    # Data & logs
-    ".csv", ".tsv", ".log",
-    # Misc text
-    ".diff", ".patch", ".gitignore", ".editorconfig",
-})
-
-
-# Sandbox root
-_SANDBOX_ROOT: Optional[Path] = None
-
-
-def set_sandbox_root(path: Path) -> None:
-    global _SANDBOX_ROOT
-    _SANDBOX_ROOT = path.resolve()
-
-
-def get_sandbox_root() -> Path:
-    if _SANDBOX_ROOT is None:
-        raise RuntimeError("Sandbox root has not been set. Call set_sandbox_root() first.")
-    return _SANDBOX_ROOT
-
-
-# Path pin store — survives context summarisation
-# Stored in process memory, not in the message list, so the summariser
-# cannot compress it away.
-_PATH_PINS: dict[str, str] = {}
-
-
-# Internal helpers
-def _safe_path(relative: str) -> Path:
-    """
-    Resolve a user/AI-supplied path against the sandbox root.
-    Raises PermissionError if the resolved path would escape the root.
-    """
-    root = get_sandbox_root()
-    candidate = root / relative
-    try:
-        resolved = candidate.resolve()
-    except OSError:
-        # On Windows, resolve() can raise FileNotFoundError for paths
-        # that don't exist yet. Fall back to normpath-based resolution,
-        # which works for non-existent paths.
-        import os
-        resolved = Path(os.path.normpath(candidate))
-
-    if not resolved.is_relative_to(root):
-        raise PermissionError(
-            f"Access denied: '{relative}' resolves outside the allowed directory."
-        )
-    return resolved
-
-
-def _is_skipped(path: Path) -> bool:
-    """True if this is a noise directory that should be excluded."""
-    return path.is_dir() and path.name in SKIP_DIRS
-
-
-def _fmt_ts(ts: float) -> str:
-    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _fmt_permissions(mode: int) -> str:
-    """Convert a stat st_mode integer to a human-readable 'rwxrwxrwx' string."""
-    result = []
-    for who in ("USR", "GRP", "OTH"):
-        for perm, letter in (("R", "r"), ("W", "w"), ("X", "x")):
-            flag = getattr(stat, f"S_I{perm}{who}")
-            result.append(letter if mode & flag else "-")
-    return "".join(result)
-
-
-# Extensions that require binary parsing rather than UTF-8 text reads
-_BINARY_EXTENSIONS = frozenset({".pdf", ".xlsx", ".xls", ".docx", ".doc"})
-
-
-def _read_binary(path: Path) -> str:
-    """
-    Extract human-readable text from binary file formats.
-    Dispatches to the appropriate parser based on file extension.
-    Raises ImportError with an install hint if the required library is missing.
-    Raises ValueError for unsupported binary extensions.
-    """
-    ext = path.suffix.lower()
-
-    if ext == ".pdf":
-        if importlib.util.find_spec("pypdf") is None:
-            raise ImportError("pip install pypdf")
-
-        from pypdf import PdfReader
-
-        reader = PdfReader(path)
-        text_output = ""
-
-        # 1. Extract text page by page
-        for i, page in enumerate(reader.pages):
-            page_text = page.extract_text() or ""
-            if page_text.strip():
-                text_output += f"[Page {i+1}]\n{page_text.strip()}\n\n"
-
-        # 2. Extract form fields (AcroForm)
-        try:
-            fields = reader.get_fields()
-            if fields:
-                field_lines = []
-                for name, field in fields.items():
-                    value = field.value
-                    if value is not None:
-                        field_lines.append(f"{name}: {value}")
-                    else:
-                        # Optional: show field name even if empty
-                        field_lines.append(f"{name}: [empty]")
-                if field_lines:
-                    text_output += "[Form Field Values]\n" + "\n".join(field_lines)
-        except Exception as e:
-            text_output += f"\n[Form Field Extraction Failed: {e}]"
-
-        return text_output.strip()
-
-    if ext in {".xlsx", ".xls"}:
-        if importlib.util.find_spec("openpyxl") is None:
-            raise ImportError("pip install openpyxl")
-        import openpyxl
-        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-        sheets = []
-        for name in wb.sheetnames:
-            ws = wb[name]
-            rows = [
-                "\t".join("" if cell.value is None else str(cell.value) for cell in row)
-                for row in ws.iter_rows()
-            ]
-            sheets.append(f"[Sheet: {name}]\n" + "\n".join(rows))
-        wb.close()
-        return "\n\n".join(sheets)
-
-    if ext in {".docx", ".doc"}:
-        if importlib.util.find_spec("docx") is None:
-            raise ImportError("pip install python-docx")
-        from docx import Document
-        doc = Document(path)
-        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-
-    raise ValueError(
-        f"No binary reader available for '{ext}'. "
-        "For plain text files this tool reads UTF-8 directly. "
-        "For other binary formats, a dedicated tool may be needed."
-    )
+from Cowork.debug_log import log_tool_call  # adjust import path to match your project
+from Cowork.cowork_helpers import (
+    _safe_path,
+    _read_binary,
+    _read_binary_units,
+    _search_binary_units,
+    BINARY_UNIT_LABELS,
+    _get_sandbox_root,
+    _is_skipped,
+    _list_directory_entries,
+    _describe_path,
+    _validate_fileops_command,
+    _SKIP_DIRS,
+    _BINARY_EXTENSIONS,
+    _ALLOWED_WRITE_EXTENSIONS,
+    MANAGEABLE_EXTENSIONS,
+    READABLE_EXTENSIONS,
+    CommandValidationError,
+    build_binary_file,
+    _format_script_library_status,
+    _fmt_delete_path_arg,
+    _encode_image,
+    _IMAGE_EXTENSIONS,
+    _MAX_IMAGES_PER_CALL,
+    _extract_text,
+    _get_vision_llm,
+    _looks_text_only,
+    _OCR_CONFIDENCE_THRESHOLD,
+    _run_ocr,
+    _FULL_READ_PREVIEW_UNITS,
+    _FULL_READ_MAX_UNITS,
+    _FULL_READ_MAX_LINES
+)
+from Cowork.cowork_tool_sandbox_exec import run_script, rollback_change
 
 
 # READ-ONLY TOOLS
 @tool
 def search_index(query: str) -> str:
     """
-    Search the local RAG index for content relevant to a query.
- 
-    This is the FIRST tool to call for any question that involves finding
-    information inside files — before reading any file directly.
- 
-    The index covers all text-based files in the sandbox:
-    .txt, .md, .pdf, .docx, .xlsx, .py, .json, .csv, and more.
- 
-    Returns the top matching snippets with their file path and position.
-    If a snippet looks relevant, use read_file_lines to read more context
-    around it in the original file.
- 
+    Semantic search over the sandbox's index (.txt, .md, .pdf, .docx, .xlsx,
+    .py, .json, .csv, and more).
+
+    For a focused lookup ("which file has X", "where is X defined"), one or
+    two well-chosen queries should surface the answer — a soft budget of
+    ~10 tool calls total across all tools for that kind of question is a
+    signal to stop and reconsider, not push further with more queries.
+    Don't repeat this with near-synonymous phrasing; rephrase only if the
+    first query's results were clearly off-target.
+
     Args:
-        query: Plain-language description of what you are looking for.
-               e.g. "quarterly budget figures" or "meeting notes from January"
+        query: Plain-language description of what you're looking for.
+
+    Returns:
+        Top matching snippets with file path and position, or a message
+        that nothing matched.
     """
     from Cowork.cowork_rag import get_rag   # adjust import path to match your project
     rag = get_rag()
@@ -250,54 +79,76 @@ def search_index(query: str) -> str:
 
 
 @tool
-def read_file(path: str, head: int = 0, tail: int = 0) -> str:
+def read_file(
+    path: str,
+    start_line: int = 0,
+    end_line: int = 0,
+    start_unit: int = 0,
+    end_unit: int = 0,
+) -> str:
     """
-    Read the contents of any file and return it as plain text.
+    Read a file as plain text, in full or by a targeted range.
 
-    NOT THE DEFAULT FIRST MOVE. Before reaching for this tool, ask whether
-    search_file_contents or search_index would get you a line number instead —
-    if so, use that, then jump straight to read_file_lines around that line.
-    Blindly reading the head of a file you haven't searched yet is a common
-    source of wasted calls (you're guessing where the answer lives instead of
-    letting a search tell you).
+    Text files: start_line/end_line, 1-indexed inclusive, max 500 lines/call.
 
-    RECOMMENDED WORKFLOW:
-    - If you don't yet know where in the file the answer is, search first
-      (search_file_contents / search_index) rather than reading head/tail blind.
-    - When a search returns specific line numbers, prefer `read_file_lines`
-      targeted at that range over reading here.
-    - Use full read (`head=0, tail=0`) only for small-to-medium files or when you 
-      genuinely need the entire content (e.g. small scripts, configs, short notes).
-    - `head=N` / `tail=N` are for genuinely unknown-structure files with no
-      search hit yet to anchor on — not a routine first step.
+    Binary documents (.pdf/.docx/.xlsx/.xls/.pptx): start_unit/end_unit
+    instead. A unit = the format's own division: .pdf=page, .pptx=slide,
+    .xlsx/.xls=sheet (by order), .docx=paragraph. 1-indexed inclusive,
+    max 50 units/call. Use one mechanism matching the file's type, not both.
 
-    Handles two categories transparently:
+    0/0 on both (default) = full file, capped at 500 lines / 20 units —
+    past that you get a preview + true total; page through with the range
+    args. The returned header always states the true total.
 
-    Text-based files (.txt, .md, .py, .json, .csv, .yaml, .html, etc.)
-        Raw UTF-8 content is returned as-is.
-
-    Binary document formats
-        .pdf   — text extracted page by page, labelled [Page N]
-        .docx  — all paragraph text extracted in order
-        .xlsx/.xls — every sheet as tab-separated table, labelled [Sheet: name]
-
-    IMPORTANT:
-    - Always start with `head=50` on unknown or potentially large files.
-    - Avoid full reads on large files (logs, big CSVs, long source files, etc.).
-      Use `read_file_lines` with targeted ranges or multiple calls instead.
-    - Full reads are mainly justified for summarization of small files, 
-      code review of scripts, or when the complete content is genuinely required.
-
-    For precise line-range reading (especially after RAG), use `read_file_lines`.
+    Investigating rather than building/converting: reading the same file
+    more than twice in one investigation is a signal the answer isn't in
+    it — report what you found and move on, or ask, rather than trying a
+    third range/angle. Following a lead into another file (e.g. the
+    function this file calls) is fine; opening an unrelated subsystem
+    because it happened to come up is not — stop and confirm with the user
+    first if the question's scope is unclear.
 
     Args:
-        path: Relative path to the file.
-        head: If > 0, return only the first N lines.
-        tail: If > 0, return only the last N lines.
-              Cannot be combined with head.
+        path:       Relative path to the file.
+        start_line: Text files only — first line (1-indexed). 0 for full/preview.
+        end_line:   Text files only — last line (inclusive). 0 for full/preview.
+        start_unit: Binary documents only — first page/slide/sheet/paragraph
+                    (1-indexed). 0 for full/preview.
+        end_unit:   Binary documents only — last page/slide/sheet/paragraph
+                    (inclusive). 0 for full/preview.
+
+    Returns:
+        A header line stating what was read and the true total
+        ("lines 1-500 of 3200" or "pages 1-3 of 340 (PREVIEW — capped; use
+        start_unit/end_unit to page through the rest)"), followed by the
+        content. On error: a plain-text explanation (bad range, wrong
+        mechanism, file not found, unsupported format, missing package) —
+        never raises.
     """
-    if head > 0 and tail > 0:
-        return "Error: Cannot specify both `head` and `tail` simultaneously."
+    line_ranged = start_line > 0 or end_line > 0
+    unit_ranged = start_unit > 0 or end_unit > 0
+
+    if line_ranged and unit_ranged:
+        return (
+            "Error: pass either start_line/end_line or start_unit/end_unit, "
+            "not both — they address different file types."
+        )
+
+    if line_ranged:
+        if start_line < 1:
+            return "Error: start_line must be >= 1."
+        if end_line < start_line:
+            return "Error: end_line must be >= start_line."
+        if end_line - start_line > 500:
+            return "Error: Cannot read more than 500 lines at once. Narrow your range."
+
+    if unit_ranged:
+        if start_unit < 1:
+            return "Error: start_unit must be >= 1."
+        if end_unit < start_unit:
+            return "Error: end_unit must be >= start_unit."
+        if end_unit - start_unit > 50:
+            return "Error: Cannot read more than 50 units at once. Narrow your range."
 
     try:
         file_path = _safe_path(path)
@@ -309,8 +160,110 @@ def read_file(path: str, head: int = 0, tail: int = 0) -> str:
     if not file_path.is_file():
         return f"'{path}' is a directory, not a file."
 
-    # Binary formats — route to dedicated parser
-    if file_path.suffix.lower() in _BINARY_EXTENSIONS:
+    suffix = file_path.suffix.lower()
+    if suffix in {".doc", ".ppt"}:
+        modern_ext = ".docx" if suffix == ".doc" else ".pptx"
+        return (
+            f"'{path}' is the legacy pre-2007 Office format ('{suffix}') and "
+            f"isn't supported — only the modern '{modern_ext}' format can be "
+            f"read. Re-save the file as {modern_ext} (e.g. via 'Save As' in "
+            "Word/PowerPoint) and try again."
+        )
+
+    # checking for images:
+    if suffix in _IMAGE_EXTENSIONS:
+        return f"'{path}' is an image — use view_image instead, with a question about what you need from it."
+
+    is_binary = suffix in _BINARY_EXTENSIONS
+
+    if line_ranged and is_binary:
+        unit_label = BINARY_UNIT_LABELS.get(suffix, "unit")
+        return (
+            f"'{path}' is a binary document ({file_path.suffix}). "
+            f"start_line/end_line only work on text files — use "
+            f"start_unit/end_unit instead, which for this format means "
+            f"{unit_label} number."
+        )
+
+    if unit_ranged and not is_binary:
+        return (
+            f"'{path}' is a text file. start_unit/end_unit only work on "
+            "binary documents (.pdf/.docx/.xlsx/.pptx) — use start_line/"
+            "end_line instead."
+        )
+
+    if line_ranged:
+        try:
+            all_lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        except Exception as e:
+            return f"Could not read '{path}': {e}"
+
+        total = len(all_lines)
+        if start_line > total:
+            return f"File only has {total} lines. start_line={start_line} is out of range."
+
+        actual_end = min(end_line, total)
+        selected = all_lines[start_line - 1 : actual_end]
+
+        numbered = "".join(f"{start_line + i:>6}  {line}" for i, line in enumerate(selected))
+        header = f"[{path} | lines {start_line}–{actual_end} of {total}]\n"
+        return header + numbered
+
+    if unit_ranged:
+        unit_label = BINARY_UNIT_LABELS.get(suffix, "unit")
+        try:
+            units = _read_binary_units(file_path)
+        except ImportError as e:
+            return f"Cannot read '{path}': missing required package — {e}"
+        except Exception as e:
+            return f"Could not extract text from '{path}': {e}"
+
+        total = len(units)
+        if total == 0:
+            return f"'{path}' has no extractable {unit_label}s (it may be empty or unparseable)."
+        if start_unit > total:
+            return f"'{path}' only has {total} {unit_label}(s). start_unit={start_unit} is out of range."
+
+        actual_end = min(end_unit, total)
+        selected = units[start_unit - 1 : actual_end]
+
+        header = f"[{path} | {unit_label}s {start_unit}–{actual_end} of {total}]\n"
+        return header + "\n\n".join(selected)
+
+    # ── Unranged ("full read") path — the one a model falls into by
+    # omitting every range argument. This is the actual cost/latency risk
+    # for large documents, so it is capped the same way a ranged call
+    # would be, rather than ever returning an entire large document in one
+    # response. Small files (the common case) are completely unaffected —
+    # this only changes behavior once a file exceeds the cap.
+    if is_binary:
+        unit_label = BINARY_UNIT_LABELS.get(suffix, "unit")
+        try:
+            units = _read_binary_units(file_path)
+        except ImportError as e:
+            return f"Cannot read '{path}': missing required package — {e}"
+        except Exception as e:
+            return f"Could not extract text from '{path}': {e}"
+
+        total = len(units)
+        if total == 0:
+            return f"'{path}' has no extractable {unit_label}s (it may be empty or unparseable)."
+
+        if total > _FULL_READ_MAX_UNITS:
+            preview = units[:_FULL_READ_PREVIEW_UNITS]
+            header = (
+                f"[{path} | {unit_label}s 1–{_FULL_READ_PREVIEW_UNITS} of {total} "
+                f"— PREVIEW, full document too large for one read. Use "
+                f"start_unit/end_unit (max 50 {unit_label}s/call) to page "
+                f"through the rest, or search_index/search_file_contents "
+                "to jump straight to relevant content.]\n"
+            )
+            return header + "\n\n".join(preview)
+
+        # Under the cap — safe to return the full document. Goes through
+        # _read_binary (not just "\n\n".join(units)) so PDFs still get
+        # their trailing form-field block, matching pre-cap behavior
+        # exactly for every file this cap doesn't affect.
         try:
             content = _read_binary(file_path)
         except ImportError as e:
@@ -318,497 +271,414 @@ def read_file(path: str, head: int = 0, tail: int = 0) -> str:
         except Exception as e:
             return f"Could not extract text from '{path}': {e}"
 
-    # Text files — UTF-8 read
+        header = f"[{path} | full document, {total} {unit_label}s]\n"
+        return header + content
+
     else:
         try:
             content = file_path.read_text(encoding="utf-8", errors="replace")
         except Exception as e:
             return f"Could not read '{path}': {e}"
 
-    total_lines = len(content.splitlines())
+        all_lines = content.splitlines(keepends=True)
+        total = len(all_lines)
 
-    if head > 0:
-        shown = content.splitlines(keepends=True)[:head]
-        shown_count = len(shown)
-        header = f"[{path} | showing first {shown_count} of {total_lines} lines (head={head})]\n"
-        return header + "".join(shown)
+        if total > _FULL_READ_MAX_LINES:
+            preview_lines = all_lines[:_FULL_READ_MAX_LINES]
+            numbered = "".join(f"{i + 1:>6}  {line}" for i, line in enumerate(preview_lines))
+            header = (
+                f"[{path} | lines 1–{_FULL_READ_MAX_LINES} of {total} — "
+                f"PREVIEW, full file too large for one read. Use "
+                f"start_line/end_line (max 500 lines/call) to page through "
+                "the rest, or search_index/search_file_contents to jump "
+                "straight to relevant content.]\n"
+            )
+            return header + numbered
 
-    if tail > 0:
-        shown = content.splitlines(keepends=True)[-tail:]
-        shown_count = len(shown)
-        header = f"[{path} | showing last {shown_count} of {total_lines} lines (tail={tail})]\n"
-        return header + "".join(shown)
-
-    header = f"[{path} | full file, {total_lines} lines]\n"
-    return header + content
-
-
-@tool
-def read_file_lines(path: str, start_line: int, end_line: int) -> str:
-    """
-    Read a specific line range from a text file, with line numbers shown.
-    Lines are 1-indexed and inclusive on both ends. Maximum 500 lines per call.
-
-    Use this BEFORE edit_file_lines to confirm you are targeting the correct
-    lines. This lets you work surgically on large files without pulling their
-    full content into context.
-
-    DO NOT GUESS start_line/end_line. Only call this with a range you already
-    have evidence for — a line number from a search_file_contents match, a
-    symbol location from search_index, or a range you've already confirmed via
-    a prior read. Picking a speculative window (e.g. "it's probably somewhere
-    around line 400") to go fishing wastes a call on a guess; search for the
-    line first, then read exactly around it.
-
-    Typical workflow
-    ----------------
-    1. search_file_contents(pattern, ...)  — get a real line number as evidence
-    2. read_file_lines(path, N, M)         — read a small window around that
-                                              evidenced line, confirm exact lines
-    3. edit_file_lines(path, N, M, ...)    — make the surgical replacement
-
-    (Use read_file with head/tail only if you have no search hit at all yet
-    and need to understand an unfamiliar file's structure first.)
-
-    Args:
-        path:       Relative path to the file.
-        start_line: First line to read (1-indexed).
-        end_line:   Last line to read (inclusive).
-    """
-    if start_line < 1:
-        return "Error: start_line must be >= 1."
-    if end_line < start_line:
-        return "Error: end_line must be >= start_line."
-    if end_line - start_line > 500:
-        return "Error: Cannot read more than 500 lines at once. Narrow your range."
-
-    try:
-        target = _safe_path(path)
-    except PermissionError as e:
-        return str(e)
-
-    if not target.exists():
-        return f"File '{path}' does not exist."
-    if not target.is_file():
-        return f"'{path}' is a directory, not a file."
-
-    try:
-        all_lines = target.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
-    except Exception as e:
-        return f"Could not read '{path}': {e}"
-
-    total = len(all_lines)
-    if start_line > total:
-        return f"File only has {total} lines. start_line={start_line} is out of range."
-
-    actual_end = min(end_line, total)
-    selected = all_lines[start_line - 1 : actual_end]
-
-    numbered = "".join(f"{start_line + i:>6}  {line}" for i, line in enumerate(selected))
-    header = f"[{path} | lines {start_line}–{actual_end} of {total}]\n"
-    return header + numbered
-
-
-@tool
-def list_directory(path: str = ".") -> str:
-    """
-    List the immediate contents of a directory.
-    Each entry is prefixed with [FILE] or [DIR].
-    Does NOT recurse into subdirectories.
-
-    Args:
-        path: Relative path to the directory. Defaults to "." (sandbox root).
-    """
-    try:
-        target = _safe_path(path)
-    except PermissionError as e:
-        return str(e)
-
-    if not target.exists():
-        return f"Directory '{path}' does not exist."
-    if not target.is_dir():
-        return f"'{path}' is a file, not a directory."
-
-    try:
-        entries = sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name))
-    except PermissionError:
-        return f"Permission denied: cannot list '{path}'."
-
-    if not entries:
-        return "Directory is empty."
-
-    lines = []
-    for entry in entries:
-        tag = "[DIR] " if entry.is_dir() else "[FILE]"
-        note = "  [skipped — noise dir]" if _is_skipped(entry) else ""
-        lines.append(f"{tag} {entry.name}{note}")
-
-    return "\n".join(lines)
-
-
-@tool
-def file_tree_shallow(subdirectory: str = ".", max_depth: int = 2, max_entries: int = 200) -> str:
-    """
-    Show a recursive visual tree of files and folders — token-safe.
-
-    Unlike an unlimited tree dump, this tool is depth-limited and entry-capped
-    so it never floods the context window on large or deeply nested projects.
-
-    Use this as the FIRST tool when exploring any unknown project. If you need
-    to go deeper into a specific subdirectory, call again with that path as the
-    root and a higher max_depth.
-
-    Rules of thumb
-    --------------
-    - Start at root with max_depth=2 to understand the project shape.
-    - Drill into a specific folder: file_tree_shallow("src/billing", max_depth=3)
-    - When the cap warning appears, narrow the subdirectory instead of raising it.
-    - Do NOT use this with max_depth > 4 on the project root.
-
-    Args:
-        subdirectory: Relative path to start the tree from. Defaults to ".".
-        max_depth:    How many levels deep to recurse. Default 2. Hard max 6.
-        max_entries:  Stop emitting after this many entries to prevent token
-                      floods. Default 200. A warning is appended when hit.
-    """
-    try:
-        target = _safe_path(subdirectory)
-    except PermissionError as e:
-        return str(e)
-
-    if not target.exists():
-        return f"Directory '{subdirectory}' does not exist."
-    if not target.is_dir():
-        return f"'{subdirectory}' is a file, not a directory."
-
-    max_depth = min(max(1, max_depth), 6)
-    root = get_sandbox_root()
-    label = str(target.relative_to(root)) if subdirectory != "." else "."
-    lines = [f"📁 {label}"]
-    entry_count = 0
-    capped = False
-
-    def _render(directory: Path, prefix: str = "", depth: int = 0) -> None:
-        nonlocal entry_count, capped
-        if capped or depth >= max_depth:
-            return
-        try:
-            children = sorted(directory.iterdir(), key=lambda p: (p.is_file(), p.name))
-        except PermissionError:
-            lines.append(f"{prefix}└── [permission denied]")
-            return
-
-        for i, child in enumerate(children):
-            if capped:
-                return
-            is_last = i == len(children) - 1
-            connector = "└── " if is_last else "├── "
-
-            if _is_skipped(child):
-                lines.append(f"{prefix}{connector}📁 {child.name}/  [skipped]")
-                entry_count += 1
-                if entry_count >= max_entries:
-                    capped = True
-                continue
-
-            icon = "📁 " if child.is_dir() else "📄 "
-            lines.append(f"{prefix}{connector}{icon}{child.name}")
-            entry_count += 1
-            if entry_count >= max_entries:
-                capped = True
-                return
-
-            if child.is_dir():
-                extension = "    " if is_last else "│   "
-                _render(child, prefix + extension, depth + 1)
-
-    _render(target)
-
-    if capped:
-        lines.append(
-            f"\n⚠️  Output capped at {max_entries} entries. "
-            "Narrow the subdirectory path to explore deeper sections."
-        )
-
-    lines.append(f"\n[Depth: {max_depth} | Entries shown: {entry_count}]")
-    return "\n".join(lines)
-
-
-@tool
-def get_file_info(path: str) -> str:
-    """
-    Get detailed metadata about a file or directory.
-    Returns: name, type, size, permissions, created, modified, and accessed times.
-
-    Args:
-        path: Relative path to the file or directory.
-    """
-    try:
-        target = _safe_path(path)
-    except PermissionError as e:
-        return str(e)
-
-    if not target.exists():
-        return f"'{path}' does not exist."
-
-    try:
-        s = target.stat()
-    except PermissionError:
-        return f"Permission denied: cannot stat '{path}'."
-
-    kind = "Directory" if target.is_dir() else "File"
-    size = f"{s.st_size:,} bytes" if target.is_file() else "—"
-    permissions = _fmt_permissions(s.st_mode)
-
-    # Creation time:
-    #   macOS  → st_birthtime (real creation time)
-    #   Windows→ st_ctime     (real creation time)
-    #   Linux  → st_ctime     (last metadata change; true birthtime not exposed by Python)
-    created = _fmt_ts(getattr(s, "st_birthtime", s.st_ctime))
-
-    return "\n".join([
-        f"Name:        {target.name}",
-        f"Type:        {kind}",
-        f"Size:        {size}",
-        f"Permissions: {permissions}",
-        f"Created:     {created}",
-        f"Modified:    {_fmt_ts(s.st_mtime)}",
-        f"Accessed:    {_fmt_ts(s.st_atime)}",
-        f"Path:        {path}",
-    ])
-
-
-@tool
-def list_allowed_directories() -> str:
-    """
-    List all directories the agent is allowed to access.
-    Returns the sandbox root that was locked in when `sicily start` was invoked.
-    No input required.
-    """
-    root = get_sandbox_root()
-    return f"Allowed directories:\n  {root}"
-
-
-# PATH PIN TOOLS — survive context summarisation
-@tool
-def pin_path(alias: str, path: str) -> str:
-    """
-    Save a file path under a short alias so it survives context summarisation.
-
-    The summariser compresses old tool outputs out of the message list. A path
-    discovered 10 turns ago may no longer be in context when you need to act
-    on it. Pinned paths live in process memory — the summariser cannot touch them.
-
-    ALWAYS call this immediately after finding a file you plan to use later,
-    before reading it or doing anything else.
-
-    Examples
-    --------
-    pin_path("target",  "src/billing/formatters/pdf_renderer.py")
-    pin_path("config",  "infrastructure/k8s/prod/values.yaml")
-    pin_path("tests",   "tests/unit/billing/test_invoice.py")
-
-    Args:
-        alias: A short memorable name for this path (e.g. "target", "config").
-        path:  The relative file path to save.
-    """
-    _PATH_PINS[alias] = path
-    return f"📌 Pinned '{alias}' → '{path}'. Use recall_path('{alias}') to retrieve it later."
-
-
-@tool
-def recall_path(alias: str) -> str:
-    """
-    Retrieve a previously pinned file path by its alias.
-
-    Use this whenever you need to act on a file but cannot be certain its
-    path is still in your active context (it may have been summarised away).
-
-    Args:
-        alias: The alias used when pin_path was called.
-    """
-    if alias not in _PATH_PINS:
-        all_pins = ", ".join(f"'{k}'" for k in _PATH_PINS) if _PATH_PINS else "none"
-        return (
-            f"No path pinned under alias '{alias}'. "
-            f"Available pins: {all_pins}. "
-            "If you have not pinned this path yet, use find_files_by_name to locate it first."
-        )
-    return f"📌 '{alias}' → '{_PATH_PINS[alias]}'"
-
-
-@tool
-def recall_all_pins() -> str:
-    """
-    List every currently pinned path.
-
-    Call this at the start of any multi-step task to remind yourself what
-    files you have already located, or after a long chain of tool calls
-    to re-orient before taking a write action.
-    """
-    if not _PATH_PINS:
-        return "No paths are currently pinned. Use pin_path to save file locations."
-    lines = [f"  {alias:20s} → {path}" for alias, path in _PATH_PINS.items()]
-    return "📌 Pinned paths:\n" + "\n".join(lines)
+        header = f"[{path} | full file, {total} lines]\n"
+        return header + content
 
 
 # WRITE TOOLS
 @tool
-def create_text_file(
-    path: str,
-    content: str,
-    create_parents: bool = True,
+def view_image(
+    paths: Union[str, List[str]],
+    question: str,
+    mode: Literal["auto", "ocr", "vision"] = "auto",
 ) -> str:
     """
-    Create a NEW text file at the given relative path with the provided content.
+    Ask a specific question about one or more images
+    (.png/.jpg/.jpeg/.gif/.webp) and get a text answer.
+ 
+    Pass multiple paths in one call when the question spans several images
+    (compare, summarize a batch) rather than calling once per image.
+    Max 8 images/call.
+ 
+    Args:
+        paths:    A single image path, or a list of paths (relative to
+                  sandbox root).
+        question: What you want to know about the image(s). Required —
+                  a missing question wastes the call.
+        mode:     "auto" (default) — runs free local OCR first; if the
+                  question is purely about text and OCR confidence is high,
+                  returns the OCR result directly with no LLM call. Otherwise
+                  falls back to the vision LLM, primed with the OCR text as
+                  a hint.
+                  "ocr" — local OCR only, no LLM call, fastest/cheapest.
+                  Use when you only need raw text and don't care about
+                  layout/visual reasoning.
+                  "vision" — skip OCR, go straight to the vision LLM. Use
+                  for photos, charts, diagrams, colors, UI screenshots, or
+                  anything needing actual visual understanding.
+ 
+    Returns:
+        A text answer. Per-image load errors are reported inline without
+        failing the whole call.
+    """
+    if isinstance(paths, str):
+        paths = [paths]
+ 
+    if not paths:
+        return "Error: at least one image path is required."
+ 
+    if len(paths) > _MAX_IMAGES_PER_CALL:
+        return (
+            f"Error: {len(paths)} images requested, max is "
+            f"{_MAX_IMAGES_PER_CALL} per call. Split into multiple calls."
+        )
+ 
+    if not question or not question.strip():
+        return (
+            "Error: a question is required — e.g. 'what does this "
+            "screenshot show?' Sending an image with no question wastes "
+            "the call, since nothing is extracted from it."
+        )
+ 
+    # ---- validate + collect image paths (same as before) ----
+    loaded, errors, file_paths = [], [], []
+    for p in paths:
+        try:
+            file_path = _safe_path(p)
+        except PermissionError as e:
+            errors.append(f"'{p}': {e}")
+            continue
+ 
+        if not file_path.exists():
+            errors.append(f"'{p}': does not exist.")
+            continue
+        if not file_path.is_file():
+            errors.append(f"'{p}': is a directory, not a file.")
+            continue
+        if file_path.suffix.lower() not in _IMAGE_EXTENSIONS:
+            errors.append(
+                f"'{p}': not a supported image format "
+                f"({', '.join(_IMAGE_EXTENSIONS)})."
+            )
+            continue
+ 
+        file_paths.append((p, file_path))
+        loaded.append(p)
+ 
+    if not loaded:
+        return "Could not load any images:\n" + "\n".join(errors)
+ 
+    # -----------------------------------------------------------------
+    # Tier 0: run local OCR (needed for "ocr" mode, and for "auto" mode
+    # to decide whether the vision LLM is needed at all).
+    # -----------------------------------------------------------------
+    ocr_results = {}
+    if mode in ("ocr", "auto"):
+        for p, file_path in file_paths:
+            try:
+                ocr_results[p] = _run_ocr(file_path)
+            except Exception as e:
+                # Belt-and-suspenders: _run_ocr already catches internally,
+                # this only fires on something even more unexpected (e.g.
+                # the normalize-retry temp file itself blowing up).
+                ocr_results[p] = {
+                    "text": "", "avg_confidence": 0.0, "n_boxes": 0,
+                    "detected": False, "error": f"{type(e).__name__}: {e}",
+                }
 
-    Safety guarantees
-    -----------------
-    - Will NEVER overwrite an existing file or directory. If the path already
-      exists the operation is aborted immediately and an error is returned.
-    - The resolved path must stay inside the sandbox root; any traversal attempt
-      (e.g. "../../etc/passwd") is blocked before any I/O occurs.
-    - Only recognised text-based extensions are accepted (see list below).
-    - Parent directories are created automatically when `create_parents=True`
-      (the default), as long as they remain inside the sandbox.
+    if mode == "ocr":
+        ocr_debug = {
+            p: {"n_boxes": ocr_results[p].get("n_boxes"), "detected": ocr_results[p].get("detected"),
+                "error": ocr_results[p].get("error")}
+            for p in loaded
+        }
+        log_tool_call("view_image._route", {"path": "OCR_ONLY", "reason": "mode=ocr", "images": loaded, "ocr_debug": ocr_debug})
+        parts = [f"[OCR: {', '.join(loaded)}]"]
+        for p in loaded:
+            r = ocr_results[p]
+            if r.get("error"):
+                parts.append(f"\n--- {p} ---\nOCR failed: {r['error']}")
+            elif not r["text"]:
+                parts.append(f"\n--- {p} ---\n(no text detected — {r.get('n_boxes', 0)} regions found)")
+            else:
+                parts.append(
+                    f"\n--- {p} (confidence {r['avg_confidence']:.2f}, {r.get('n_boxes', 0)} regions) ---\n{r['text']}"
+                )
+        if errors:
+            parts.append("\nSkipped — " + "; ".join(errors))
+        return "\n".join(parts)
 
-    To edit an existing file, use edit_file_lines instead.
+    # -----------------------------------------------------------------
+    # Tier "auto": if it's a text-only question and OCR is confident
+    # across all images, skip the vision LLM entirely.
+    # -----------------------------------------------------------------
+    if mode == "auto" and _looks_text_only(question):
+        confidences = {p: ocr_results[p]["avg_confidence"] for p in loaded}
+        ocr_debug = {
+            p: {"n_boxes": ocr_results[p].get("n_boxes"), "detected": ocr_results[p].get("detected"),
+                "error": ocr_results[p].get("error")}
+            for p in loaded
+        }
+        all_confident = all(
+            ocr_results[p]["text"] and ocr_results[p]["avg_confidence"] >= _OCR_CONFIDENCE_THRESHOLD
+            for p in loaded
+        )
+        if all_confident:
+            log_tool_call("view_image._route", {
+                "path": "OCR_ONLY", "reason": "auto_text_only_high_confidence",
+                "images": loaded, "confidences": confidences, "threshold": _OCR_CONFIDENCE_THRESHOLD,
+            })
+            parts = [f"[OCR: {', '.join(loaded)}]"]
+            for p in loaded:
+                r = ocr_results[p]
+                parts.append(f"\n--- {p} ---\n{r['text']}")
+            if errors:
+                parts.append("\nSkipped — " + "; ".join(errors))
+            return "\n".join(parts)
+        # else: fall through to vision LLM below, OCR text still used as a hint
+        log_tool_call("view_image._route", {
+            "path": "VISION_LLM", "reason": "auto_text_only_low_confidence",
+            "images": loaded, "confidences": confidences, "threshold": _OCR_CONFIDENCE_THRESHOLD,
+            "ocr_debug": ocr_debug,
+        })
+    elif mode == "auto":
+        log_tool_call("view_image._route", {"path": "VISION_LLM", "reason": "auto_visual_question", "images": loaded})
+    elif mode == "vision":
+        log_tool_call("view_image._route", {"path": "VISION_LLM", "reason": "mode=vision", "images": loaded})
+ 
+    # -----------------------------------------------------------------
+    # Tier 1: vision LLM (mode == "vision", or "auto" falling through).
+    # If we already ran OCR, prime the prompt with it so the model
+    # doesn't have to re-derive text from raw pixels.
+    # -----------------------------------------------------------------
+    prompt_text = question
+    if ocr_results:
+        ocr_hint_parts = []
+        for p in loaded:
+            r = ocr_results[p]
+            if r["text"]:
+                ocr_hint_parts.append(f"[{p}]\n{r['text']}")
+        if ocr_hint_parts:
+            prompt_text = (
+                f"{question}\n\n"
+                "Reference — text auto-extracted via OCR from the image(s) "
+                "below (may contain errors, use the image as ground truth "
+                "if they conflict):\n" + "\n\n".join(ocr_hint_parts)
+            )
+ 
+    content_blocks = [{"type": "text", "text": prompt_text}]
+    for p, file_path in file_paths:
+        try:
+            data, mime = _encode_image(file_path)
+        except ValueError as e:
+            errors.append(f"'{p}': {e}")
+            loaded.remove(p) if p in loaded else None
+            continue
+        content_blocks.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{data}"},
+        })
+ 
+    if len(content_blocks) == 1:  # only the text block, all images failed encoding
+        return "Could not load any images:\n" + "\n".join(errors)
+ 
+    try:
+        import time
+        from langchain_core.messages import HumanMessage
+        _t0 = time.monotonic()
+        response = _get_vision_llm().invoke([HumanMessage(content=content_blocks)])
+        answer = _extract_text(response.content)
+        log_tool_call("view_image._vision_llm_call", {
+            "images": loaded, "elapsed_s": round(time.monotonic() - _t0, 2),
+        })
+    except Exception as e:
+        log_tool_call("view_image._vision_llm_call", {"images": loaded, "error": str(e)})
+        return f"Vision request failed: {e}"
+ 
+    prefix = f"[Viewed: {', '.join(loaded)}]\n"
+    if errors:
+        prefix += "Skipped — " + "; ".join(errors) + "\n"
+    return prefix + answer
 
-    Supported extensions
-    --------------------
-    Documents/notes : .txt .md .markdown .rst .org .tex
-    Config/data     : .json .jsonl .ndjson .yaml .yml .toml .ini .cfg .conf .env
-    Web/markup      : .html .htm .css .scss .sass .xml .svg
-    Source code     : .py .pyi .js .mjs .cjs .ts .tsx .jsx .sh .bash .zsh .fish
-                      .rb .go .rs .java .kt .scala .c .cpp .cc .h .hpp .cs .fs
-                      .php .lua .r .sql
-    Data/logs       : .csv .tsv .log
-    Misc text       : .diff .patch .gitignore .editorconfig
+
+@tool
+def write_file(
+    path: str,
+    content: str = "",
+    mode: str = "create",
+    start_line: int = 0,
+    end_line: int = 0,
+    create_parents: bool = True,
+    dry_run: bool = True,
+) -> str:
+    """
+    Create a new file, or replace a line range in an existing text file.
+
+    mode="create" (default): writes `content` to `path` verbatim; refuses
+    if the path exists. Parent dirs auto-created when create_parents=True.
+
+    mode="edit": replaces lines [start_line, end_line] (1-indexed inclusive)
+    with `content` ("" to delete the range); file must exist. dry_run=True
+    (default) previews as a diff. Text extensions only.
+
+    --- Binary formats (.docx, .xlsx, .xls, .pptx, .pdf) ---
+    mode="create" only. `content` must be a standalone Python 3 script that
+    builds the file, not the file content itself. Requirements:
+    1. Don't read/reference any path other than the script's own working dir.
+    2. Save the result to exactly: .docx->"__cowork_output__.docx",
+       .xlsx->"__cowork_output__.xlsx", .pptx->"__cowork_output__.pptx",
+       .xls->"__cowork_output__.xls", .pdf->"__cowork_output__.pdf".
+    Validated by opening with the matching reader library, then copied to
+    `path`. Any failure (script error, timeout, missing/invalid output)
+    writes nothing and returns the specific error — read it, fix the
+    specific cause, retry. After 2 failed retries on the same file, stop
+    and show the user the exact error rather than continuing to guess.
+
+    If the script fails because a required library isn't installed, the
+    error names the missing library and the exact `pip install` command
+    for it, without the environment-modifying `--break-system-packages`
+    flag baked in. Don't run that install yourself — tell the user which
+    library is missing and why, show them the command, and ask whether
+    they'd like you to install it now or would rather install it
+    themselves before you retry. Only add flags like
+    --break-system-packages if the user asks for that.
+
+    Read source material once to extract what you need for the content —
+    don't re-read a source file "just to be sure" after you've already
+    pulled what's needed from it. Build only what was asked: don't
+    proactively add alternate formats, extra slides/sheets, or a summary
+    doc that wasn't requested.
 
     Args:
-        path:           Relative path for the new file, including its name and
-                        extension (e.g. "notes/meeting.md").
-        content:        UTF-8 text content to write.
-        create_parents: When True (default), any missing parent directories are
-                        created automatically. Set to False if you want the
-                        operation to fail when a parent does not exist.
+        path:           Relative path to the file.
+        content:        mode="create" + text: full file content, written verbatim.
+                        mode="create" + binary: a Python build script (see above).
+                        mode="edit": replacement text for the line range ("" to delete).
+        mode:           "create" or "edit".
+        start_line:     mode="edit" only — first line to replace (1-indexed).
+        end_line:       mode="edit" only — last line to replace (inclusive).
+        create_parents: mode="create" only — auto-create missing parent dirs (default True).
+        dry_run:        mode="edit" only — True (default) previews without writing.
+
+    Returns:
+        Success: "Created '{path}'.\nSize: N bytes" (text writes also
+        append "| Encoding: utf-8"). mode="edit" success: a diff preview
+        (dry_run=True) or confirmation of applied lines (dry_run=False).
+        Failure: a plain-text explanation of exactly what went wrong —
+        already-exists, missing/disallowed extension, missing parent, or
+        (binary) the build script's stderr or the reader library's
+        validation error. Never raises.
     """
-    # 1. Sandbox enforcement
+    if mode not in ("create", "edit"):
+        return f"Error: mode must be 'create' or 'edit', got '{mode}'."
+
     try:
         target = _safe_path(path)
     except PermissionError as e:
         return str(e)
 
-    # 2. No-overwrite guard
-    if target.exists():
-        kind = "directory" if target.is_dir() else "file"
-        return (
-            f"Refused: '{path}' already exists as a {kind}. "
-            "Use edit_file_lines to modify an existing file."
-        )
-
-    # 3. Extension whitelist
     ext = target.suffix.lower()
-    if not ext:
-        return (
-            f"Refused: '{path}' has no file extension. "
-            "Please include one (e.g. report.md, config.yaml)."
-        )
-    if ext not in ALLOWED_WRITE_EXTENSIONS:
-        allowed_str = "  " + "\n  ".join(sorted(ALLOWED_WRITE_EXTENSIONS))
-        return (
-            f"Refused: extension '{ext}' is not in the allowed list.\n"
-            f"Supported extensions:\n{allowed_str}"
-        )
 
-    # 4. Parent directory handling
-    parent = target.parent
-    if not parent.exists():
-        if not create_parents:
-            rel_parent = parent.relative_to(get_sandbox_root())
+    if mode == "create":
+        if target.exists():
+            kind = "directory" if target.is_dir() else "file"
             return (
-                f"Error: parent directory '{rel_parent}' does not exist. "
-                "Pass create_parents=True to create it automatically, "
-                "or use make_directory first."
+                f"Refused: '{path}' already exists as a {kind}. "
+                "Use mode=\"edit\" to modify an existing file."
             )
+        if not ext:
+            return (
+                f"Refused: '{path}' has no file extension. "
+                "Please include one (e.g. report.md, config.yaml)."
+            )
+
+        if ext in _BINARY_EXTENSIONS:
+            parent = target.parent
+            if not parent.exists():
+                if not create_parents:
+                    rel_parent = parent.relative_to(_get_sandbox_root())
+                    return (
+                        f"Error: parent directory '{rel_parent}' does not exist. "
+                        "Pass create_parents=True to create it automatically, "
+                        "or use run_file_command('mkdir ...') first."
+                    )
+                try:
+                    parent.mkdir(parents=True, exist_ok=True)
+                except Exception as e:
+                    return f"Could not create parent directories for '{path}': {e}"
+
+            if not content.strip():
+                status = _format_script_library_status(ext)
+                return (
+                    f"Refused: '{path}' is a '{ext}' file, which requires "
+                    f"`content` to be a Python script that builds it (see "
+                    f"write_file's docstring). Library availability in this "
+                    f"sandbox:\n{status}"
+                )
+
+            try:
+                size = build_binary_file(target, ext, content)
+            except ValueError as e:
+                return str(e)
+            except Exception as e:
+                return f"Could not build '{path}': {e}"
+
+            return f"Created '{path}'.\nSize: {size:,} bytes"
+
+        if ext not in _ALLOWED_WRITE_EXTENSIONS:
+            allowed_str = "  " + "\n  ".join(sorted(_ALLOWED_WRITE_EXTENSIONS))
+            return (
+                f"Refused: extension '{ext}' is not in the allowed list.\n"
+                f"Supported extensions:\n{allowed_str}"
+            )
+
+        parent = target.parent
+        if not parent.exists():
+            if not create_parents:
+                rel_parent = parent.relative_to(_get_sandbox_root())
+                return (
+                    f"Error: parent directory '{rel_parent}' does not exist. "
+                    "Pass create_parents=True to create it automatically, "
+                    "or use run_file_command('mkdir ...') first."
+                )
+            try:
+                parent.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                return f"Could not create parent directories for '{path}': {e}"
+
         try:
-            parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
         except Exception as e:
-            return f"Could not create parent directories for '{path}': {e}"
+            return f"Could not write '{path}': {e}"
 
-    # 5. Write
-    try:
-        target.write_text(content, encoding="utf-8")
-    except Exception as e:
-        return f"Could not write '{path}': {e}"
+        size = target.stat().st_size
+        return f"Created '{path}'.\nSize: {size:,} bytes | Encoding: utf-8"
 
-    size = target.stat().st_size
-    return (
-        f"Created '{path}'.\n"
-        f"Size: {size:,} bytes | Encoding: utf-8"
-    )
-
-
-@tool
-def edit_file_lines(
-    path: str,
-    start_line: int,
-    end_line: int,
-    new_content: str,
-    dry_run: bool = True,
-) -> str:
-    """
-    Replace a specific line range in an existing file with new content.
-    This is the correct tool for any task that modifies an existing file.
-
-    Safety design
-    -------------
-    - dry_run=True (the default): shows a diff-style preview WITHOUT writing.
-      Always call with dry_run=True first so the user can confirm the change.
-    - dry_run=False: actually writes the change. Only use after the user
-      confirms the preview is correct.
-    - The file MUST already exist. Use create_text_file for new files.
-    - Replaces lines [start_line, end_line] inclusive (1-indexed) with
-      new_content. All surrounding lines are untouched.
-    - Set new_content="" to delete the target lines without inserting anything.
-    - Only text-based extensions (same list as create_text_file) are supported.
-
-    Typical workflow
-    ----------------
-    1. read_file(path, head=50)                         — understand structure
-    2. read_file_lines(path, N, M)                      — confirm exact target
-    3. edit_file_lines(path, N, M, new, dry_run=True)   — preview the change
-    4. User confirms the preview looks correct
-    5. edit_file_lines(path, N, M, new, dry_run=False)  — apply it
-
-    Args:
-        path:        Relative path to the file.
-        start_line:  First line to replace (1-indexed).
-        end_line:    Last line to replace (inclusive).
-        new_content: Replacement text. Pass "" to delete the range entirely.
-        dry_run:     If True (default), show a preview without writing anything.
-    """
+    # mode == "edit"
     if start_line < 1:
         return "Error: start_line must be >= 1."
     if end_line < start_line:
         return "Error: end_line must be >= start_line."
 
-    try:
-        target = _safe_path(path)
-    except PermissionError as e:
-        return str(e)
-
     if not target.exists():
-        return (
-            f"File '{path}' does not exist. "
-            "Use create_text_file to create new files."
-        )
+        return f"File '{path}' does not exist. Use mode=\"create\" to make new files."
     if not target.is_file():
         return f"'{path}' is a directory, not a file."
-
-    # Extension guard — only edit text-based files
-    ext = target.suffix.lower()
-    if ext not in ALLOWED_WRITE_EXTENSIONS:
+    if ext not in _ALLOWED_WRITE_EXTENSIONS:
         return (
             f"Refused: extension '{ext}' is not in the allowed list for editing. "
             "Only text-based files can be edited."
@@ -826,11 +696,11 @@ def edit_file_lines(
     actual_end = min(end_line, total)
     removed = all_lines[start_line - 1 : actual_end]
 
-    # Ensure new_content ends with a newline so the file stays well-formed
-    if new_content and not new_content.endswith("\n"):
-        replacement_block = new_content + "\n"
+    # Ensure new content ends with a newline so the file stays well-formed
+    if content and not content.endswith("\n"):
+        replacement_block = content + "\n"
     else:
-        replacement_block = new_content
+        replacement_block = content
 
     new_file_lines = all_lines[: start_line - 1] + ([replacement_block] if replacement_block else []) + all_lines[actual_end:]
     new_content_full = "".join(new_file_lines)
@@ -855,7 +725,6 @@ def edit_file_lines(
             f"Call again with dry_run=False to apply."
         )
 
-    # Apply the edit
     try:
         target.write_text(new_content_full, encoding="utf-8")
     except Exception as e:
@@ -874,120 +743,756 @@ def edit_file_lines(
 
 
 @tool
-def make_directory(path: str) -> str:
+def run_file_command(command: str) -> str:
     """
-    Create a new directory at the given relative path, including any missing
-    intermediate parents. Idempotent: succeeds silently if the directory
-    already exists.
+    Run one filesystem command inside the sandbox: `cp`, `mv`, `mkdir`,
+    `ls`, or `info`. Batch multiple paths in one call
+    (e.g. `ls reports/q3 reports/q4`) instead of one call per path.
 
-    Safety guarantees
-    -----------------
-    - Will NOT fail or overwrite if the directory already exists.
-    - Will NOT touch any existing files or directories inside the path.
-    - The resolved path must stay inside the sandbox root.
-    - Will refuse if the path already exists as a *file*.
+    Only these five commands, limited flags (`-n`/`-r`/`-p`), no globs,
+    no piping/chaining.
 
     Args:
-        path: Relative path of the directory to create (e.g. "reports/q3").
+        command: A single cp/mv/mkdir/ls/info invocation, e.g.
+                "cp reports/draft.md reports/draft-backup.md",
+                "mv -r old_project new_project",
+                "mkdir reports/q3 reports/q4",
+                "ls reports/q3 reports/q4",
+                "info report.pdf notes.md archive/2026".
     """
-    # ── 1. Sandbox enforcement ────────────────────────────────────────────────
     try:
-        target = _safe_path(path)
+        executable, paths, flags = _validate_fileops_command(command)
+    except CommandValidationError as e:
+        return str(e)
+
+    root = _get_sandbox_root()
+    no_clobber = "-n" in flags
+
+    if executable == "ls":
+        sections = []
+        for target in paths:
+            label = str(target.relative_to(root)) if target.is_relative_to(root) else str(target)
+            body = _list_directory_entries(target, label)
+            sections.append(f"[{label}]\n{body}" if len(paths) > 1 else body)
+        return "\n\n".join(sections)
+
+    if executable == "info":
+        if not paths:
+            return "Refused: 'info' needs at least one path argument."
+        sections = []
+        for target in paths:
+            label = str(target.relative_to(root)) if target.is_relative_to(root) else str(target)
+            sections.append(_describe_path(target, label))
+        return "\n\n".join(sections)
+
+    if executable == "mkdir":
+        results = []
+        for target in paths:
+            if target.is_file():
+                results.append(f"'{target.relative_to(root)}': refused — already exists as a file.")
+                continue
+            if target.is_dir():
+                results.append(f"'{target.relative_to(root)}': already exists — nothing to do.")
+                continue
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+                results.append(f"'{target.relative_to(root)}': created.")
+            except Exception as e:
+                results.append(f"'{target.relative_to(root)}': could not create — {e}.")
+        return "\n".join(results)
+
+    # cp / mv — one or more sources, last positional is the destination.
+    *sources, dst = paths
+    multi_source = len(sources) > 1
+
+    # With 2+ sources, the destination must be a directory (create it if it doesn't exist yet, same as real cp/mv). With exactly 1 source,
+    # dst may be either a directory (item goes inside it) or a new path (item is placed/renamed at that exact path).
+    if multi_source:
+        if dst.exists() and not dst.is_dir():
+            return (
+                f"Refused: with multiple sources the destination "
+                f"'{dst.relative_to(root)}' must be a directory."
+            )
+        try:
+            dst.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return f"Could not create destination directory '{dst.relative_to(root)}': {e}"
+
+    results = []
+    for src in sources:
+        if not src.exists():
+            results.append(f"'{src.name}': source does not exist.")
+            continue
+
+        is_dir = src.is_dir()
+        if is_dir and executable == "cp" and "-r" not in flags:
+            results.append(
+                f"'{src.relative_to(root)}': is a directory — pass -r to copy it "
+                "(e.g. \"cp -r folder dest\")."
+            )
+            continue
+        if not is_dir:
+            ext = src.suffix.lower()
+            if ext not in MANAGEABLE_EXTENSIONS:
+                results.append(f"'{src.relative_to(root)}': refused — '{ext}' is not a manageable file type.")
+                continue
+
+        # Resolve final destination path for this item.
+        item_dst = (dst / src.name) if (multi_source or dst.is_dir()) else dst
+
+        if item_dst.exists():
+            if no_clobber:
+                results.append(f"'{src.relative_to(root)}': skipped (destination exists, -n set).")
+                continue
+            results.append(
+                f"'{src.relative_to(root)}': refused — destination "
+                f"'{item_dst.relative_to(root)}' already exists (this tool never overwrites)."
+            )
+            continue
+
+        src_rel = src.relative_to(root)
+        try:
+            item_dst.parent.mkdir(parents=True, exist_ok=True)
+            if executable == "cp":
+                if is_dir:
+                    shutil.copytree(str(src), str(item_dst))
+                    results.append(f"Copied '{src_rel}' -> '{item_dst.relative_to(root)}' (directory).")
+                else:
+                    shutil.copy2(str(src), str(item_dst))
+                    results.append(f"Copied '{src_rel}' -> '{item_dst.relative_to(root)}' ({item_dst.stat().st_size:,} bytes).")
+            else:  # mv
+                shutil.move(str(src), str(item_dst))
+                results.append(f"Moved '{src_rel}' -> '{item_dst.relative_to(root)}'.")
+        except Exception as e:
+            results.append(f"'{src_rel}': could not {executable} — {e}")
+
+    return "\n".join(results)
+
+
+# ---------------------------------------------------------------------------
+# DELETE (permanent — dry_run confirmation required)
+# ---------------------------------------------------------------------------
+
+@tool
+def delete_path(
+    path: Union[str, List[str]],
+    recursive: bool = False,
+    dry_run: bool = True,
+) -> str:
+    """
+    Permanently delete one or more files/directories (string or list,
+    can mix files and dirs).
+
+    Every path is validated independently; any single failure refuses the
+    ENTIRE batch (never a partial delete), naming the reason per path.
+
+    dry_run=True (default) previews; dry_run=False applies the whole
+    validated batch at once (irreversible).
+
+    Args:
+        path:      A single path, or list of paths, to delete.
+        recursive: Must be True if ANY directory in the batch is
+                   non-empty. Ignored for files.
+        dry_run:   If True (default), preview only.
+
+    Returns:
+        dry_run=True: preview + counts, nothing deleted. dry_run=False
+        success: per-path confirmation of permanent deletion.
+        Validation failure: reason per failing path, nothing deleted.
+    """
+    paths = [path] if isinstance(path, str) else list(path)
+
+    if not paths:
+        return "Error: no path(s) provided."
+
+    root = _get_sandbox_root()
+
+    # ── Pass 1: validate every path independently, collect outcomes.
+    # Nothing is deleted in this pass — this is pure inspection, so a
+    # failing item never prevents us from also reporting on the others.
+    resolved = []       # list of dicts describing each valid, ready-to-delete item
+    problems = []        # list of "path: reason" strings for anything that failed
+
+    for p in paths:
+        try:
+            target = _safe_path(p)
+        except PermissionError as e:
+            problems.append(f"'{p}': {e}")
+            continue
+
+        if not target.exists():
+            problems.append(f"'{p}': does not exist.")
+            continue
+
+        if target.is_file():
+            ext = target.suffix.lower()
+            if ext not in MANAGEABLE_EXTENSIONS:
+                problems.append(
+                    f"'{p}': '{ext}' is not currently a manageable file type."
+                )
+                continue
+            resolved.append({"path": p, "target": target, "kind": "file"})
+            continue
+
+        # target.is_dir()
+        if target == root:
+            problems.append(f"'{p}': cannot delete the sandbox root itself.")
+            continue
+
+        contents = list(target.rglob("*"))
+        file_count = sum(1 for c in contents if c.is_file())
+        dir_count = sum(1 for c in contents if c.is_dir())
+
+        if contents and not recursive:
+            problems.append(
+                f"'{p}': not empty ({file_count} file(s), {dir_count} "
+                "subfolder(s)) — pass recursive=True to confirm deleting it all."
+            )
+            continue
+
+        resolved.append({
+            "path": p, "target": target, "kind": "dir",
+            "contents": contents, "file_count": file_count, "dir_count": dir_count,
+        })
+
+    # ── All-or-nothing gate: any failure refuses the ENTIRE batch, so a
+    # destructive call never partially applies. Every failure is reported
+    # together, not just the first, so one retry can fix them all.
+    if problems:
+        header = (
+            f"Refused: {len(problems)} of {len(paths)} path(s) failed "
+            "validation — nothing was deleted.\n\n"
+        )
+        body = "\n".join(f"  - {p}" for p in problems)
+        footer = (
+            "\n\nFix the issue(s) above (or pass recursive=True if any are "
+            "non-empty directories you intend to delete entirely) and call "
+            "again with the full corrected list."
+        )
+        return header + body + footer
+
+    # ── All paths valid. dry_run: preview the whole batch, delete nothing.
+    if dry_run:
+        lines = [f"[DRY RUN — nothing deleted, {len(resolved)} path(s) validated]\n"]
+        for item in resolved:
+            if item["kind"] == "file":
+                lines.append(f"  FILE  '{item['path']}' (permanent delete)")
+            else:
+                preview = "\n".join(
+                    f"      - {c.relative_to(root)}" for c in item["contents"][:10]
+                )
+                more = (
+                    f"\n      ... and {len(item['contents']) - 10} more"
+                    if len(item["contents"]) > 10 else ""
+                )
+                lines.append(
+                    f"  DIR   '{item['path']}' (permanent delete) "
+                    f"({item['file_count']} file(s), {item['dir_count']} subfolder(s))"
+                    + (f"\n{preview}{more}" if item["contents"] else "")
+                )
+        lines.append("\nCall again with dry_run=False to apply (irreversible).")
+        return "\n".join(lines)
+
+    # ── Apply the entire validated batch (permanent).
+    results = []
+    for item in resolved:
+        try:
+            if item["kind"] == "file":
+                item["target"].unlink()
+                results.append(f"  Deleted '{item['path']}'")
+            else:
+                shutil.rmtree(str(item["target"]))
+                results.append(
+                    f"  Deleted '{item['path']}' and its contents "
+                    f"({item['file_count']} file(s), {item['dir_count']} "
+                    f"subfolder(s))"
+                )
+        except Exception as e:
+            # A failure here is a filesystem-level surprise happening
+            # AFTER validation passed (e.g. permissions changed, disk
+            # error) — surface it per-item rather than silently stopping,
+            # since prior items in this loop may already be deleted.
+            results.append(f"  FAILED '{item['path']}': {e}")
+            continue
+
+    header = f"Permanently deleted {len(resolved)} path(s):\n\n"
+    return header + "\n".join(results)
+
+
+# ---------------------------------------------------------------------------
+# SEARCH — three tiers, escalating cost, with the strategy baked into the
+# docstrings themselves so the model follows it without being separately prompted each time.
+# ---------------------------------------------------------------------------
+
+@tool
+def find_files_by_name(
+    path: str,
+    pattern: str,
+    exclude_patterns: list[str] = [],
+    includes: Optional[list[str]] = None,
+    max_results: int = 100,
+) -> str:
+    """
+    Recursively find files by NAME/GLOB (e.g. "*.py", "invoice_*"), not
+    content. Matching is case-insensitive (e.g. pattern "*bio*" matches
+    "Sristi_BioData.png"). Returns relative paths only.
+
+    Caps: max_results<=200, ~2000 entries walked — narrow `path`/`pattern`
+    for full results on a large tree.
+
+    Args:
+        path:             Starting directory (relative path).
+        pattern:          Glob pattern matched against each entry's name,
+                          case-insensitively.
+        exclude_patterns: Optional glob patterns to exclude, matched
+                          case-insensitively against both the entry name
+                          and relative path.
+        includes:         Optional glob filters to explicitly include,
+                          case-insensitively, e.g. ["*.png", "*.ts", "!**/tests/*"].
+        max_results:      Stop after this many matches (default 100, hard cap 200).
+    """
+    import fnmatch
+
+    def _glob_match(name: str, pat: str) -> bool:
+        # fnmatch.fnmatch's case sensitivity depends on the host OS
+        # (case-insensitive on Windows/macOS, case-sensitive on Linux),
+        # which made this tool silently miss real matches like
+        # "Sristi_BioData.png" for pattern "*bio*" on a Linux sandbox.
+        # Force case-insensitivity everywhere, regardless of OS, by
+        # lower-casing both sides and using the case-sensitive matcher.
+        return fnmatch.fnmatchcase(name.lower(), pat.lower())
+
+    try:
+        start = _safe_path(path)
     except PermissionError as e:
         return str(e)
 
-    # ── 2. Collision check ────────────────────────────────────────────────────
-    if target.is_file():
+    if not start.exists():
+        return f"Directory '{path}' does not exist."
+    if not start.is_dir():
+        return f"'{path}' is not a directory."
+
+    max_results = max(1, min(max_results, _MAX_NAME_RESULTS_CEILING))
+
+    root = _get_sandbox_root()
+    matches: list[str] = []
+    entries_scanned = 0
+    scan_capped = False
+
+    def _should_include(file_rel_path: str, file_name: str) -> bool:
+        if not includes:
+            return True
+        included = False
+        for inc in includes:
+            # Support negative includes similar to search_file_contents
+            if inc.startswith("!"):
+                if _glob_match(file_name, inc[1:]) or _glob_match(file_rel_path, inc[1:]):
+                    return False
+            else:
+                if _glob_match(file_name, inc) or _glob_match(file_rel_path, inc):
+                    included = True
+        # If user only passed negative filters ("!*"), everything else defaults to True
+        return included if any(not inc.startswith("!") for inc in includes) else True
+
+    def _walk(directory: Path) -> None:
+        nonlocal entries_scanned, scan_capped
+        if len(matches) >= max_results or scan_capped:
+            return
+        try:
+            children = sorted(directory.iterdir(), key=lambda p: (p.is_file(), p.name))
+        except PermissionError:
+            return
+
+        for child in children:
+            if len(matches) >= max_results:
+                return
+            if entries_scanned >= _MAX_NAME_FILES_SCANNED:
+                scan_capped = True
+                return
+
+            if _is_skipped(child):
+                continue
+
+            entries_scanned += 1
+            rel = str(child.relative_to(root))
+
+            # Exclude check
+            if any(
+                _glob_match(child.name, xp) or _glob_match(rel, xp)
+                for xp in exclude_patterns
+            ):
+                continue
+
+            # Inclusion and pattern match
+            if _glob_match(child.name, pattern):
+                if _should_include(rel, child.name):
+                    matches.append(rel)
+
+            if child.is_dir():
+                _walk(child)
+
+    _walk(start)
+
+    if not matches:
+        note = " (stopped early — narrow `path`/`pattern` to search the rest)" if scan_capped else ""
+        return f"No files matching '{pattern}' found under '{path}'{note}."
+
+    cap_note = ""
+    if len(matches) >= max_results:
+        cap_note = f" (capped at max_results={max_results})"
+    elif scan_capped:
+        cap_note = " (stopped scanning early — narrow `path`/`pattern` for full results)"
+
+    return f"Found {len(matches)} match(es){cap_note}:\n" + "\n".join(matches)
+
+
+# Hard server-side ceilings — independent of whatever the caller passes.
+# These exist because an unscoped search_file_contents call (broad path, no includes, high max_results) can otherwise walk and return a large
+# fraction of a monorepo in one call. Args are clamped, not rejected, so a call never fails — it just can't blow the budget.
+_MAX_RESULTS_CEILING = 40
+_MAX_FILES_SCANNED = 400          # stop walking after this many readable files, matches or not
+_MAX_OUTPUT_CHARS = 6_000         # hard cap on the returned string; truncated with a note past this
+_MAX_PATTERNS = 8                 # cap on how many patterns one search_file_contents call can OR together
+
+# find_files_by_name ceilings — mirrors the caps above so every tool in the
+# search tier degrades the same way (clamp + note, never a hard failure).
+_MAX_NAME_RESULTS_CEILING = 200
+_MAX_NAME_FILES_SCANNED = 2000
+
+
+@tool
+def search_file_contents(
+    pattern: Union[str, List[str]],
+    path: str = ".",
+    regex: bool = False,
+    case_sensitive: bool = False,
+    match_per_line: bool = True,
+    includes: Optional[List[str]] = None,
+    max_results: int = 20,
+) -> str:
+    """
+    Grep-equivalent literal/regex search under `path` (single file or
+    recursive directory). Text/code by line; PDF/docx/xlsx/pptx by real
+    structure (page/slide/sheet/paragraph). Reported line/unit numbers feed
+    directly into read_file's start_line/end_line or start_unit/end_unit.
+
+    `pattern` takes a string or list of up to 8 (OR'd together, prefer this
+    over regex alternation AND over multiple separate calls — put every term
+    you want to check for in one call's pattern list rather than searching
+    the same path repeatedly with near-synonymous terms; same-line/unit hits
+    across patterns are merged into one result, not duplicated). If a search
+    already returned matches for a file, don't search that file again —
+    read_file the relevant range directly instead of grepping it further.
+
+    Caps: max_results<=40, 8 patterns/call, ~400 files walked (directory
+    mode), output truncated ~6000 chars — narrow path/pattern/includes for
+    full results.
+
+    Args:
+        pattern:        Text or regex, or list of up to 8 (OR'd, merged).
+        path:           File or directory to search. Default ".".
+        regex:          Treat pattern(s) as regex.
+        case_sensitive: Default False.
+        match_per_line: True (default): lines + numbers. False: matching
+                        file paths only (cheaper).
+        includes:       Glob filters, e.g. ["*.py", "!**/node_modules/*"].
+                        Directory mode only.
+        max_results:    Default 20, hard cap 40.
+
+    Returns:
+        Header line + one block per match ("[path:line] text" / "[path |
+        location] text").
+    """
+    try:
+        start = _safe_path(path)
+    except PermissionError as e:
+        return str(e)
+
+    if not start.exists():
+        return f"'{path}' does not exist."
+
+    single_file_mode = start.is_file()
+
+    if single_file_mode:
+        ext = start.suffix.lower()
+        if ext not in READABLE_EXTENSIONS:
+            return (
+                f"'{path}' has extension '{ext}', which isn't a searchable "
+                "text or document format."
+            )
+    elif not start.is_dir():
+        return f"'{path}' is a file, not a directory. Pass a directory to search."
+
+    # Clamp caller-supplied limits to server-side ceilings rather than
+    # trusting them — this is what actually bounds worst-case cost.
+    max_results = max(1, min(max_results, _MAX_RESULTS_CEILING))
+
+    patterns = [pattern] if isinstance(pattern, str) else list(pattern)
+    if not patterns:
+        return "Error: pattern must be a non-empty string or list of strings."
+    if len(patterns) > _MAX_PATTERNS:
+        return f"Error: at most {_MAX_PATTERNS} patterns per call — got {len(patterns)}. Narrow the list or split into separate calls."
+
+    # Compile one regex per pattern (not one combined regex) so we can
+    # report which specific pattern(s) matched a given line/unit — that's
+    # what powers the same-line merge/dedup below.
+    flags = 0 if case_sensitive else re.IGNORECASE
+    compiled = []  # list of (pattern_text, compiled_regex)
+    for p in patterns:
+        try:
+            compiled.append((p, re.compile(p if regex else re.escape(p), flags)))
+        except re.error as e:
+            return f"Invalid regex pattern '{p}': {e}"
+
+    def _matched_patterns(text: str) -> list:
+        """Every pattern (in caller order) that hits `text`, deduplicating
+        multi-pattern hits on the same line/unit into one match entry."""
+        return [p for p, rx in compiled if rx.search(text)]
+
+    root = _get_sandbox_root()
+    matches = []
+    matching_files = set()
+    files_scanned = 0
+    files_skipped = []
+    scan_capped = False
+
+    # Common directory excludes to keep search fast
+    DEFAULT_IGNORE_DIRS = _SKIP_DIRS
+
+    def _should_include(file_rel_path: str) -> bool:
+        if not includes:
+            return True
+        included = False
+        for inc in includes:
+            if inc.startswith("!"):
+                if fnmatch.fnmatch(file_rel_path, inc[1:]):
+                    return False
+            else:
+                if fnmatch.fnmatch(file_rel_path, inc):
+                    included = True
+        return included if any(not inc.startswith("!") for inc in includes) else True
+
+    def _iter_files(target: Path):
+        # Single-file mode: yield just that file, no directory walk.
+        if target.is_file():
+            if not _is_skipped(target):
+                yield target
+            return
+        try:
+            children = sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name))
+        except PermissionError:
+            return
+        for child in children:
+            if child.is_dir():
+                if child.name in DEFAULT_IGNORE_DIRS or _is_skipped(child):
+                    continue
+                yield from _iter_files(child)
+            elif child.is_file():
+                if _is_skipped(child):
+                    continue
+                yield child
+
+    for file_path in _iter_files(start):
+        if len(matches) >= max_results:
+            break
+        if files_scanned >= _MAX_FILES_SCANNED:
+            scan_capped = True
+            break
+
+        ext = file_path.suffix.lower()
+        if ext not in READABLE_EXTENSIONS:
+            continue
+
+        try:
+            rel_str = str(file_path.relative_to(root)).replace("\\", "/")
+        except ValueError:
+            rel_str = str(file_path).replace("\\", "/")
+
+        if not single_file_mode and not _should_include(rel_str):
+            continue
+
+        # ── Binary documents: search real structure (page/slide/sheet/
+        #    paragraph), not a flattened line number — this is what keeps
+        #    results in sync with read_file's start_unit/end_unit, which
+        #    addresses the same page/slide/sheet/paragraph numbering.
+        if ext in _BINARY_EXTENSIONS:
+            # _search_binary_units takes the full pattern list and does the
+            # multi-pattern merge itself, on a single parse of the file —
+            # keeping that here (rather than looping over it once per
+            # pattern) is what keeps an 8-pattern search from re-opening
+            # and re-extracting the same PDF/workbook/deck 8 times.
+            try:
+                unit_matches = _search_binary_units(file_path, compiled)
+            except Exception:
+                files_skipped.append(rel_str)
+                continue
+
+            files_scanned += 1
+            for m in unit_matches:
+                if len(matches) >= max_results:
+                    break
+
+                hit_patterns = m["matched_patterns"]
+                matching_files.add(rel_str)
+
+                if not match_per_line:
+                    if rel_str not in matches:
+                        matches.append(rel_str)
+                    break
+
+                suffix = f"  (matched: {', '.join(hit_patterns)})" if len(patterns) > 1 and len(hit_patterns) > 1 else ""
+                matches.append(f"[{rel_str} | {m['location']}]  {m['line_text']}{suffix}")
+
+            continue
+
+        # ── Text files: unchanged line-based search.
+        try:
+            text = file_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            files_skipped.append(rel_str)
+            continue
+
+        files_scanned += 1
+        lines = text.splitlines()
+
+        for i, line in enumerate(lines):
+            if len(matches) >= max_results:
+                break
+
+            hit_patterns = _matched_patterns(line)
+            if hit_patterns:
+                matching_files.add(rel_str)
+
+                # If only file listing requested (git grep -l behavior)
+                if not match_per_line:
+                    if rel_str not in matches:
+                        matches.append(rel_str)
+                    break
+
+                line_num = i + 1
+
+                suffix = f"  (matched: {', '.join(hit_patterns)})" if len(patterns) > 1 and len(hit_patterns) > 1 else ""
+                matches.append(f"[{rel_str}:{line_num}]  {line.strip()}{suffix}")
+
+    pattern_desc = f"pattern '{patterns[0]}'" if len(patterns) == 1 else f"{len(patterns)} patterns {patterns}"
+    search_desc = (
+        f"Searched for {'regex' if regex else 'literal'} {pattern_desc} "
+        f"({'case-sensitive' if case_sensitive else 'case-insensitive'}) under '{path}'"
+    )
+    cap_note = (
+        f" (stopped after scanning {_MAX_FILES_SCANNED} files — narrow `path`/`includes` "
+        "to search the rest)" if scan_capped else ""
+    )
+
+    if not matches:
+        note = f" ({len(files_skipped)} file(s) could not be read)" if files_skipped else ""
         return (
-            f"Refused: '{path}' already exists as a file. "
-            "Cannot create a directory at that path."
+            f"{search_desc}\n"
+            f"No matches across {files_scanned} readable file(s){note}{cap_note}."
         )
 
-    if target.is_dir():
-        return f"Directory '{path}' already exists — nothing to do."
+    header = f"{search_desc}\nFound {len(matches)} match(es) across {len(matching_files)} file(s) ({files_scanned} scanned{cap_note})"
+    if len(matches) >= max_results:
+        header += f" (capped at max_results={max_results})"
 
-    # ── 3. Create ─────────────────────────────────────────────────────────────
-    try:
-        target.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        return f"Could not create directory '{path}': {e}"
+    body = "\n\n".join(matches)
+    if len(body) > _MAX_OUTPUT_CHARS:
+        body = body[:_MAX_OUTPUT_CHARS] + f"\n... [truncated at {_MAX_OUTPUT_CHARS} chars — narrow `path`/`includes`/`pattern` for full results]"
 
-    return f"Directory '{path}' created."
+    return header + ":\n\n" + body
 
 
 # EXPORTED TOOL LIST
+# list_directory and get_file_info are no longer standalone tools — they're
+# available as the `ls` / `info` sub-commands of run_file_command (see
+# cowork_tool_fileops.py), which lets the model target several paths per
+# call instead of one per round-trip.
 LOCAL_TOOLS = [
     # Read-only (safe)
     search_index,
     read_file,
-    read_file_lines,
-    list_directory,
-    file_tree_shallow,
-    get_file_info,
-    list_allowed_directories,
-
-    # Path pins (process memory — survive summarisation)
-    pin_path,
-    recall_path,
-    recall_all_pins,
+    view_image,
 
     # Write (safe-ish)
-    create_text_file,
-    edit_file_lines,
-    make_directory,
+    write_file,
+
+    # Search tier (escalating cost — see docstrings for the strategy)
+    find_files_by_name,
+    search_file_contents,
+
+    # Copy / move / rename / mkdir / list / inspect — one validated command tool (no-clobber by default).
+    run_file_command,
+
+    # Delete (soft — trash, dry_run by default)
+    delete_path,
+
+    # Tier 1 escape hatch — arbitrary scripts, staged + diffed + human-gated. 
+    # Only reached for tasks run_file_command can't express (see run_script's docstring for when to prefer which).
+    run_script,
+    rollback_change,
 ]
 
 
-# SPINNER STATUS MESSAGES
 TOOL_STATUS_MAP = {
     "search_index": lambda args: (
         f"Searching index for [white]'{args.get('query')}'[/white]"
     ),
     "read_file": lambda args: (
-        f"Reading first {args.get('head')} lines of [white]'{args.get('path')}'[/white]"
-        if args.get("head")
-        else f"Reading file [white]'{args.get('path')}'[/white]"
-    ),
-    "read_file_lines": lambda args: (
         f"Reading lines {args.get('start_line')}–{args.get('end_line')} of "
         f"[white]'{args.get('path')}'[/white]"
+        if args.get("start_line") or args.get("end_line")
+        else (
+            f"Reading units {args.get('start_unit')}–{args.get('end_unit')} of "
+            f"[white]'{args.get('path')}'[/white]"
+            if args.get("start_unit") or args.get("end_unit")
+            else f"Reading file [white]'{args.get('path')}'[/white]"
+        )
     ),
-    "list_directory": lambda args: (
-        f"Listing contents of [white]'{args.get('path', '.')}'[/white]"
+    "view_image": lambda args: (
+        f"Viewing [white]{len(args.get('paths')) if isinstance(args.get('paths'), list) else 1} "
+        f"image(s)[/white] — [white]'{args.get('question', '')[:60]}'[/white]"
     ),
-    "file_tree_shallow": lambda args: (
-        f"Scanning directory tree of [white]'{args.get('subdirectory', '.')}'[/white] "
-        f"(depth {args.get('max_depth', 2)})"
-    ),
-    "get_file_info": lambda args: (
-        f"Inspecting metadata for [white]'{args.get('path')}'[/white]"
-    ),
-    "list_allowed_directories": lambda args: "Checking sandbox boundary",
-    "pin_path": lambda args: (
-        f"Pinning [white]'{args.get('path')}'[/white] as [white]'{args.get('alias')}'[/white]"
-    ),
-    "recall_path": lambda args: (
-        f"Recalling pinned path [white]'{args.get('alias')}'[/white]"
-    ),
-    "recall_all_pins": lambda args: "Checking all pinned paths",
-    "create_text_file": lambda args: (
+    "write_file": lambda args: (
         f"Creating [white]'{args.get('path')}'[/white]"
+        if args.get("mode", "create") == "create"
+        else (
+            f"Previewing edit to [white]'{args.get('path')}'[/white] "
+            f"(lines {args.get('start_line')}–{args.get('end_line')})"
+            if args.get("dry_run", True)
+            else f"Applying edit to [white]'{args.get('path')}'[/white] "
+                 f"(lines {args.get('start_line')}–{args.get('end_line')})"
+        )
     ),
-    "edit_file_lines": lambda args: (
-        f"Previewing edit to [white]'{args.get('path')}'[/white] "
-        f"(lines {args.get('start_line')}–{args.get('end_line')})"
+    "find_files_by_name": lambda args: (
+        f"Searching filenames for [white]'{args.get('pattern')}'[/white] "
+        f"under [white]'{args.get('path')}'[/white]"
+    ),
+    "search_file_contents": lambda args: (
+        f"Searching for [white]{', '.join(repr(p) for p in args.get('pattern'))}[/white] "
+        f"under [white]'{args.get('path', '.')}'[/white]"
+        if isinstance(args.get("pattern"), list)
+        else f"Searching for [white]'{args.get('pattern')}'[/white] "
+             f"under [white]'{args.get('path', '.')}'[/white]"
+    ),
+    "run_file_command": lambda args: (
+        f"Running [white]'{args.get('command')}'[/white]"
+    ),
+    "delete_path": lambda args: (
+        f"Previewing delete of {_fmt_delete_path_arg(args.get('path'))}"
         if args.get("dry_run", True)
-        else f"Applying edit to [white]'{args.get('path')}'[/white] "
-             f"(lines {args.get('start_line')}–{args.get('end_line')})"
+        else f"Deleting {_fmt_delete_path_arg(args.get('path'))} (-> trash)"
     ),
-    "make_directory": lambda args: (
-        f"Creating directory [white]'{args.get('path')}'[/white]"
-    ),
+    "run_script": lambda args: (
+         f"Running a {args.get('interpreter', 'python3')} script against "
+         f"[white]'{args.get('scope', '.')}'[/white] (staged copy only)"
+     ),
+     "apply_change": lambda args: (
+         f"Applying change [white]'{args.get('change_id')}'[/white] to real files"
+     ),
+     "rollback_change": lambda args: (
+         f"Rolling back change [white]'{args.get('change_id')}'[/white]"
+     ),
 }
-
-import Cowork.cowork_tool_fileops as fileops
-LOCAL_TOOLS.extend(fileops.FILEOPS_TOOLS)   # Merge fileops tools
-TOOL_STATUS_MAP.update(fileops.FILEOPS_TOOL_STATUS_MAP) # Merge status messages
 
 
 def get_friendly_tool_message(tool_call: dict) -> str:
