@@ -42,6 +42,7 @@ dependencies = [
     "python-telegram-bot>=22.7",
     "pyyaml>=6.0.3",
     "rank-bm25>=0.2.2",
+    "rapidocr-onnxruntime>=1.4.4",
     "requests>=2.34.0",
     "rich>=15.0.0",
     "scikit-learn>=1.9.0",

@@ -1355,3 +1355,57 @@
 .code-copy-btn:active {
     transform: scale(0.92);
 }
+
+/* --- Readability Backdrop behind the input cluster ---
+   #bottom-dock floats transparently over #messages, so chat text bleeds
+   through around the input box, "Using..." bars, context shelf and the
+   @ / # dropdown. These pseudo-elements sit BEHIND the dock's content
+   (z-index: -1 inside the dock's own stacking context) but above the
+   messages. The fade-out is a FIXED distance at the very top only, so
+   everything inside the dock (shelf, bars, input) is always fully
+   blurred no matter how tall the dock gets. pointer-events: none keeps
+   it from ever stealing clicks/scroll. */
+#bottom-dock::before,
+#bottom-dock::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: -1;
+    pointer-events: none;
+    -webkit-backdrop-filter: blur(22px) saturate(130%);
+    backdrop-filter: blur(22px) saturate(130%);
+}
+
+/* Base layer: always on, hugs the dock and auto-grows with it.
+   Solid blur + tint everywhere except the top 48px, which fades out. */
+#bottom-dock::before {
+    top: -48px;
+    background: linear-gradient(to bottom,
+            rgba(10, 10, 12, 0) 0,
+            rgba(10, 10, 12, 0.82) 48px,
+            rgba(10, 10, 12, 0.88) 100%);
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 48px);
+    mask-image: linear-gradient(to bottom, transparent 0, #000 48px);
+}
+
+/* Halo layer: fades in while the @ / # dropdown is open. Its height
+   tracks the dropdown's real height (--mention-dropdown-h, set from
+   mentions.js) + the 8px gap + a 40px fade-out margin, so a short list
+   (#) gets a short halo and a long list (@) gets a tall one. */
+#bottom-dock::after {
+    top: calc(-1 * (var(--mention-dropdown-h, 0px) + 48px));
+    opacity: 0;
+    background: linear-gradient(to bottom,
+            rgba(10, 10, 12, 0) 0,
+            rgba(10, 10, 12, 0.7) 40px,
+            rgba(10, 10, 12, 0.8) 100%);
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 40px);
+    mask-image: linear-gradient(to bottom, transparent 0, #000 40px);
+    transition: opacity 0.25s ease, top 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+#bottom-dock:has(.mention-dropdown--visible)::after {
+    opacity: 1;
+}

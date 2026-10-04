@@ -790,6 +790,11 @@
           padding-right: 8px;
           scrollbar-width: none; /* Firefox */
           -ms-overflow-style: none; /* old Edge/IE */
+          /* Soft fade at top/bottom edges; sizes are toggled by JS on scroll */
+          --fade-top: 0px;
+          --fade-bottom: 0px;
+          -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 var(--fade-top), #000 calc(100% - var(--fade-bottom)), transparent 100%);
+          mask-image: linear-gradient(to bottom, transparent 0, #000 var(--fade-top), #000 calc(100% - var(--fade-bottom)), transparent 100%);
         }
         .result-text::-webkit-scrollbar { display: none; } /* Chrome/Safari */
 
@@ -854,6 +859,7 @@
           flex-shrink: 0;
         }
         .btn-followup:hover:not(:disabled) { background: rgba(255, 255, 255, 0.12); }
+        .btn-followup:disabled { opacity: 0.4; cursor: not-allowed; }
         .wrap.busy .followup-row { opacity: 0.4; pointer-events: none; }
       </style>
 
@@ -910,6 +916,14 @@
     const status = shadow.querySelector(".status");
     const noticeEl = shadow.querySelector(".notice");
     const resultText = shadow.querySelector(".result-text");
+
+    // Fade the top/bottom edges only when there is more content in that direction
+    function updateResultFade() {
+      const { scrollTop, scrollHeight, clientHeight } = resultText;
+      resultText.style.setProperty("--fade-top", scrollTop > 1 ? "28px" : "0px");
+      resultText.style.setProperty("--fade-bottom", scrollTop + clientHeight < scrollHeight - 1 ? "28px" : "0px");
+    }
+    resultText.addEventListener("scroll", updateResultFade);
     const replaceBtn = shadow.querySelector(".btn-replace");
     const copyBtn = shadow.querySelector(".btn-copy");
     const followupInput = shadow.querySelector(".followup-input");
@@ -1007,12 +1021,17 @@
       animateHeightChange(() => { }); // Re-calc height with error text visible
     }
 
+    // Follow-up send is only enabled when there's text and we're not busy
+    function updateFollowupState() {
+      followupBtn.disabled = followupInput.disabled || !followupInput.value.trim();
+    }
+
     function setBusy(isBusy) {
       askBtn.disabled = isBusy;
       editBtn.disabled = isBusy;
       input.disabled = isBusy;
-      followupBtn.disabled = isBusy;
       followupInput.disabled = isBusy;
+      updateFollowupState();
 
       // Toggle neural glow/border shaders
       if (isBusy) {
@@ -1034,6 +1053,9 @@
 
         resultText.textContent = text;
         resultView.classList.add("active");
+        resultText.scrollTop = 0;
+        updateResultFade();
+        updateFollowupState();
 
         // Show the warning ONLY if the user tried to execute an 'edit' on static text
         if (actionType === "edit" && context.tier === "readonly") {
@@ -1108,6 +1130,7 @@
           if (instructionOverride !== undefined) {
             followupInput.value = "";
             followupInput.style.height = "auto";
+            updateFollowupState();
           } else {
             input.value = "";
             input.style.height = "auto";
@@ -1135,6 +1158,7 @@
     followupBtn.addEventListener("click", submitFollowup);
 
     followupInput.addEventListener("input", () => {
+      updateFollowupState();
       followupInput.style.height = "auto";
       followupInput.style.height = `${Math.min(followupInput.scrollHeight, 120)}px`;
     });

@@ -1,16 +1,16 @@
 import datetime
-import stat
-from pathlib import Path
-from typing import Optional, Callable
 import importlib
 import importlib.util
-import time
+import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import uuid
+from pathlib import Path
+from typing import Optional, Callable
 
 
 # Noise directories — skipped in trees and searches
@@ -132,6 +132,66 @@ def _fmt_permissions(mode: int) -> str:
     return "".join(result)
 
 
+# Image extensions viewable via view_image. Never parsed as text — always
+# base64-encoded and handed to a vision-capable model.
+_IMAGE_EXTENSIONS: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+# Matches Anthropic/OpenAI vision limits — reject before wasting a request.
+_MAX_IMAGE_BYTES = 8 * 1024 * 1024   # 8 MB, matches claude.ai's own cap
+_MAX_IMAGES_PER_CALL = 8             # keep a single view_image call cheap and reviewable
+
+
+def _encode_image(path: Path) -> tuple[str, str]:
+    """
+    Read one image file and return (base64_data, mime_type).
+    Raises ValueError on unsupported format or oversize file — never raises
+    on I/O errors uncaught, so callers can turn this into a clean per-image
+    error line instead of failing the whole batch.
+    """
+    import base64
+
+    suffix = path.suffix.lower()
+    mime = _IMAGE_EXTENSIONS.get(suffix)
+    if mime is None:
+        raise ValueError(f"'{suffix}' is not a supported image format.")
+
+    size = path.stat().st_size
+    if size > _MAX_IMAGE_BYTES:
+        raise ValueError(
+            f"{size / 1_048_576:.1f} MB, over the "
+            f"{_MAX_IMAGE_BYTES / 1_048_576:.0f} MB limit."
+        )
+
+    data = base64.b64encode(path.read_bytes()).decode("ascii")
+    return data, mime
+
+
+def _extract_text(content) -> str:
+    """
+    Normalize a LangChain message's .content into plain text. With
+    use_responses_api=True, .content can come back as a string OR as a
+    list of content blocks (text/reasoning/refusal/etc.) — this collapses
+    it to just the text, in order, regardless of which shape it took.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        return "".join(parts) if parts else "(no text content returned)"
+    return str(content)
+
+
 # Extensions that require binary parsing rather than UTF-8 text reads
 _BINARY_EXTENSIONS = frozenset({".pdf", ".xlsx", ".xls", ".docx", ".pptx"})
 
@@ -154,6 +214,192 @@ BINARY_UNIT_LABELS: dict[str, str] = {
     ".xls": "sheet",
     ".docx": "paragraph",
 }
+
+
+# One lazily-built vision sub-client, separate from the main agent LLM.
+# Kept cheap/fast on purpose — this never runs at xhigh reasoning effort,
+# it just answers a bounded visual question and returns text. Reusing the
+# main orchestrator model here would re-inject raw image tokens into the
+# expensive, long-lived agent loop for no benefit (see design note on
+# view_image below).
+_VISION_LLM = None
+
+
+def _get_vision_llm():
+    global _VISION_LLM
+    if _VISION_LLM is None:
+        from langchain_openai import ChatOpenAI
+        _VISION_LLM = ChatOpenAI(
+            model="gpt-6-luna",     # same model family; capability, not reasoning cost, is what's needed here
+            use_responses_api=True,
+            reasoning_effort="low",   # this is a lookup, not a plan — keep it fast/cheap
+            max_retries=0,
+        )
+    return _VISION_LLM
+
+
+# ---------------------------------------------------------------------------
+# Tier 0: RapidOCR — free, local, CPU, no LLM call.
+# Same underlying PP-OCR models as PaddleOCR, exported to ONNX, so accuracy
+# is basically equivalent while install/runtime footprint is much lighter.
+# Lazily built once, reused across calls.
+# ---------------------------------------------------------------------------
+_OCR_ENGINE = None
+ 
+ 
+def _get_ocr_engine():
+    global _OCR_ENGINE
+    if _OCR_ENGINE is None:
+        from rapidocr_onnxruntime import RapidOCR
+        _OCR_ENGINE = RapidOCR()
+    return _OCR_ENGINE
+ 
+ 
+def _run_ocr(file_path: Path, *, _retry_on_empty: bool = True) -> dict:
+    """
+    Run RapidOCR on a single image.
+    Returns {"text": str, "avg_confidence": float, "n_boxes": int,
+    "detected": bool, "error": str | None}.
+
+    "detected": False + no error means the engine ran cleanly but the
+    detector found zero text regions — most commonly caused by low
+    contrast, skew, blur, or an oversized/undersized image confusing the
+    detection model's input scaling. This is NOT the same as "no text
+    exists in the image" (a dense, clearly-text-heavy image scoring zero
+    boxes is a strong signal something upstream is wrong, not that OCR
+    correctly determined the image is textless).
+
+    On a first-pass empty result, retries once against a normalized copy
+    (upscaled if small, downscaled if huge, converted to plain RGB) before
+    giving up — this recovers a meaningful fraction of "text-heavy image,
+    zero boxes" cases that are really a detector input-scaling issue
+    rather than an unreadable image.
+    """
+    engine = _get_ocr_engine()
+
+    try:
+        result, _elapse = engine(str(file_path))
+    except Exception as e:
+        return {
+            "text": "", "avg_confidence": 0.0, "n_boxes": 0,
+            "detected": False, "error": f"{type(e).__name__}: {e}",
+        }
+
+    if not result and _retry_on_empty:
+        normalized = _normalize_for_ocr(file_path)
+        if normalized is not None:
+            try:
+                result, _elapse = engine(str(normalized))
+            except Exception as e:
+                return {
+                    "text": "", "avg_confidence": 0.0, "n_boxes": 0,
+                    "detected": False,
+                    "error": f"retry after normalize failed: {type(e).__name__}: {e}",
+                }
+            finally:
+                try:
+                    normalized.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    if not result:
+        # Ran cleanly (possibly twice), genuinely zero text regions detected.
+        return {
+            "text": "", "avg_confidence": 0.0, "n_boxes": 0,
+            "detected": False, "error": None,
+        }
+
+    # Each entry: [box_points, text, confidence]
+    lines = [r[1] for r in result]
+    confidences = [r[2] for r in result]
+
+    return {
+        "text": "\n".join(lines),
+        "avg_confidence": sum(confidences) / len(confidences),
+        "n_boxes": len(result),
+        "detected": True,
+        "error": None,
+    }
+
+
+def _normalize_for_ocr(file_path: Path) -> Optional[Path]:
+    """
+    Best-effort preprocessing for a rescue retry after detection finds
+    zero boxes on the first pass:
+      - convert to plain RGB (drops alpha/CMYK/palette weirdness some
+        detectors mishandle)
+      - upscale if the shorter side is small (helps detect small/dense
+        text on e.g. a photographed receipt)
+      - downscale if a dimension is huge (keeps detector input-size
+        assumptions sane on e.g. raw phone-camera photos)
+    Returns the path to a temp copy, or None if PIL isn't available or
+    preprocessing itself fails (caller just treats this as "no rescue
+    available" and keeps the original empty result).
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+
+    try:
+        with Image.open(file_path) as img:
+            img = img.convert("RGB")
+            w, h = img.size
+            short_side = min(w, h)
+            long_side = max(w, h)
+
+            if short_side < 600:
+                scale = 600 / short_side
+                img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            elif long_side > 4000:
+                scale = 4000 / long_side
+                img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+            tmp_path = file_path.with_name(f".__ocr_retry__{file_path.stem}.png")
+            img.save(tmp_path, format="PNG")
+            return tmp_path
+    except Exception:
+        return None
+ 
+ 
+# Keywords that suggest the user just wants raw text, not visual reasoning.
+_TEXT_ONLY_HINTS = (
+    "extract", "read", "transcribe", "ocr", "what does it say",
+    "what text", "copy the text", "all the text", "verbatim",
+)
+ 
+# Keywords that suggest the question needs actual visual understanding —
+# OCR text alone won't answer these, so always go to the vision LLM.
+_VISUAL_HINTS = (
+    "color", "colour", "chart", "graph", "diagram", "layout", "design",
+    "icon", "photo", "image show", "look like", "visually", "style",
+    "logo", "shape", "position", "arrange",
+)
+ 
+ 
+def _looks_text_only(question: str) -> bool:
+    q = question.lower()
+    if any(h in q for h in _VISUAL_HINTS):
+        return False
+    return any(h in q for h in _TEXT_ONLY_HINTS)
+ 
+ 
+# Confidence threshold above which we trust OCR-only output for a text-only
+# question and skip the vision LLM entirely.
+_OCR_CONFIDENCE_THRESHOLD = 0.85
+
+
+# Caps on read_file's UNRANGED ("full read") path — the one a model falls
+# into by omitting start_line/end_line/start_unit/end_unit entirely. This
+# is the actual risk surface for cost/latency: a targeted range is already
+# capped (500 lines / 50 units, enforced above), but nothing previously
+# stopped an unranged call from returning an entire 300-page PDF or
+# 500-slide deck in one shot. These constants are that backstop — past
+# them, a full read auto-downgrades to a preview + explicit paging
+# instruction instead of dumping everything.
+_FULL_READ_MAX_LINES = 500     # text files
+_FULL_READ_MAX_UNITS = 20      # binary documents (pages/slides/sheets/paragraphs)
+_FULL_READ_PREVIEW_UNITS = 3   # units shown in the preview when capped
 
 
 # DOCX: python-docx exposes doc.paragraphs and doc.tables as separate flat
@@ -192,7 +438,7 @@ def _docx_table_text(table) -> str:
     return "[Table]\n" + "\n".join(rows)
 
 
-def _search_binary_units(path: Path, search_regex) -> list[dict]:
+def _search_binary_units(path: Path, search_regex: re.Pattern) -> list[dict]:
     """
     Search a binary document's real internal structure for `search_regex`,
     returning one dict per match:
@@ -601,38 +847,40 @@ _SCRIPTED_BINARY_OUTPUT_NAME: dict[str, str] = {
 # Candidate libraries per extension, in the order we'd recommend trying
 # them. `module` is what actually gets import-checked (may differ from the
 # pip/uv package name — e.g. "docx" vs "python-docx"). `install` is the
-# real install instruction shown when a library is missing, so a model
-# never has to guess the pip name or discover --break-system-packages the
-# hard way via a failed subprocess call.
+# plain pip install instruction shown when a library is missing, so a
+# model never has to guess the pip name. Deliberately does NOT include
+# `--break-system-packages` — whether to force an install into a
+# system-managed Python environment is a call for the user to make, not
+# something baked into a command the model runs unprompted.
 _SCRIPT_LIBRARY_CANDIDATES: dict[str, list[dict[str, str]]] = {
     ".docx": [
         {"module": "docx", "package": "python-docx",
-         "install": "pip install python-docx --break-system-packages"},
+         "install": "pip install python-docx"},
         {"module": None, "package": "pandoc",
          "install": "(system binary, not pip) apt-get install pandoc / brew install pandoc / winget install JohnMacFarlane.Pandoc",
          "note": "Markdown -> docx via subprocess, no Python import needed"},
     ],
     ".pptx": [
         {"module": "pptx", "package": "python-pptx",
-         "install": "pip install python-pptx --break-system-packages"},
+         "install": "pip install python-pptx"},
     ],
     ".xlsx": [
         {"module": "openpyxl", "package": "openpyxl",
-         "install": "pip install openpyxl --break-system-packages"},
+         "install": "pip install openpyxl"},
         {"module": "pandas", "package": "pandas",
-         "install": "pip install pandas --break-system-packages"},
+         "install": "pip install pandas"},
     ],
     ".xls": [
         {"module": "openpyxl", "package": "openpyxl",
-         "install": "pip install openpyxl --break-system-packages"},
+         "install": "pip install openpyxl"},
         {"module": "pandas", "package": "pandas",
-         "install": "pip install pandas --break-system-packages"},
+         "install": "pip install pandas"},
     ],
     ".pdf": [
         {"module": "reportlab", "package": "reportlab",
-         "install": "pip install reportlab --break-system-packages"},
+         "install": "pip install reportlab"},
         {"module": "pypdf", "package": "pypdf",
-         "install": "pip install pypdf --break-system-packages"},
+         "install": "pip install pypdf"},
     ],
 }
 
@@ -714,6 +962,64 @@ def _format_script_library_status(ext: str) -> str:
 
 _SCRIPT_TIMEOUT_SECONDS = 120
 
+# Matches CPython's standard "No module named 'X'" text from both
+# ImportError and ModuleNotFoundError tracebacks.
+_MISSING_MODULE_RE = re.compile(r"No module named ['\"]([A-Za-z0-9_\.]+)['\"]")
+
+
+def _detect_missing_library(ext: str, stderr: str) -> Optional[dict[str, str]]:
+    """
+    Inspect a failed build script's stderr for a missing-import error and,
+    if found, match it back to a known candidate for this extension.
+
+    Returns the matching candidate dict (module/package/install/[note])
+    from _SCRIPT_LIBRARY_CANDIDATES, or None if the failure wasn't a
+    recognizable missing-library import (in which case the caller should
+    fall back to showing the raw error, not guess at a library problem).
+    """
+    match = _MISSING_MODULE_RE.search(stderr)
+    if not match:
+        return None
+    missing_module = match.group(1).split(".")[0]
+
+    for cand in _SCRIPT_LIBRARY_CANDIDATES.get(ext, []):
+        if cand["module"] == missing_module:
+            return cand
+
+    # Not one of our known candidates (could be some other import the
+    # model's script used) — still useful to know the name, but there's
+    # no known install command to offer, so let the generic error show.
+    return None
+
+
+def _format_missing_library_message(ext: str, package: str, install_cmd: str, note: str = "") -> str:
+    """
+    Build the message shown to the model (and, via it, the user) when a
+    build script fails because a required library isn't installed.
+
+    Deliberately does NOT install anything itself and does NOT tell the
+    model to just go run the install command. It asks the model to put
+    the choice to the user: install it now (with the exact command and
+    why it's needed), or install it manually and retry. This keeps the
+    user in control of what gets installed into their environment,
+    rather than a script silently installing a package with an
+    environment-modifying flag like --break-system-packages.
+    """
+    note_str = f" ({note})" if note else ""
+    return (
+        f"Build script for '{ext}' failed: the '{package}' library is not "
+        f"installed in this sandbox{note_str}.\n\n"
+        f"Suggested install command:\n  {install_cmd}\n\n"
+        "Do not run this install automatically. Tell the user which "
+        f"library is missing and why it's needed (building this '{ext}' "
+        f"file), show them the exact command above, and ask whether "
+        "they'd like you to install it now or would rather install it "
+        "themselves (and let you know when it's ready) before retrying. "
+        "If they ask you to install it, run that exact command as given — "
+        "don't add flags like --break-system-packages unless the user "
+        "specifically asks for that."
+    )
+
 
 def _run_binary_build_script(ext: str, script: str) -> Path:
     """
@@ -759,9 +1065,19 @@ def _run_binary_build_script(ext: str, script: str) -> Path:
             )
 
         if proc.returncode != 0:
+            stderr = proc.stderr.strip()
+            missing = _detect_missing_library(ext, stderr)
+            if missing is not None:
+                raise ValueError(_format_missing_library_message(
+                    ext,
+                    package=missing["package"],
+                    install_cmd=missing["install"],
+                    note=missing.get("note", ""),
+                ))
+
             raise ValueError(
                 f"Build script for '{ext}' failed (exit {proc.returncode}).\n\n"
-                f"--- stderr ---\n{proc.stderr.strip()[-4000:]}\n\n"
+                f"--- stderr ---\n{stderr[-4000:]}\n\n"
                 f"--- stdout ---\n{proc.stdout.strip()[-2000:]}\n\n"
                 f"Fix the script and call write_file again. The script must "
                 f"save its result to exactly '{output_name}' in its working "
@@ -875,8 +1191,7 @@ def _validate_binary_output(ext: str, path: Path) -> None:
     If the reader library itself isn't installed in this sandbox, this
     silently skips validation rather than failing the build — an
     unrelated missing dependency on the READ side shouldn't block a WRITE
-    that otherwise looks fine; check_binary_write_libraries() covers read-
-    side availability separately if that ever needs surfacing.
+    that otherwise looks fine.
     """
     validator = _BINARY_VALIDATORS.get(ext)
     if validator is None:
@@ -1030,43 +1345,6 @@ MANAGEABLE_ONLY_EXTENSIONS: frozenset[str] = frozenset({
 # touch. Union of the two sets above — everything content-readable, plus
 # everything that's only filesystem-manageable.
 MANAGEABLE_EXTENSIONS: frozenset[str] = READABLE_EXTENSIONS | MANAGEABLE_ONLY_EXTENSIONS
-
-TRASH_DIR_NAME = ".sicily-trash"
-
-
-# ---------------------------------------------------------------------------
-# Trash helpers
-# ---------------------------------------------------------------------------
-
-def _trash_root() -> Path:
-    """
-    Return (and create) the sandbox-local trash directory.
-    Lives INSIDE the sandbox root so it passes _safe_path() like everything
-    else, and so trashed files survive a session restart for manual recovery.
-    """
-    root = _get_sandbox_root()
-    trash = root / TRASH_DIR_NAME
-    trash.mkdir(exist_ok=True)
-    return trash
-
-
-def _move_to_trash(target: Path) -> Path:
-    """
-    Move `target` into the trash dir, preserving its relative path so a
-    human can find and restore it by hand. Timestamps the leaf name on
-    collision instead of overwriting a previously trashed item.
-    """
-    root = _get_sandbox_root()
-    rel = target.relative_to(root)
-    dest = _trash_root() / rel
-    dest.parent.mkdir(parents=True, exist_ok=True)
-
-    if dest.exists():
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        dest = dest.with_name(f"{stamp}__{dest.name}")
-
-    shutil.move(str(target), str(dest))
-    return dest
 
 
 # ---------------------------------------------------------------------------
