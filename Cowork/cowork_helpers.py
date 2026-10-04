@@ -230,7 +230,7 @@ def _get_vision_llm():
     if _VISION_LLM is None:
         from langchain_openai import ChatOpenAI
         _VISION_LLM = ChatOpenAI(
-            model="gpt-5.6-luna",     # same model family; capability, not reasoning cost, is what's needed here
+            model="gpt-6-luna",     # same model family; capability, not reasoning cost, is what's needed here
             use_responses_api=True,
             reasoning_effort="low",   # this is a lookup, not a plan — keep it fast/cheap
             max_retries=0,

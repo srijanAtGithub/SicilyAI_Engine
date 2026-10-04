@@ -366,7 +366,7 @@ async def process_user_reply(user_id: str, user_name: str, chat_id: int, text: s
                     state = await current_graph.aget_state({"configurable": {"thread_id": session_id}})
                     for msg in state.values.get("messages", []):
                         if hasattr(msg, "usage_metadata") and msg.usage_metadata:
-                            model_name = msg.response_metadata.get("model_name", "gpt-5.6-luna")
+                            model_name = msg.response_metadata.get("model_name", "gpt-6-luna")
                             msg_id = getattr(msg, "id", None)
                             
                             from usage_tracker import record_usage

@@ -93,7 +93,7 @@ def load_config() -> None:
 
 def get_main_llm(tools=None):
     llm = ChatOpenAI(
-        model="gpt-5.6-luna",
+        model="gpt-6-luna",
         use_responses_api=True,
         reasoning_effort="high",
     )
@@ -105,7 +105,7 @@ def get_main_llm(tools=None):
 
 def get_cowork_llm(tools=None):
     llm = ChatOpenAI(
-        model="gpt-5.6-luna",
+        model="gpt-6-luna",
         use_responses_api=True,          # enables tools + reasoning together
         reasoning_effort="xhigh",        # default is medium
         max_retries=0,                   # let _ainvoke_with_retry own all retry/backoff
@@ -118,7 +118,7 @@ def get_cowork_llm(tools=None):
 
 def get_safety_llm(schema):
     llm = ChatOpenAI(
-        model="gpt-5.6-luna",
+        model="gpt-6-luna",
         use_responses_api=True,
         reasoning_effort="medium",
     )
@@ -127,7 +127,7 @@ def get_safety_llm(schema):
 
 def get_intent_llm(schema):
     llm = ChatOpenAI(
-        model="gpt-5.6-luna",
+        model="gpt-6-luna",
         use_responses_api=True,
         reasoning_effort="medium",
     )
@@ -149,7 +149,7 @@ def get_transcriber() -> AsyncOpenAI:
 
 def navigator_smart_llm(schema=None):
     llm = ChatOpenAI(
-        model="gpt-5.6-luna",
+        model="gpt-6-luna",
         use_responses_api=True,
         reasoning_effort="high",
     )
