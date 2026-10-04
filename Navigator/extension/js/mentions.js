@@ -587,6 +587,19 @@ function ensureDropdownEl() {
     dropdownEl.id = "mention-dropdown";
     dropdownEl.className = "mention-dropdown";
     bottomDock.appendChild(dropdownEl);
+
+    // Keep the blur halo behind the dock (see #bottom-dock::after in
+    // chat.css) the same height as whatever the dropdown currently is:
+    // the @ list is long, the # list is short, and filtering changes it
+    // again. ResizeObserver fires on every one of those changes.
+    const syncHeight = () => {
+        bottomDock.style.setProperty("--mention-dropdown-h", dropdownEl.offsetHeight + "px");
+    };
+    if (typeof ResizeObserver !== "undefined") {
+        new ResizeObserver(syncHeight).observe(dropdownEl);
+    }
+    syncHeight();
+
     return dropdownEl;
 }
 
@@ -640,7 +653,7 @@ function renderDropdown(filter) {
         if (mentionType === "@") {
             titleEl.textContent = item.title || "(untitled)";
             titleEl.title = item.url || "";
-            
+
             if (!isScriptableTab(item)) {
                 row.style.opacity = "0.6";
                 const badge = document.createElement("span");

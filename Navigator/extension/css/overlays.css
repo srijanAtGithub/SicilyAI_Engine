@@ -6,6 +6,10 @@
     background: rgba(10, 10, 12, 0.45);
     /* Smooth dimming layer */
 
+    /* Blur the chat text underneath so the drop zones read clearly */
+    -webkit-backdrop-filter: blur(12px) saturate(120%);
+    backdrop-filter: blur(12px) saturate(120%);
+
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -1018,11 +1022,13 @@
     margin-top: 6px;
     white-space: pre-wrap;
     line-height: 1.5;
-    
+
     /* --- New Restrictive Constraints --- */
-    max-height: 72px; /* Roughly limits to 4 lines of text */
+    max-height: 72px;
+    /* Roughly limits to 4 lines of text */
     overflow-y: auto;
-    padding-right: 4px; /* Gives the scrollbar a little breathing room */
+    padding-right: 4px;
+    /* Gives the scrollbar a little breathing room */
 }
 
 /* Optional but recommended: Style the internal scrollbar to match the modern aesthetic */
