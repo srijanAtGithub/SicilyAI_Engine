@@ -89,6 +89,26 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def truncate_messages_at_user_turn(
+    messages: list[BaseMessage], turn_index: int
+) -> list[BaseMessage]:
+    """
+    Same "drop the Nth user message and everything after it" rule as
+    ChatStore.truncate_from_user_turn, but for a plain list of LangChain
+    messages — for stores that are not SQLite-backed (e.g. the in-memory
+    temporary/incognito sessions). Returns a new list.
+    """
+    if turn_index < 0:
+        return list(messages)
+    seen = 0
+    for i, m in enumerate(messages):
+        if isinstance(m, HumanMessage):
+            if seen == turn_index:
+                return list(messages[:i])
+            seen += 1
+    return list(messages)
+
+
 class ChatStore:
     """
     Drop-in replacement for the old in-memory SessionStore.
@@ -250,6 +270,51 @@ class ChatStore:
             existed = cur.fetchone() is not None
             cur.execute("DELETE FROM messages WHERE tab_id = ?", (tab_id,))
         return existed
+
+    def truncate_from_user_turn(self, tab_id: str, turn_index: int) -> int:
+        """
+        Edit-and-resend support: deletes the Nth *user* message of this
+        session (0-based) and every row after it (that turn's AI reply
+        and all later turns). Returns the number of rows deleted.
+
+        Turns are addressed by position rather than by a new id column,
+        so this works on every conversation saved before the feature
+        existed — no schema change, no migration. append_turn() always
+        writes 'user' then 'ai', so the Nth 'user' row is the start of
+        the Nth turn.
+
+        If turn_index is past the end (e.g. the UI had a message that
+        never got stored), nothing is deleted and 0 is returned.
+
+        If this empties the session, its generated title is dropped too,
+        so the Chats list falls back to the first user message and the
+        title can be regenerated from the edited prompt.
+        """
+        if turn_index < 0:
+            return 0
+
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT id FROM messages "
+                "WHERE tab_id = ? AND role = 'user' "
+                "ORDER BY id ASC LIMIT 1 OFFSET ?",
+                (tab_id, turn_index),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return 0
+
+            cur.execute(
+                "DELETE FROM messages WHERE tab_id = ? AND id >= ?",
+                (tab_id, row["id"]),
+            )
+            deleted = cur.rowcount
+
+            cur.execute("SELECT 1 FROM messages WHERE tab_id = ? LIMIT 1", (tab_id,))
+            if cur.fetchone() is None:
+                cur.execute("DELETE FROM session_titles WHERE tab_id = ?", (tab_id,))
+
+        return deleted
 
     def __len__(self) -> int:
         with self._cursor() as cur:

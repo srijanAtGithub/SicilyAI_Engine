@@ -34,7 +34,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from Navigator.Task_Files.Chat_Section import build_navigator_graph
-from Navigator.Task_Files.ChatStore import ChatStore
+from Navigator.Task_Files.ChatStore import ChatStore, truncate_messages_at_user_turn
 
 from Navigator.Task_Files.Organise_Tabs import OrganiseTabsRequest, process_organise_tabs
 from Navigator.Task_Files.Edit_Selection import EditSelectionRequest, EditSelectionResponse, process_edit_selection
@@ -291,6 +291,16 @@ async def websocket_endpoint(websocket: WebSocket, tab_id: str):
             
             context_snippets = payload.get("context_snippets") or []
 
+            # Edit-and-resend: the panel sends "truncate_from_turn": N, meaning
+            # "drop the Nth user message and everything after it, then treat
+            # this text as the next turn". See ChatStore.truncate_from_user_turn.
+            truncate_from = payload.get("truncate_from_turn")
+            is_edit = (
+                isinstance(truncate_from, int)
+                and not isinstance(truncate_from, bool)
+                and truncate_from >= 0
+            )
+
             log.info("Received message", tab_id=tab_id, text=user_text, page_url=page_url, snippets_count=len(context_snippets))
 
             if not user_text:
@@ -302,6 +312,13 @@ async def websocket_endpoint(websocket: WebSocket, tab_id: str):
                 history = temp_sessions[tab_id]
             else:
                 history = sessions.get(tab_id)
+
+            # For an edit, the model must only see the turns BEFORE the edited
+            # one. The stored history is trimmed later, only once the graph has
+            # succeeded, so a failed LLM call can't leave the chat truncated
+            # with nothing in its place.
+            if is_edit:
+                history = truncate_messages_at_user_turn(history, truncate_from)
 
             result = await graph.ainvoke({
                 "messages": history + [HumanMessage(content=user_text)],
@@ -341,6 +358,15 @@ async def websocket_endpoint(websocket: WebSocket, tab_id: str):
                 if isinstance(msg, AIMessage) and msg.content:
                     reply_text = content_to_text(msg.content)
                     break
+
+            # Persist the truncation now that we have a good reply.
+            if is_edit:
+                if is_temp:
+                    temp_sessions[tab_id] = list(history)
+                else:
+                    removed = sessions.truncate_from_user_turn(tab_id, truncate_from)
+                    log.info("Edit-and-resend truncated history", tab_id=tab_id,
+                             from_turn=truncate_from, rows_removed=removed)
 
             # Save to memory OR database depending on the session type
             if is_temp:

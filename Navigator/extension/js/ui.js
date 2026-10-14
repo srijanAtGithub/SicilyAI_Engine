@@ -23,6 +23,11 @@ const COPY_ICON = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org
   <path d="M16 18V20C16 21.1046 15.1046 22 14 22H4C2.89543 22 2 21.1046 2 20V8C2 6.89543 2.89543 6 4 6H6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>`;
 
+const EDIT_ICON = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <path d="M12 20h9" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`;
+
 const CHECK_ICON = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
   <path d="M20 6L9 17L4 12" stroke="#34c759" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>`;
@@ -60,7 +65,106 @@ function addCodeBlockCopyButtons(container) {
   });
 }
 
-export function addMessage(text, role) {
+// ── Edit & resend (user messages) ─────────────────────────────────────
+// main.js registers the handler that actually truncates history and
+// re-sends; ui.js only owns the inline editor. The handler returns
+// false to keep the editor open (e.g. socket not connected), anything
+// else means "done, the bubble has been replaced".
+let editHandler = null;
+let activeEdit = null;
+
+export function setEditHandler(fn) {
+  editHandler = fn;
+}
+
+export function cancelActiveEdit() {
+  if (activeEdit) activeEdit.cancel();
+}
+
+function startEditing(el, originalText) {
+  if (activeEdit) activeEdit.cancel();
+
+  // Keep the original nodes (text / collapsible head+body / buttons)
+  // so Cancel can put the bubble back exactly as it was.
+  const saved = Array.from(el.childNodes);
+  el.classList.add("editing");
+
+  const editor = document.createElement("div");
+  editor.className = "msg-editor";
+
+  const ta = document.createElement("textarea");
+  ta.className = "msg-edit-input";
+  ta.rows = 1;
+  ta.value = originalText;
+
+  const actions = document.createElement("div");
+  actions.className = "msg-edit-actions";
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.className = "msg-edit-btn";
+  cancelBtn.textContent = "Cancel";
+
+  const submitBtn = document.createElement("button");
+  submitBtn.type = "button";
+  submitBtn.className = "msg-edit-btn primary";
+  submitBtn.textContent = "Send";
+
+  actions.appendChild(cancelBtn);
+  actions.appendChild(submitBtn);
+  editor.appendChild(ta);
+  editor.appendChild(actions);
+
+  const autosize = () => {
+    ta.style.height = "auto";
+    ta.style.height = Math.min(ta.scrollHeight + 2, 200) + "px";
+  };
+
+  const close = () => {
+    el.classList.remove("editing");
+    el.replaceChildren(...saved);
+    activeEdit = null;
+  };
+
+  const submit = async () => {
+    const newText = ta.value.trim();
+    if (!newText || !editHandler) return;
+    submitBtn.disabled = true;
+    const ok = await editHandler(el, newText);
+    if (ok === false) {
+      submitBtn.disabled = false;
+    } else {
+      activeEdit = null; // the handler has replaced this bubble
+    }
+  };
+
+  ta.addEventListener("input", autosize);
+  ta.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      submit();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      close();
+    }
+  });
+  cancelBtn.addEventListener("click", close);
+  submitBtn.addEventListener("click", submit);
+
+  activeEdit = { el, cancel: close };
+
+  el.replaceChildren(editor);
+  autosize();
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+}
+
+// `meta` (optional, user messages only) lets main.js remember what was
+// attached to this turn so an edit can re-send the same context:
+//   { contextSnippets: string[]  // full text that goes to the backend
+//     trailSnippets:   string[]  // what addContextTrail displayed }
+// Returns the created element.
+export function addMessage(text, role, meta = {}) {
   // Once there's a real message (user, ai, or even a system notice),
   // the "nothing here yet" placeholder no longer applies.[cite: 2]
   hideEmptyState();
@@ -147,15 +251,32 @@ export function addMessage(text, role) {
   });
 
   el.appendChild(copyBtn);
+
+  if (role === "user") {
+    el._meta = meta;
+    const editBtn = document.createElement("button");
+    editBtn.className = "copy-btn edit-btn";
+    editBtn.type = "button";
+    editBtn.title = "Edit and resend";
+    editBtn.innerHTML = EDIT_ICON;
+    editBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      startEditing(el, text);
+    });
+    el.appendChild(editBtn);
+  }
+
   messagesEl.appendChild(el);
 
   requestAnimationFrame(() => {
     messagesEl.scrollTop = messagesEl.scrollHeight;
   });
+
+  return el;
 }
 
 export function addContextTrail(snippets) {
-  if (!snippets || snippets.length === 0) return;
+  if (!snippets || snippets.length === 0) return null;
   const trail = document.createElement("div");
   trail.className = "msg-context-trail";
   snippets.forEach((text) => {
@@ -180,6 +301,7 @@ export function addContextTrail(snippets) {
   requestAnimationFrame(() => {
     messagesEl.scrollTop = messagesEl.scrollHeight;
   });
+  return trail;
 }
 
 export function clearMessagesUI() {
@@ -213,48 +335,32 @@ export function showOnline() {
   disconnectedScreen.classList.remove("retrying");
 }
 
+let isSendingNow = false;
+
 export function setSending(isSending) {
+  isSendingNow = isSending;
   sendBtn.disabled = isSending;
   const icon = document.getElementById("send-icon");
   const spinner = document.getElementById("send-spinner");
   if (icon) icon.style.display = isSending ? "none" : "";
   if (spinner) spinner.style.display = isSending ? "inline-block" : "none";
-  if (isSending) {
-    appWrap.classList.add("busy");
-  } else {
-    appWrap.classList.remove("busy");
-  }
+  appWrap.classList.toggle("busy", isSending);
+  syncSendBtn();
 }
 
 export const inputRow = document.getElementById("input-row");
-export const PROXIMITY_THRESHOLD = 90;
-let sendBtnRevealTimer = null;
+export const inputBox = document.getElementById("input-box");
 
-export function revealSendBtn() {
-  clearTimeout(sendBtnRevealTimer);
-  sendBtn.classList.add("revealed");
+// Show the send button only when there's something to send
+// (or while a send is in flight, so the spinner stays visible).
+export function syncSendBtn() {
+  const hasText = !!inputBox && inputBox.value.trim().length > 0;
+  sendBtn.classList.toggle("revealed", hasText || isSendingNow);
 }
 
-export function hideSendBtn(delay = 400) {
-  clearTimeout(sendBtnRevealTimer);
-  sendBtnRevealTimer = setTimeout(() => {
-    if (!sendBtn.matches(":hover")) {
-      sendBtn.classList.remove("revealed");
-    }
-  }, delay);
+if (inputBox) {
+  inputBox.addEventListener("input", syncSendBtn);
 }
 
-sendBtn.addEventListener("mouseenter", revealSendBtn);
-sendBtn.addEventListener("mouseleave", () => hideSendBtn(300));
-
-document.addEventListener("mousemove", (e) => {
-  const rect = inputRow.getBoundingClientRect();
-  const dx = Math.max(rect.left - e.clientX, 0, e.clientX - rect.right);
-  const dy = Math.max(rect.top - e.clientY, 0, e.clientY - rect.bottom);
-  const dist = Math.sqrt(dx * dx + dy * dy);
-  if (dist <= PROXIMITY_THRESHOLD) {
-    revealSendBtn();
-  } else {
-    hideSendBtn(300);
-  }
-});
+// Initial state on load
+syncSendBtn();

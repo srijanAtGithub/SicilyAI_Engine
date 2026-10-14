@@ -1,5 +1,5 @@
 import { NotificationService } from "./notifications.js";
-import { addMessage, clearMessagesUI, addContextTrail, setSending, sendBtn, appWrap, showEmptyState } from "./ui.js";
+import { addMessage, clearMessagesUI, addContextTrail, setSending, sendBtn, appWrap, showEmptyState, messagesEl, setEditHandler, cancelActiveEdit, syncSendBtn } from "./ui.js";
 import { socket, getActiveTabInfo, loadHistory, deleteSessionOnBackend, connectSocket, closeSocket, resolveSessionKey, carrySessionToUrl, startNewSessionForUrl, pinSessionKeyToUrl, fetchAllSessions, BACKEND_HOST } from "./api.js";
 import { attachedContexts, clearAttachedContexts, currentCapability } from "./features.js";
 import {
@@ -104,8 +104,13 @@ async function sendMessage() {
   // Render the UI with only the short labels
   addContextTrail(displaySnippets);
 
-  addMessage(text, "user");
+  const userEl = addMessage(text, "user", {
+    contextSnippets: payloadSnippets,
+    trailSnippets: displaySnippets,
+  });
+  pendingUserEl = userEl;
   inputEl.value = "";
+  syncSendBtn();
 
   inputEl.style.height = 'auto';
   inputEl.style.overflowY = 'hidden';
@@ -128,6 +133,78 @@ async function sendMessage() {
   if (hasMentionedCollection()) clearMentionedCollection();
 }
 
+// ── Edit & resend ─────────────────────────────────────────────────────
+// Backend rows have no ids on the wire, so a turn is addressed by its
+// position among the user messages ("truncate_from_turn": N means: drop
+// the Nth user message and everything after it, then treat the new text
+// as the next turn). This works unchanged on every chat saved before this
+// feature existed.
+let pendingUserEl = null;
+
+window.addEventListener("chat-turn-complete", () => { pendingUserEl = null; });
+
+// A send whose socket died before any reply never reached ChatStore;
+// flag it so it isn't counted when computing the turn index.
+window.addEventListener("chat-socket-closed", () => {
+  if (pendingUserEl) {
+    pendingUserEl.dataset.unsaved = "1";
+    pendingUserEl = null;
+  }
+});
+
+function renderHistory(history) {
+  for (const m of history) {
+    const isUser = m.role === "user";
+    const snippets = isUser && Array.isArray(m.context_snippets) ? m.context_snippets : [];
+    if (snippets.length) addContextTrail(snippets);
+    addMessage(m.text, isUser ? "user" : "ai",
+      isUser ? { contextSnippets: snippets, trailSnippets: snippets } : {});
+  }
+}
+
+async function editAndResend(userEl, newText) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    NotificationService.show("Not connected to backend yet.");
+    return false;
+  }
+
+  const userEls = Array.from(messagesEl.querySelectorAll(".msg.user"));
+  const pos = userEls.indexOf(userEl);
+  if (pos === -1) return false;
+
+  // Only turns the backend actually stored count toward the index.
+  const turnIndex = userEls.slice(0, pos).filter((el) => el.dataset.unsaved !== "1").length;
+
+  // Re-send exactly what was attached to the original turn.
+  const meta = userEl._meta || {};
+  const snippets = meta.contextSnippets || [];
+  const trail = meta.trailSnippets || snippets;
+
+  // Remove the edited message, its context trail, and everything after it.
+  const prev = userEl.previousElementSibling;
+  if (prev && prev.classList.contains("msg-context-trail")) prev.remove();
+  while (userEl.nextSibling) userEl.nextSibling.remove();
+  userEl.remove();
+
+  if (trail.length) addContextTrail(trail);
+  pendingUserEl = addMessage(newText, "user", { contextSnippets: snippets, trailSnippets: trail });
+
+  setSending(true);
+
+  const fresh = await getActiveTabInfo();
+  socket.send(JSON.stringify({
+    text: newText,
+    page_url: fresh.url,
+    page_title: fresh.title,
+    context_snippets: snippets,
+    capability: currentCapability,
+    truncate_from_turn: turnIndex
+  }));
+  return true;
+}
+
+setEditHandler(editAndResend);
+
 // "New Chat" starts a distinct backend session rather than wiping the
 // current one: it mints a fresh session key and points this URL at it
 // (so this page resumes the new, empty conversation from now on,
@@ -148,6 +225,7 @@ async function handleClear(showNotification = true) {
     }
   }
 
+  cancelActiveEdit();
   closeSocket();
   clearMessagesUI();
   showEmptyState();
@@ -318,6 +396,7 @@ async function switchToSession(sessionKey) {
   }
 
   // Tear down old session
+  cancelActiveEdit();
   closeSocket();
   clearMessagesUI();
 
@@ -334,12 +413,7 @@ async function switchToSession(sessionKey) {
     showEmptyState();
   }
 
-  for (const m of history) {
-    if (m.role === "user" && Array.isArray(m.context_snippets) && m.context_snippets.length) {
-      addContextTrail(m.context_snippets);
-    }
-    addMessage(m.text, m.role === "user" ? "user" : "ai");
-  }
+  renderHistory(history);
 
   // Reconnect socket to the new session
   connectSocket(sessionKey);
@@ -419,12 +493,7 @@ async function loadSessionForUrl(url) {
     autoMentionActiveTab(currentTab);
   }
 
-  for (const m of history) {
-    if (m.role === "user" && Array.isArray(m.context_snippets) && m.context_snippets.length) {
-      addContextTrail(m.context_snippets);
-    }
-    addMessage(m.text, m.role === "user" ? "user" : "ai");
-  }
+  renderHistory(history);
 
   updateActiveChatTitle()
 
@@ -493,12 +562,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       autoMentionActiveTab(currentTab);
     }
 
-    for (const m of history) {
-      if (m.role === "user" && Array.isArray(m.context_snippets) && m.context_snippets.length) {
-        addContextTrail(m.context_snippets);
-      }
-      addMessage(m.text, m.role === "user" ? "user" : "ai");
-    }
+    renderHistory(history);
 
     connectSocket(currentSessionKey);
   } else {

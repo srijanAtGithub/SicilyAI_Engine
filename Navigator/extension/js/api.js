@@ -180,6 +180,9 @@ export function connectSocket(sessionKey) {
   };
 
   socket.onclose = () => {
+    // Lets main.js flag a user message whose reply never arrived, so the
+    // edit/truncate index only counts turns the backend really stored.
+    window.dispatchEvent(new Event("chat-socket-closed"));
     setStatus("disconnected");
     setSending(false);
   };

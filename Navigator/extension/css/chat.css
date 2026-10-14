@@ -474,7 +474,7 @@
     box-shadow: 0 0 14px rgba(255, 255, 255, 0.22);
 }
 
-/* Send button — hidden by default, emerges from input on proximity */
+/* Send button — hidden by default, emerges when the input has text */
 #send-btn {
     padding: 9px 15px;
     border-radius: 10px;
@@ -1408,4 +1408,83 @@
 
 #bottom-dock:has(.mention-dropdown--visible)::after {
     opacity: 1;
+}
+
+
+/* --- Edit & resend (user messages) --- */
+.msg.user .edit-btn {
+    /* sits just left of the copy button (22px wide + 4px gap + 10px inset) */
+    right: 36px;
+}
+
+.msg.user.editing {
+    align-self: stretch;
+    text-align: left;
+    padding: 0;
+    border-right: none;
+    color: #f2f2f7;
+}
+
+.msg-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.msg-edit-input {
+    width: 100%;
+    padding: 8px 10px;
+    border-radius: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    background: rgba(0, 0, 0, 0.6);
+    color: #f2f2f7;
+    font-size: var(--chat-font-size, 12px);
+    line-height: 1.5;
+    outline: none;
+    resize: none;
+    overflow-y: auto;
+    min-height: 36px;
+    max-height: 200px;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.msg-edit-input:focus {
+    border-color: rgba(255, 255, 255, 0.4);
+    box-shadow: 0 0 12px rgba(255, 255, 255, 0.15);
+}
+
+.msg-edit-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 6px;
+}
+
+.msg-edit-btn {
+    padding: 5px 12px;
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: rgba(255, 255, 255, 0.08);
+    color: #f2f2f7;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s ease, transform 0.1s ease;
+}
+
+.msg-edit-btn:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.18);
+}
+
+.msg-edit-btn:active:not(:disabled) {
+    transform: scale(0.95);
+}
+
+.msg-edit-btn.primary {
+    background: rgba(40, 110, 230, 0.3);
+    border-color: rgb(37, 113, 255);
+}
+
+.msg-edit-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
 }
