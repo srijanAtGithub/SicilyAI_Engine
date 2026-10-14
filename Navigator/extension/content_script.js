@@ -929,7 +929,12 @@
     const followupInput = shadow.querySelector(".followup-input");
     const followupBtn = shadow.querySelector(".btn-followup");
 
+    // What's currently shown in the result pane (an edit OR a reply).
     let pendingAiText = "";
+    // The most recent *edit* (new version of the selection). This is the
+    // only thing Replace/Copy should ever insert — a conversational reply
+    // like "Glad that works!" must never land in the user's document.
+    let lastEditText = "";
 
     // Turn history for THIS open box only. Lives entirely in this
     // closure — created fresh every time openEditBox() runs, and gone
@@ -1042,7 +1047,7 @@
     }
 
     // Morph the window from Input to Preview mode with animation
-    function showPreviewMode(text, actionType) {
+    function showPreviewMode(text, actionType, kind) {
       pendingAiText = text;
 
       // Use the smooth lerp engine
@@ -1057,20 +1062,26 @@
         updateResultFade();
         updateFollowupState();
 
+        const canReplace =
+          context.tier !== "readonly" && actionType !== "ask" && !!lastEditText;
+
         // Show the warning ONLY if the user tried to execute an 'edit' on static text
         if (actionType === "edit" && context.tier === "readonly") {
           noticeEl.textContent = "Static text detected — edits will show as a copyable result.";
+          noticeEl.style.display = "block";
+        } else if (kind === "reply" && lastEditText && actionType !== "ask") {
+          // The pane is showing a chat reply, not a new version — make it
+          // clear what Replace/Copy will actually use.
+          noticeEl.textContent = canReplace
+            ? "Replace will insert your last edited version."
+            : "Copy will copy your last edited version.";
           noticeEl.style.display = "block";
         } else {
           noticeEl.style.display = "none";
         }
 
-        // Hide the replace button if the field is read-only OR if the action is an 'ask'
-        if (context.tier === "readonly" || actionType === "ask") {
-          replaceBtn.style.display = "none";
-        } else {
-          replaceBtn.style.display = ""; // Restores the default button layout for regular edits
-        }
+        // Hide Replace on read-only fields, in 'ask' mode, or when there's no edit yet
+        replaceBtn.style.display = canReplace ? "" : "none";
       });
 
       // Let the user immediately keep the conversation going without an
@@ -1127,6 +1138,10 @@
           conversationHistory.push({ role: "user", text: instruction });
           conversationHistory.push({ role: "ai", text: response.edited_text });
 
+          // Older backends don't send `kind`; fall back to the old behaviour.
+          const kind = response.kind || (actionType === "ask" ? "reply" : "edit");
+          if (kind === "edit") lastEditText = response.edited_text;
+
           if (instructionOverride !== undefined) {
             followupInput.value = "";
             followupInput.style.height = "auto";
@@ -1137,7 +1152,7 @@
             actionBtns.classList.remove("has-text");
           }
 
-          showPreviewMode(response.edited_text, actionType);
+          showPreviewMode(response.edited_text, actionType, kind);
         }
       );
     }
@@ -1215,14 +1230,14 @@
     input.addEventListener("keypress", (e) => e.stopPropagation());
 
     replaceBtn.addEventListener("click", () => {
-      if (pendingAiText) {
-        applyEdit(context, pendingAiText);
+      if (lastEditText) {
+        applyEdit(context, lastEditText);
       }
       closeActiveBox();
     });
 
     copyBtn.addEventListener("click", () => {
-      navigator.clipboard?.writeText(pendingAiText).catch(() => { });
+      navigator.clipboard?.writeText(lastEditText || pendingAiText).catch(() => { });
       copyBtn.textContent = "Copied";
       copyBtn.classList.add("btn-success"); // Apply Green Success Gradient
       setTimeout(() => {

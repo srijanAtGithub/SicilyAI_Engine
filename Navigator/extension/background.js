@@ -77,7 +77,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     })
     .catch((err) => {
       console.log("[Sicily Navigator] edit-selection request failed", err);
-      sendResponse({ ok: false, error: "Backend not reachable — is navigator_bridge.py running?" });
+      sendResponse({ ok: false, error: "Backend not reachable — please start using sicily navigator --start?" });
     });
 
   return true; // Important: keeps the channel open for async response
