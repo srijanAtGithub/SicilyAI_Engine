@@ -56,6 +56,10 @@ async function sendMessage() {
   const text = inputEl.value.trim();
   if (!text) return;
 
+  // While a reply is streaming the input stays usable (so the transcript
+  // can be scrolled/selected), but a second turn must not be sent.
+  if (appWrap.classList.contains("busy")) return;
+
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     addMessage("Not connected to backend yet.", "system");
     return;
@@ -110,6 +114,7 @@ async function sendMessage() {
   });
   pendingUserEl = userEl;
   inputEl.value = "";
+  inputEl.blur(); // sending takes focus out of the box
   syncSendBtn();
 
   inputEl.style.height = 'auto';
@@ -143,6 +148,20 @@ let pendingUserEl = null;
 
 window.addEventListener("chat-turn-complete", () => { pendingUserEl = null; });
 
+// Stopped before the model produced anything: the backend didn't save the
+// turn, so don't count this user message when computing edit indices.
+window.addEventListener("chat-turn-stopped", (e) => {
+  if (pendingUserEl && !e.detail?.saved) pendingUserEl.dataset.unsaved = "1";
+  pendingUserEl = null;
+});
+
+// Ask the backend to stop generating the reply that's in flight.
+function stopGeneration() {
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: "stop" }));
+  }
+}
+
 // A send whose socket died before any reply never reached ChatStore;
 // flag it so it isn't counted when computing the turn index.
 window.addEventListener("chat-socket-closed", () => {
@@ -158,7 +177,7 @@ function renderHistory(history) {
     const snippets = isUser && Array.isArray(m.context_snippets) ? m.context_snippets : [];
     if (snippets.length) addContextTrail(snippets);
     addMessage(m.text, isUser ? "user" : "ai",
-      isUser ? { contextSnippets: snippets, trailSnippets: snippets } : {});
+      isUser ? { contextSnippets: snippets, trailSnippets: snippets } : { stopped: !!m.stopped });
   }
 }
 
@@ -432,7 +451,11 @@ chatsOverlay.addEventListener("click", (e) => {
   if (e.target === chatsOverlay) closeChatsPanel();
 });
 
-sendBtn.addEventListener("click", sendMessage);
+// The same button sends, or stops the reply that's currently generating.
+sendBtn.addEventListener("click", () => {
+  if (appWrap.classList.contains("busy")) stopGeneration();
+  else sendMessage();
+});
 clearBtn.addEventListener("click", handleClear);
 
 // Empty-state suggestion chips: these are generic conversation starters

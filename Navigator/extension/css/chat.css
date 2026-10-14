@@ -1488,3 +1488,39 @@
     opacity: 0.4;
     cursor: not-allowed;
 }
+
+
+/* --- Busy state: keep the transcript and input dock interactive ---
+   The busy overlay (.wrap.busy::after, z-index 9999) blocks all clicks
+   while a reply is pending. That would also block the stop button (it
+   lives in the dock) and scrolling/selecting the answer as it streams in,
+   so lift the transcript and the dock above it. The header stays blocked,
+   and main.js refuses to send a second turn while busy. */
+.wrap.busy #messages {
+    z-index: 10000;
+}
+
+.wrap.busy #bottom-dock {
+    z-index: 10001;
+}
+
+/* No edit-and-resend while a reply is in flight. */
+.wrap.busy .edit-btn {
+    display: none;
+}
+
+/* --- "Response stopped" note (grey) --- */
+.stopped-note {
+    display: block;
+    margin-top: 8px;
+    font-size: 11.5px;
+    font-style: italic;
+    color: #8e8e93;
+    letter-spacing: 0.2px;
+}
+
+.msg.stopped-note {
+    align-self: flex-start;
+    margin: 0;
+    padding: 0 10px;
+}

@@ -39,6 +39,7 @@ Schema:
         role              TEXT NOT NULL,   -- 'user' | 'ai'
         text              TEXT NOT NULL,
         context_snippets  TEXT,            -- JSON array[str], NULL if none
+        stopped           INTEGER NOT NULL DEFAULT 0,  -- 1 on an 'ai' row the user stopped mid-reply
         created_at        TEXT NOT NULL    -- ISO-8601 UTC
     )
     INDEX (tab_id, id)                     -- fast ordered fetch per tab
@@ -74,6 +75,7 @@ CREATE TABLE IF NOT EXISTS messages (
     role              TEXT NOT NULL,
     text              TEXT NOT NULL,
     context_snippets  TEXT,
+    stopped           INTEGER NOT NULL DEFAULT 0,
     created_at        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_tab_id ON messages(tab_id, id);
@@ -139,6 +141,14 @@ class ChatStore:
         self._conn.row_factory = sqlite3.Row
         with self._conn:
             self._conn.executescript(_SCHEMA)
+            # Databases created before the "stopped" flag existed: add the
+            # column in place. Existing rows get 0 (= not stopped), so every
+            # already-saved chat loads exactly as before.
+            cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(messages)")}
+            if "stopped" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE messages ADD COLUMN stopped INTEGER NOT NULL DEFAULT 0"
+                )
 
     @contextmanager
     def _cursor(self):
@@ -158,7 +168,8 @@ class ChatStore:
     def get_full(self, tab_id: str) -> list[dict]:
         """
         Returns every row for this tab in order, as plain dicts:
-            {"role": "user"|"ai", "text": str, "context_snippets": list[str]}
+            {"role": "user"|"ai", "text": str, "context_snippets": list[str],
+             "stopped": bool}
 
         This is what the popup's history load (loadHistory in api.js ->
         GET /session/{tab_id} -> main.js's startup loop) actually needs:
@@ -167,7 +178,7 @@ class ChatStore:
         """
         with self._cursor() as cur:
             cur.execute(
-                "SELECT role, text, context_snippets FROM messages "
+                "SELECT role, text, context_snippets, stopped FROM messages "
                 "WHERE tab_id = ? ORDER BY id ASC",
                 (tab_id,),
             )
@@ -176,7 +187,12 @@ class ChatStore:
         out = []
         for row in rows:
             snippets = json.loads(row["context_snippets"]) if row["context_snippets"] else []
-            out.append({"role": row["role"], "text": row["text"], "context_snippets": snippets})
+            out.append({
+                "role": row["role"],
+                "text": row["text"],
+                "context_snippets": snippets,
+                "stopped": bool(row["stopped"]),
+            })
         return out
 
     def append_turn(
@@ -185,12 +201,16 @@ class ChatStore:
         user_text: str,
         ai_text: str,
         context_snippets: list[str] | None = None,
+        stopped: bool = False,
     ) -> None:
         """
         Persist exactly one turn: the human message (with whatever
         context_snippets rode alongside it — drag/drop text, an "Add to
         Chat" summary, an @-mentioned tab's content) and the AI reply
         that followed it.
+
+        `stopped` marks the AI reply as cut short by the user (the panel
+        shows a grey "Response stopped" note under it, including on reload).
 
         Called once per WebSocket turn in navigator_bridge.py, right
         after the graph returns — mirrors the old sessions.set(...) call
@@ -206,9 +226,9 @@ class ChatStore:
                 (tab_id, user_text, snippets_json, now),
             )
             cur.execute(
-                "INSERT INTO messages (tab_id, role, text, context_snippets, created_at) "
-                "VALUES (?, 'ai', ?, NULL, ?)",
-                (tab_id, ai_text, now),
+                "INSERT INTO messages (tab_id, role, text, context_snippets, stopped, created_at) "
+                "VALUES (?, 'ai', ?, NULL, ?, ?)",
+                (tab_id, ai_text, 1 if stopped else 0, now),
             )
 
     # ── LangGraph-shaped API (get/set/clear/__len__, matches old SessionStore) ──

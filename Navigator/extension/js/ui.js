@@ -65,6 +65,106 @@ function addCodeBlockCopyButtons(container) {
   });
 }
 
+// Grey "Response stopped" line shown under an AI reply the user cut short.
+function makeStoppedNote() {
+  const note = document.createElement("div");
+  note.className = "stopped-note";
+  note.textContent = "Response stopped";
+  return note;
+}
+
+// Floating "copy message" button, shared by normal and streamed bubbles.
+function makeCopyButton(text) {
+  const copyBtn = document.createElement("button");
+  copyBtn.className = "copy-btn";
+  copyBtn.title = "Copy text";
+  copyBtn.innerHTML = COPY_ICON;
+  copyBtn.addEventListener("click", () => {
+    navigator.clipboard.writeText(text).then(() => {
+      copyBtn.innerHTML = CHECK_ICON;
+      setTimeout(() => {
+        copyBtn.innerHTML = COPY_ICON;
+      }, 1500);
+    }).catch(err => console.error("Failed to copy text:", err));
+  });
+  return copyBtn;
+}
+
+// ── Streaming AI replies ──────────────────────────────────────────────
+// The bubble is created lazily by the first chunk (api.js), grows as
+// chunks arrive, and is re-rendered through the same markdownToHtml()
+// used for finished messages — markdown.js already degrades gracefully on
+// partial input (an unclosed ``` fence just renders as a code block so
+// far; unfinished **bold** shows literally until it closes).
+//
+// Rendering is coalesced to one pass per animation frame so a fast token
+// stream doesn't re-parse the whole message hundreds of times a second.
+// The per-block code "copy" buttons and the message copy button are only
+// added in finish(), since re-rendering would wipe them every frame.
+export function beginStreamingMessage() {
+  hideEmptyState();
+
+  const el = document.createElement("div");
+  el.className = "msg ai md-body streaming";
+  messagesEl.appendChild(el);
+  appWrap.classList.add("streaming");
+
+  let buffer = "";
+  let raf = 0;
+
+  // Only follow the stream if the reader hasn't scrolled up to read.
+  const nearBottom = () =>
+    messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 80;
+
+  const render = () => {
+    raf = 0;
+    const stick = nearBottom();
+    el.innerHTML = markdownToHtml(buffer);
+    if (stick) messagesEl.scrollTop = messagesEl.scrollHeight;
+  };
+
+  return {
+    append(chunk) {
+      buffer += chunk;
+      if (!raf) raf = requestAnimationFrame(render);
+    },
+
+    // finalText is the backend's authoritative full reply (what was saved).
+    finish(finalText, opts = {}) {
+      if (raf) { cancelAnimationFrame(raf); raf = 0; }
+      const full = finalText ?? buffer;
+      const stick = nearBottom();
+      el.classList.remove("streaming");
+      appWrap.classList.remove("streaming");
+      el.innerHTML = markdownToHtml(full);
+      addCodeBlockCopyButtons(el);
+      el.appendChild(makeCopyButton(full));
+      if (opts.stopped) el.appendChild(makeStoppedNote());
+      if (stick) messagesEl.scrollTop = messagesEl.scrollHeight;
+    },
+
+    // Stream died before completing — nothing was saved server-side, so
+    // don't leave a half-answer on screen that won't survive a reload.
+    abort() {
+      if (raf) { cancelAnimationFrame(raf); raf = 0; }
+      el.remove();
+      appWrap.classList.remove("streaming");
+    },
+  };
+}
+
+// Grey "Response stopped" line for when the user hit stop before any
+// text had streamed in (so there is no bubble to attach the note to).
+export function addStoppedNote() {
+  const el = document.createElement("div");
+  el.className = "msg stopped-note";
+  el.textContent = "Response stopped";
+  messagesEl.appendChild(el);
+  requestAnimationFrame(() => {
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  });
+}
+
 // ── Edit & resend (user messages) ─────────────────────────────────────
 // main.js registers the handler that actually truncates history and
 // re-sends; ui.js only owns the inline editor. The handler returns
@@ -82,6 +182,7 @@ export function cancelActiveEdit() {
 }
 
 function startEditing(el, originalText) {
+  if (appWrap.classList.contains("busy")) return; // no edits mid-reply
   if (activeEdit) activeEdit.cancel();
 
   // Keep the original nodes (text / collapsible head+body / buttons)
@@ -163,6 +264,7 @@ function startEditing(el, originalText) {
 // attached to this turn so an edit can re-send the same context:
 //   { contextSnippets: string[]  // full text that goes to the backend
 //     trailSnippets:   string[]  // what addContextTrail displayed }
+// For AI messages, `meta.stopped` marks a reply the user cut short.
 // Returns the created element.
 export function addMessage(text, role, meta = {}) {
   // Once there's a real message (user, ai, or even a system notice),
@@ -234,23 +336,10 @@ export function addMessage(text, role, meta = {}) {
     el.textContent = text;
   }
 
-  // Create the copy button[cite: 2]
-  const copyBtn = document.createElement("button");
-  copyBtn.className = "copy-btn";
-  copyBtn.title = "Copy text";
-  copyBtn.innerHTML = COPY_ICON;
+  el.appendChild(makeCopyButton(text));
 
-  // Handle clipboard functionality[cite: 2]
-  copyBtn.addEventListener("click", () => {
-    navigator.clipboard.writeText(text).then(() => {
-      copyBtn.innerHTML = CHECK_ICON;
-      setTimeout(() => {
-        copyBtn.innerHTML = COPY_ICON;
-      }, 1500);
-    }).catch(err => console.error("Failed to copy text:", err));
-  });
-
-  el.appendChild(copyBtn);
+  // Replies saved as "stopped" (history reload) get the same grey note.
+  if (role === "ai" && meta.stopped) el.appendChild(makeStoppedNote());
 
   if (role === "user") {
     el._meta = meta;
@@ -337,14 +426,32 @@ export function showOnline() {
 
 let isSendingNow = false;
 
+// While a reply is pending the send button becomes a *stop* button: it
+// stays enabled and clickable (main.js decides send-vs-stop from the
+// "busy" class), and shows a stop square instead of the old spinner.
+const STOP_ICON_SVG = `<svg id="send-stop" viewBox="0 0 20 20" width="16" height="16" fill="none" xmlns="http://www.w3.org/2000/svg" style="display:none"><rect x="0" y="0" width="20" height="20" rx="4" fill="currentColor"/></svg>`;
+
+function getStopIcon() {
+  let el = document.getElementById("send-stop");
+  if (!el) {
+    sendBtn.insertAdjacentHTML("beforeend", STOP_ICON_SVG);
+    el = document.getElementById("send-stop");
+  }
+  return el;
+}
+
 export function setSending(isSending) {
   isSendingNow = isSending;
-  sendBtn.disabled = isSending;
+  sendBtn.disabled = false;
+  sendBtn.title = isSending ? "Stop generating" : "Send";
   const icon = document.getElementById("send-icon");
   const spinner = document.getElementById("send-spinner");
+  const stopIcon = getStopIcon();
   if (icon) icon.style.display = isSending ? "none" : "";
-  if (spinner) spinner.style.display = isSending ? "inline-block" : "none";
+  if (spinner) spinner.style.display = "none"; // replaced by the stop icon
+  if (stopIcon) stopIcon.style.display = isSending ? "inline-block" : "none";
   appWrap.classList.toggle("busy", isSending);
+  if (!isSending) appWrap.classList.remove("streaming");
   syncSendBtn();
 }
 
