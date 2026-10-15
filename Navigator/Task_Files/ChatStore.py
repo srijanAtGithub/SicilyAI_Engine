@@ -82,9 +82,13 @@ CREATE INDEX IF NOT EXISTS idx_messages_tab_id ON messages(tab_id, id);
 
 CREATE TABLE IF NOT EXISTS session_titles (
     tab_id TEXT PRIMARY KEY,
-    title TEXT NOT NULL
+    title TEXT NOT NULL,
+    custom INTEGER NOT NULL DEFAULT 0   -- 1 = named by the user; never overwritten by the auto-titler
 );
 """
+
+
+MAX_TITLE_LEN = 80
 
 
 def _now_iso() -> str:
@@ -148,6 +152,13 @@ class ChatStore:
             if "stopped" not in cols:
                 self._conn.execute(
                     "ALTER TABLE messages ADD COLUMN stopped INTEGER NOT NULL DEFAULT 0"
+                )
+            # Same for session_titles.custom (user-chosen names). Every
+            # title that already exists was auto-generated, so they get 0.
+            title_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(session_titles)")}
+            if "custom" not in title_cols:
+                self._conn.execute(
+                    "ALTER TABLE session_titles ADD COLUMN custom INTEGER NOT NULL DEFAULT 0"
                 )
 
     @contextmanager
@@ -289,6 +300,7 @@ class ChatStore:
             cur.execute("SELECT 1 FROM messages WHERE tab_id = ? LIMIT 1", (tab_id,))
             existed = cur.fetchone() is not None
             cur.execute("DELETE FROM messages WHERE tab_id = ?", (tab_id,))
+            cur.execute("DELETE FROM session_titles WHERE tab_id = ?", (tab_id,))
         return existed
 
     def truncate_from_user_turn(self, tab_id: str, turn_index: int) -> int:
@@ -306,9 +318,10 @@ class ChatStore:
         If turn_index is past the end (e.g. the UI had a message that
         never got stored), nothing is deleted and 0 is returned.
 
-        If this empties the session, its generated title is dropped too,
-        so the Chats list falls back to the first user message and the
-        title can be regenerated from the edited prompt.
+        If this empties the session, its *auto-generated* title is dropped
+        too, so the Chats list falls back to the first user message and the
+        title can be regenerated from the edited prompt. A title the user
+        chose (custom = 1) is kept.
         """
         if turn_index < 0:
             return 0
@@ -332,7 +345,7 @@ class ChatStore:
 
             cur.execute("SELECT 1 FROM messages WHERE tab_id = ? LIMIT 1", (tab_id,))
             if cur.fetchone() is None:
-                cur.execute("DELETE FROM session_titles WHERE tab_id = ?", (tab_id,))
+                cur.execute("DELETE FROM session_titles WHERE tab_id = ? AND custom = 0", (tab_id,))
 
         return deleted
 
@@ -343,12 +356,57 @@ class ChatStore:
         return count
 
     def set_title(self, tab_id: str, title: str) -> None:
-        """Saves a short, relevant title for the session."""
+        """
+        Saves the auto-generated title for the session. If the user has
+        renamed the chat (custom = 1) this is a no-op, so the background
+        title generator can never overwrite a name the user chose.
+        """
         with self._cursor() as cur:
             cur.execute(
-                "INSERT OR REPLACE INTO session_titles (tab_id, title) VALUES (?, ?)",
-                (tab_id, title)
+                "INSERT INTO session_titles (tab_id, title, custom) VALUES (?, ?, 0) "
+                "ON CONFLICT(tab_id) DO UPDATE SET title = excluded.title "
+                "WHERE session_titles.custom = 0",
+                (tab_id, title),
             )
+
+    def get_title(self, tab_id: str) -> str:
+        """The title the Chats list shows: stored title, else first user message."""
+        with self._cursor() as cur:
+            cur.execute("SELECT title FROM session_titles WHERE tab_id = ?", (tab_id,))
+            row = cur.fetchone()
+            if row and row["title"]:
+                return row["title"]
+            cur.execute(
+                "SELECT text FROM messages WHERE tab_id = ? AND role = 'user' "
+                "ORDER BY id ASC LIMIT 1",
+                (tab_id,),
+            )
+            first = cur.fetchone()
+        return first["text"][:120] if first else ""
+
+    def rename_session(self, tab_id: str, title: str) -> str | None:
+        """
+        User-initiated rename. Returns the title now in effect, or None if
+        there is no such session (no messages under this key).
+
+        A non-empty name is stored as custom (protected from the
+        auto-titler and from edit-and-resend). An empty name clears the
+        custom title, falling back to the first user message.
+        """
+        clean = " ".join((title or "").split())[:MAX_TITLE_LEN]
+        with self._cursor() as cur:
+            cur.execute("SELECT 1 FROM messages WHERE tab_id = ? LIMIT 1", (tab_id,))
+            if cur.fetchone() is None:
+                return None
+            if clean:
+                cur.execute(
+                    "INSERT INTO session_titles (tab_id, title, custom) VALUES (?, ?, 1) "
+                    "ON CONFLICT(tab_id) DO UPDATE SET title = excluded.title, custom = 1",
+                    (tab_id, clean),
+                )
+            else:
+                cur.execute("DELETE FROM session_titles WHERE tab_id = ?", (tab_id,))
+        return self.get_title(tab_id)
 
     def list_sessions(self) -> list[dict]:
         """

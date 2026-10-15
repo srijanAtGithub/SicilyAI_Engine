@@ -32,7 +32,8 @@ import configuration
 configuration.load_config()
 
 import structlog
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
 from Navigator.Task_Files.Chat_Section import build_navigator_graph
@@ -291,6 +292,23 @@ async def delete_session(tab_id: str):
     """
     existed = sessions.clear(tab_id)
     return {"status": "cleared", "existed": existed}
+
+
+class RenameSessionRequest(BaseModel):
+    title: str
+
+
+@app.patch("/session/{tab_id}/title")
+async def rename_session(tab_id: str, req: RenameSessionRequest):
+    """
+    User renames a conversation (Chats panel or the chat header). An empty
+    title clears the custom name. The stored name is protected from the
+    background auto-titler. Returns the title now in effect.
+    """
+    title = sessions.rename_session(tab_id, req.title)
+    if title is None:
+        raise HTTPException(status_code=404, detail="No such conversation")
+    return {"status": "renamed", "title": title}
 
 
 @app.delete("/temp_session/{tab_id}")

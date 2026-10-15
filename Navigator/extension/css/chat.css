@@ -1524,3 +1524,56 @@
     margin: 0;
     padding: 0 10px;
 }
+
+
+/* --- Rename chat (Chats list rows + header title) --- */
+.chats-item-rename-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    margin-left: 8px;
+    padding: 0;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: #a1a1aa;
+    cursor: pointer;
+    vertical-align: middle;
+    opacity: 0;
+    transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.chats-item:hover .chats-item-rename-btn,
+.chats-item-rename-btn:focus-visible {
+    opacity: 1;
+}
+
+.chats-item-rename-btn:hover {
+    background: rgba(255, 255, 255, 0.16);
+    color: #f2f2f7;
+}
+
+.rename-input {
+    width: 100%;
+    padding: 3px 8px;
+    border-radius: 7px;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    background: rgba(255, 255, 255, 0.08);
+    color: #f2f2f7;
+    font: inherit;
+    outline: none;
+}
+
+.rename-input:focus {
+    border-color: rgba(255, 255, 255, 0.5);
+    box-shadow: 0 0 10px rgba(255, 255, 255, 0.12);
+}
+
+/* The header title fades out on the right (mask); drop that while editing. */
+.active-chat-title.renaming {
+    -webkit-mask-image: none;
+    mask-image: none;
+    overflow: visible;
+}

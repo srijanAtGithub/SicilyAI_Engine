@@ -254,3 +254,22 @@ export async function fetchAllSessions() {
     return [];
   }
 }
+
+// Renames a conversation. Resolves to the title now in effect (an empty
+// name clears the custom title and falls back to the first message), or
+// null if the rename failed.
+export async function renameSessionOnBackend(sessionKey, title) {
+  try {
+    const res = await fetch(`http://${BACKEND_HOST}/session/${sessionKey}/title`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title }),
+    });
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const data = await res.json();
+    return typeof data.title === "string" ? data.title : title;
+  } catch (err) {
+    console.error("Couldn't rename session:", err);
+    return null;
+  }
+}

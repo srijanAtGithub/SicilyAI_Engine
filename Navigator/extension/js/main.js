@@ -1,6 +1,6 @@
 import { NotificationService } from "./notifications.js";
 import { addMessage, clearMessagesUI, addContextTrail, setSending, sendBtn, appWrap, showEmptyState, messagesEl, setEditHandler, cancelActiveEdit, syncSendBtn } from "./ui.js";
-import { socket, getActiveTabInfo, loadHistory, deleteSessionOnBackend, connectSocket, closeSocket, resolveSessionKey, carrySessionToUrl, startNewSessionForUrl, pinSessionKeyToUrl, fetchAllSessions, BACKEND_HOST } from "./api.js";
+import { socket, getActiveTabInfo, loadHistory, deleteSessionOnBackend, connectSocket, closeSocket, resolveSessionKey, carrySessionToUrl, startNewSessionForUrl, pinSessionKeyToUrl, fetchAllSessions, renameSessionOnBackend, BACKEND_HOST } from "./api.js";
 import { attachedContexts, clearAttachedContexts, currentCapability } from "./features.js";
 import {
   getMentionedTabSnippets, hasMentionedTab, clearMentionedTab, isMentionDropdownOpen,
@@ -33,6 +33,9 @@ async function updateActiveChatTitle() {
     return;
   }
 
+  // Don't clobber the inline rename editor if it's open.
+  if (titleEl.dataset.renaming) return;
+
   try {
     const sessions = await fetchAllSessions();
     const current = sessions.find(s => s.session_key === currentSessionKey);
@@ -45,6 +48,96 @@ async function updateActiveChatTitle() {
   } catch (err) {
     console.error("Failed to update chat title:", err);
   }
+}
+
+// ── Rename chat ───────────────────────────────────────────────────────
+// One inline editor shared by the Chats list rows and the header title.
+// Enter or clicking away saves, Esc cancels. onSave(name) resolves to the
+// title now in effect (shown immediately) or null if it failed (the old
+// text is kept).
+const RENAME_ICON = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" width="12" height="12">
+  <path d="M12 20h9" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`;
+
+function startInlineRename(host, currentText, onSave) {
+  if (host.dataset.renaming) return;
+  host.dataset.renaming = "1";
+  host.classList.add("renaming");
+
+  const original = (currentText || "").trim();
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "rename-input";
+  input.maxLength = 80;
+  input.value = original;
+  input.placeholder = "Name this chat";
+
+  host.textContent = "";
+  host.appendChild(input);
+  input.focus();
+  input.select();
+
+  // Don't let clicks/typing inside the editor reach the row (which would
+  // switch to that conversation) or other panel handlers.
+  for (const type of ["click", "dblclick", "mousedown"]) {
+    input.addEventListener(type, (e) => e.stopPropagation());
+  }
+
+  let finished = false;
+  const finish = async (save) => {
+    if (finished) return;
+    finished = true;
+
+    const next = input.value.trim();
+    host.classList.remove("renaming");
+    delete host.dataset.renaming;
+    host.textContent = original;
+
+    if (!save || next === original) return;
+
+    const result = await onSave(next);
+    if (result !== null && result !== undefined) host.textContent = result;
+  };
+
+  input.addEventListener("keydown", (e) => {
+    e.stopPropagation();
+    if (e.key === "Enter") {
+      e.preventDefault();
+      finish(true);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      finish(false);
+    }
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+
+async function renameSession(sessionKey, name) {
+  const result = await renameSessionOnBackend(sessionKey, name);
+  if (result === null) {
+    NotificationService.show("Couldn't rename this conversation.");
+    return null;
+  }
+  if (sessionKey === currentSessionKey) updateActiveChatTitle();
+  return result || "New Conversation";
+}
+
+// Double-click the title at the top of the chat to rename it.
+const headerTitleEl = document.getElementById("active-chat-title");
+if (headerTitleEl) {
+  headerTitleEl.title = "Double-click to rename";
+  headerTitleEl.addEventListener("dblclick", () => {
+    if (typeof isTempMode !== "undefined" && isTempMode) return;
+    if (!messagesEl.querySelector(".msg.user, .msg.ai")) {
+      NotificationService.show("Send a message first, then you can name this chat.");
+      return;
+    }
+    window.getSelection()?.removeAllRanges();
+    startInlineRename(headerTitleEl, headerTitleEl.textContent, (name) =>
+      renameSession(currentSessionKey, name)
+    );
+  });
 }
 
 window.addEventListener("chat-turn-complete", () => {
@@ -324,6 +417,20 @@ async function populateChatsPanel() {
     timeSpan.textContent = formatTimeAgo(s.last_active);
 
     meta.appendChild(timeSpan);
+
+    // Hover-reveal rename pencil: turns this row's title into an editor.
+    const renameBtn = document.createElement("button");
+    renameBtn.className = "chats-item-rename-btn";
+    renameBtn.type = "button";
+    renameBtn.title = "Rename conversation";
+    renameBtn.innerHTML = RENAME_ICON;
+    renameBtn.addEventListener("click", (e) => {
+      e.stopPropagation(); // don't switch to this conversation
+      startInlineRename(preview, preview.textContent, (name) =>
+        renameSession(s.session_key, name)
+      );
+    });
+    meta.appendChild(renameBtn);
 
     item.appendChild(preview);
     item.appendChild(meta);
