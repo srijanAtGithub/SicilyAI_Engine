@@ -459,14 +459,23 @@ async function startOrganiseTabs(includeGrouped) {
 
   try {
     const tabs = await chrome.tabs.query({ currentWindow: true });
-    let filteredTabs = tabs;
+    const NO_GROUP = chrome.tabGroups ? chrome.tabGroups.TAB_GROUP_ID_NONE : -1;
+
+    // Pinned tabs are never grouped — chrome.tabs.group() would silently unpin them.
+    let filteredTabs = tabs.filter(tab => !tab.pinned);
+    const pinnedCount = tabs.length - filteredTabs.length;
+
     if (!includeGrouped) {
-      filteredTabs = tabs.filter(tab => tab.groupId === -1 || tab.groupId === (chrome.tabGroups ? chrome.tabGroups.TAB_GROUP_ID_NONE : -1));
+      filteredTabs = filteredTabs.filter(tab => tab.groupId === NO_GROUP);
     }
 
     if (filteredTabs.length === 0) {
       appWrap.classList.remove("busy");
-      NotificationService.show("No tabs found that need organising.");
+      NotificationService.show(
+        pinnedCount > 0
+          ? "No unpinned tabs found that need organising."
+          : "No tabs found that need organising."
+      );
       return;
     }
 
@@ -474,7 +483,8 @@ async function startOrganiseTabs(includeGrouped) {
       id: tab.id,
       title: tab.title || "",
       url: tab.url || "",
-      groupId: tab.groupId
+      groupId: tab.groupId,
+      pinned: !!tab.pinned
     }));
 
     const response = await fetch(`http://${BACKEND_HOST}/organise-tabs`, {
@@ -487,23 +497,33 @@ async function startOrganiseTabs(includeGrouped) {
 
     const data = await response.json();
 
+    // Defensive: only ever group IDs we actually sent (i.e. unpinned tabs).
+    const allowedIds = new Set(filteredTabs.map(t => t.id));
+
     if (data.groups && data.groups.length > 0) {
+      let createdCount = 0;
       for (const groupPlan of data.groups) {
-        const { title, color, tab_ids } = groupPlan;
-        if (tab_ids && tab_ids.length > 0) {
+        const { title, color } = groupPlan;
+        const tab_ids = (groupPlan.tab_ids || []).filter(id => allowedIds.has(id));
+        if (tab_ids.length > 0) {
           try {
             const groupId = await chrome.tabs.group({ tabIds: tab_ids });
             await chrome.tabGroups.update(groupId, {
               title: title,
               color: color
             });
+            createdCount++;
           } catch (groupError) {
             console.warn("Failed to complete an individual tab group structure", groupError);
           }
         }
       }
       appWrap.classList.remove("busy");
-      NotificationService.show(`Successfully organised tabs into ${data.groups.length} groups!`);
+      NotificationService.show(
+        createdCount > 0
+          ? `Successfully organised tabs into ${createdCount} groups!`
+          : "No valid groupings could be applied."
+      );
     } else {
       appWrap.classList.remove("busy");
       NotificationService.show("FastAPI LLM suggested no groupings.");
