@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS site_themes (
     fingerprint    TEXT NOT NULL DEFAULT '',
     notes          TEXT NOT NULL DEFAULT '',
     source         TEXT NOT NULL DEFAULT 'ai',
+    params_json    TEXT NOT NULL DEFAULT '{}',
     created_at     REAL NOT NULL,
     updated_at     REAL NOT NULL
 )
@@ -43,6 +44,10 @@ class ThemeStore:
         self._lock = threading.Lock()
         with self._conn() as conn:
             conn.execute(_SCHEMA)
+            # Older databases predate the params column.
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(site_themes)")}
+            if "params_json" not in cols:
+                conn.execute("ALTER TABLE site_themes ADD COLUMN params_json TEXT NOT NULL DEFAULT '{}'")
             conn.commit()
 
     def _conn(self):
@@ -61,6 +66,7 @@ class ThemeStore:
             "fingerprint": row["fingerprint"],
             "notes": row["notes"],
             "source": row["source"],
+            "params": json.loads(row["params_json"] or "{}"),
             "updated_at": row["updated_at"],
         }
 
@@ -81,8 +87,8 @@ class ThemeStore:
                 """
                 INSERT INTO site_themes
                     (host, enabled, original_mode, target_mode, anchors_json,
-                     fingerprint, notes, source, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     fingerprint, notes, source, params_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(host) DO UPDATE SET
                     enabled       = excluded.enabled,
                     original_mode = excluded.original_mode,
@@ -91,6 +97,7 @@ class ThemeStore:
                     fingerprint   = excluded.fingerprint,
                     notes         = excluded.notes,
                     source        = excluded.source,
+                    params_json   = excluded.params_json,
                     updated_at    = excluded.updated_at
                 """,
                 (
@@ -102,6 +109,7 @@ class ThemeStore:
                     record.get("fingerprint", ""),
                     record.get("notes", ""),
                     record.get("source", "ai"),
+                    json.dumps(record.get("params", {})),
                     now,
                     record.get("updated_at") or now,
                 ),

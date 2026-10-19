@@ -1,23 +1,24 @@
 """
 Site_Theme.py
 -------------
-AI Site Themes: turn a light site dark while keeping its colour identity.
+AI dark themes for light websites.
 
-Division of labour:
-  - theme_engine.js measures the rendered page locally and sends only a
-    compact palette summary: clustered colours, how much background
-    area / text / border each covers, surface depth, and which text
-    colours sit on which backgrounds. No page content leaves the browser.
-  - The smart model (navigator_smart_llm) designs the new palette:
-    roles, mood, brand feel.
-  - validate_design() then enforces the hard rules (mode sanity, text
-    contrast, surface separation) so a bad model call can never make a
-    site unreadable. If the model call fails entirely, a role-aware
-    OKLCH remap stands in, so the user still gets a usable theme.
-  - The result is stored per hostname in ThemeStore (SQLite).
+Design: colour fundamentals in code, AI only for taste.
+  - theme_engine.js measures the rendered page locally and sends a compact
+    palette summary (clustered colours, their background / text / border
+    share, surface depth, text-on-background pairs). No page content.
+  - A fixed dark-mode ladder (the same structure standard design systems
+    use) maps every colour by its role and lightness: page and raised
+    surfaces, primary / secondary / disabled text, subtle borders, and
+    accents that keep their hue. This guarantees depth and contrast on
+    every site.
+  - The smart model makes only the taste decisions: which brand hue (if
+    any) faintly tints the dark surfaces, how strongly, and how deep the
+    page sits within a safe range. ~20 output tokens, low reasoning effort.
+  - validate() then enforces text contrast and surface separation.
+  - Results are stored per hostname in ThemeStore (SQLite).
 """
 
-import json
 import math
 import re
 import time
@@ -73,12 +74,20 @@ class ThemeAnchor(BaseModel):
     share: float = 0.0
 
 
+class ThemeParams(BaseModel):
+    """The model's whole answer — the three taste decisions."""
+    hue: Optional[float] = Field(description="OKLCH hue (0-360) of the brand colour that faintly tints dark surfaces, or null for neutral grey")
+    tint: float = Field(description="Tint chroma, 0 to 0.02")
+    page: float = Field(description="Page surface OKLCH lightness, 0.12 to 0.18")
+
+
 class ThemeRecord(BaseModel):
     host: str
     enabled: bool
     original_mode: Mode
     target_mode: Mode
     anchors: list[ThemeAnchor]
+    params: dict = {}
     fingerprint: str = ""
     notes: str = ""
     source: Literal["ai", "fallback"] = "ai"
@@ -87,22 +96,6 @@ class ThemeRecord(BaseModel):
 
 class ListThemesResponse(BaseModel):
     themes: list[ThemeRecord]
-
-
-# ── LLM OUTPUT SCHEMA ───────────────────────────────────────────────────
-# Every field required-but-nullable so it stays valid under strict
-# structured output.
-
-class ColorAssignment(BaseModel):
-    id: str = Field(description="Palette colour id, exactly as given")
-    as_background: Optional[str] = Field(description="New #rrggbb when this colour is used as a background, else null")
-    as_text: Optional[str] = Field(description="New #rrggbb when this colour is used as text, else null")
-    as_border: Optional[str] = Field(description="New #rrggbb when this colour is used as a border, else null")
-
-
-class ThemeDesign(BaseModel):
-    assignments: list[ColorAssignment]
-    notes: str = Field(description="One or two sentences on the main design choices")
 
 
 # ── COLOUR MATHS (sRGB <-> OKLab / OKLCH, WCAG contrast) ────────────────
@@ -213,89 +206,88 @@ def contrast(h1: str, h2: str) -> float:
     hi, lo = max(a, b), min(a, b)
     return (hi + 0.05) / (lo + 0.05)
 
+# ── THE DARK LADDER ─────────────────────────────────────────────────────
+# Mirrors ladder() in theme_engine.js — keep the two in sync.
 
-# ── ALGORITHMIC REMAP ───────────────────────────────────────────────────
-# Mirrors algorithmic() in theme_engine.js — keep the two in sync. Used to
-# fill anything the model left out, to replace obviously wrong values,
-# and as the whole palette if the model call fails.
+DEFAULT_PARAMS = {"hue": None, "tint": 0.0, "page": 0.16}
 
-def algorithmic_map(hex_value: str, role: str) -> str:
-    """Role-aware light -> dark remap that keeps hue."""
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def clean_params(p: ThemeParams | dict | None) -> dict:
+    """Clamp whatever the model said into the safe ranges."""
+    if p is None:
+        return dict(DEFAULT_PARAMS)
+    d = p.model_dump() if isinstance(p, BaseModel) else dict(p)
+    hue = d.get("hue")
+    return {
+        "hue": None if hue is None else float(hue) % 360,
+        "tint": round(_clamp(float(d.get("tint") or 0), 0.0, 0.02), 4),
+        "page": round(_clamp(float(d.get("page") or DEFAULT_PARAMS["page"]), 0.12, 0.18), 4),
+    }
+
+
+def ladder(hex_value: str, role: str, p: dict) -> str:
+    """
+    Light-theme colour -> dark-theme colour, by role and lightness.
+      surfaces: white -> page; light greys -> raised steps above the page
+      text:     near-black -> primary (L ~.9); greys -> secondary; light stays light
+      borders:  light lines -> subtle lines just above the page
+      accents:  keep hue and chroma; lightness clamped to readable ranges
+    Neutrals take the brand tint; softly tinted colours keep their own hue.
+    """
     L, C, H = hex_to_oklch(hex_value)
+    page, tint, th = p["page"], p["tint"], p["hue"]
     accent = C > 0.08
+    tinted = 0.02 < C <= 0.08
+
+    def tone(lo: float, own_c: float) -> str:
+        if tinted:
+            return oklch_to_hex(lo, own_c, H)
+        if th is None or tint <= 0:
+            return oklch_to_hex(lo, 0, H)
+        return oklch_to_hex(lo, tint, th)
+
     if role == "bg":
         if accent:
-            return oklch_to_hex(min(L, 0.62), C * 0.9, H)
-        if L >= 0.5:
-            return oklch_to_hex(0.16 + (1 - L) * 0.22, min(C, 0.025), H)
-        return oklch_to_hex(L, C, H)
+            return oklch_to_hex(_clamp(L, 0.42, 0.58), C * 0.9, H)
+        if L >= 0.75:
+            lo = page + (1 - L) / 0.25 * 0.12
+        elif L >= 0.5:
+            lo = page + 0.12 + (0.75 - L) * 0.4
+        else:
+            lo = _clamp(L, page - 0.03, page + 0.06)
+        return tone(lo, min(C * 0.6, 0.04))
+
     if role == "text":
         if accent:
-            return oklch_to_hex(max(L, 0.72), C, H)
-        if L < 0.6:
-            return oklch_to_hex(0.95 - L * 0.45, min(C, 0.03), H)
-        return oklch_to_hex(L, C, H)
+            return oklch_to_hex(_clamp(L, 0.72, 0.85), C, H)
+        lo = 0.94 - ((L / 0.65) ** 1.5) * 0.26 if L < 0.65 else L
+        return tone(min(lo, 0.96), min(C, 0.04))
+
     if accent:
-        return oklch_to_hex(max(L, 0.6), C, H)
-    if L >= 0.5:
-        return oklch_to_hex(0.30 + (1 - L) * 0.25, min(C, 0.03), H)
-    return oklch_to_hex(L, C, H)
+        return oklch_to_hex(_clamp(L, 0.55, 0.7), C, H)
+    lo = page + 0.10 + (1 - L) * 0.3 if L >= 0.6 else 0.42
+    return tone(lo, min(C, 0.04))
 
 
 # ── PROMPT ──────────────────────────────────────────────────────────────
 
-_DARK_RULES = """\
-- Large surfaces (high bg_share) become calm, deep, low-chroma tones, OKLCH L ≈ 0.14–0.22. Never pure #000000. A faint tint (chroma ≤ 0.02) of the site's brand hue is welcome when it suits the site.
-- Preserve elevation: surfaces at greater depth (cards, popovers, inputs) are slightly LIGHTER than the surface beneath them (ΔL ≈ 0.03–0.06) — that is how good dark UIs show elevation.
-- Body text becomes light but not pure white (L ≈ 0.88–0.94). Secondary / muted text stays visibly secondary (L ≈ 0.68–0.78). Keep the original hierarchy between text colours.
-- Accent and brand colours (chroma above ~0.08) keep their hue. Change lightness only as much as needed: accent text and links usually brighten a little (L ≈ 0.70–0.80) to read on dark surfaces; accent backgrounds (buttons, badges, highlights) keep roughly their lightness so the text on them still works.
-- Neutral borders and dividers become subtle — a little lighter than the surface they sit on (L ≈ 0.28–0.36).
-- Status colours (red, green, amber, blue info) stay recognisable."""
-
-def _system_prompt() -> str:
-    rules = _DARK_RULES
-    return f"""You are a senior UI colour designer. You convert a website's colour palette from light mode to dark mode while keeping the site's identity — its brand hues, its accent colours, its sense of hierarchy — so it still clearly feels like the same website, just in dark mode.
-
-You receive the site's measured palette. Each colour has an id, its hex, its OKLCH values [L, C, H°], and how it is used:
-- bg_share: fraction of the painted background area it covers
-- text_share: fraction of the page's text (weighted by length × font size) drawn in it
-- border_share: fraction of border length drawn in it
-- depth: surface nesting level (0 = page, 1 = a section or card on the page, 2 = something on a card, ...)
-You also get pairs: which text colour sits on which background colour, and how much of the page's text that pair accounts for.
-
-For every colour, return a new #rrggbb for each way it is used: as_background if bg_share > 0, as_text if text_share > 0, as_border if border_share > 0, and null otherwise. One original colour can need different values per use — white as the page background becomes a deep surface, while white text on a blue button stays near-white.
-
-Design rules for dark mode:
-{rules}
-
-General rules:
-- Every text/background pair must stay comfortably readable: WCAG contrast ≥ 4.5:1 everywhere, ≥ 7:1 for the dominant body-text pair.
-- Colours that were clearly distinguishable must stay distinguishable.
-- Keep the mood. A warm, cream-toned site should feel warm in dark mode; a cool corporate blue site should feel cool.
-- Hex only, format #rrggbb. Include every id exactly once."""
+_SYSTEM = """You choose dark-theme parameters for a website from its colours. Reply with JSON only.
+hue: OKLCH hue (0-360) of the site's brand colour, used to faintly tint dark surfaces; null for plain grey (monochrome sites, or red/orange/yellow brands, where tinted dark surfaces look muddy).
+tint: tint strength 0-0.02 (0.006-0.012 typical; 0 if hue is null).
+page: page surface lightness 0.12-0.18 (0.13 crisp and high-contrast for tools and apps; 0.16-0.18 softer for reading sites)."""
 
 
-def _human_prompt(req: GenerateThemeRequest) -> str:
-    palette = []
-    for p in req.palette:
+def _user_prompt(req: GenerateThemeRequest) -> str:
+    rows = []
+    for p in sorted(req.palette, key=lambda c: -(c.bg_share + c.text_share + c.border_share))[:10]:
+        use = max(("bg", p.bg_share), ("text", p.text_share), ("border", p.border_share), key=lambda x: x[1])
         L, C, H = hex_to_oklch(p.hex)
-        palette.append({
-            "id": p.id,
-            "hex": normalize_hex(p.hex),
-            "oklch": [round(L, 3), round(C, 3), round(H)],
-            "bg_share": round(p.bg_share, 4),
-            "text_share": round(p.text_share, 4),
-            "border_share": round(p.border_share, 4),
-            "depth": p.depth,
-        })
-    pairs = [{"text": x.fg, "on": x.bg, "share": round(x.share, 4)} for x in req.pairs]
-    payload = {
-        "site": req.host,
-        "title": req.title[:120],
-        "palette": palette,
-        "pairs": pairs,
-    }
-    return json.dumps(payload, ensure_ascii=False)
+        rows.append(f"{normalize_hex(p.hex)} {use[0]} {use[1]:.2f} h{round(H)} c{C:.2f}")
+    return f"{req.host}\n" + "\n".join(rows)
 
 
 # ── VALIDATION ──────────────────────────────────────────────────────────
@@ -304,46 +296,22 @@ def _share(p: PaletteColor, role: str) -> float:
     return getattr(p, f"{role}_share")
 
 
-def validate_design(
-    req: GenerateThemeRequest, design: ThemeDesign | None
-) -> tuple[dict[tuple[str, str], str], int, int]:
+def validate(req: GenerateThemeRequest, params: dict) -> tuple[dict[tuple[str, str], str], int]:
     """
-    Turns the model's proposal into a safe (palette_id, role) -> hex map.
-    Returns (mapping, fixes_applied, values_filled_algorithmically).
+    Ladder-maps every measured colour, then enforces the hard rules:
+    distinct surfaces stay distinct (deeper = lighter) and every measured
+    text/background pair stays readable. Returns (mapping, fixes).
     """
-    proposed = {}
-    if design:
-        for a in design.assignments:
-            proposed[a.id] = a
-
     mapping: dict[tuple[str, str], str] = {}
-    filled = 0
-    fields = {"bg": "as_background", "text": "as_text", "border": "as_border"}
-
     for p in req.palette:
-        a = proposed.get(p.id)
         for role in ROLES:
-            val = normalize_hex(getattr(a, fields[role])) if a else None
-            if _share(p, role) <= 0 and val is None:
-                continue
-            if val is None:
-                val = algorithmic_map(p.hex, role)
-                filled += 1
-            mapping[(p.id, role)] = val
+            if _share(p, role) > 0:
+                mapping[(p.id, role)] = ladder(p.hex, role, params)
 
     fixes = 0
 
-    # 1. Mode sanity: big surfaces must actually be dark.
-    for p in req.palette:
-        key = (p.id, "bg")
-        if p.bg_share >= 0.05 and key in mapping:
-            L = hex_to_oklch(mapping[key])[0]
-            if L > 0.42:
-                mapping[key] = algorithmic_map(p.hex, "bg")
-                fixes += 1
-
-    # 2. Surfaces that were distinct stay distinct; deeper ones lighter.
-    bgs = [p for p in req.palette if (p.id, "bg") in mapping and p.bg_share > 0]
+    # 1. Surfaces that were distinct stay distinct; deeper ones lighter.
+    bgs = [p for p in req.palette if (p.id, "bg") in mapping]
     if bgs:
         base = max(bgs, key=lambda p: p.bg_share)
         base_new = mapping[(base.id, "bg")]
@@ -351,9 +319,8 @@ def validate_design(
         for p in bgs:
             if p.id == base.id or p.bg_share < 0.005:
                 continue
-            # Light UIs separate surfaces by tiny steps (#fff page vs
-            # #fafafa / #f6f9fc cards ≈ 0.015–0.02 apart), so only treat
-            # colours under 0.008 apart as "the same surface".
+            # Light UIs separate surfaces by tiny steps (#fff vs #fafafa),
+            # so only colours under 0.008 apart count as the same surface.
             if ok_distance(p.hex, base.hex) < 0.008:
                 continue
             new = mapping[(p.id, "bg")]
@@ -364,7 +331,9 @@ def validate_design(
             mapping[(p.id, "bg")] = oklch_to_hex(base_L + step, C, H)
             fixes += 1
 
-    # 3. Contrast for every measured text/background pair.
+    # 2. Contrast for every measured text/background pair. Text moves away
+    #    from its background on its own side (light text stays light); if
+    #    it runs out of room, the background moves the other way instead.
     pairs = sorted(req.pairs, key=lambda x: -x.share)
     body = pairs[0] if pairs else None
     for _ in range(3):
@@ -377,24 +346,39 @@ def validate_design(
             fg, bg = mapping[fk], mapping[bk]
             if contrast(fg, bg) >= need:
                 continue
-            L, C, H = hex_to_oklch(fg)
-            step = 0.02 if hex_to_oklch(bg)[0] < 0.5 else -0.02
-            new = fg
-            for _ in range(50):
-                L += step
-                if L < 0 or L > 1:
-                    break
-                new = oklch_to_hex(L, C, H)
-                if contrast(new, bg) >= need:
-                    break
-            if new != fg:
-                mapping[fk] = new
-                fixes += 1
-                changed = True
+            new_fg, new_bg = _separate(fg, bg, need)
+            if new_fg != fg:
+                mapping[fk] = new_fg
+            if new_bg != bg:
+                mapping[bk] = new_bg
+            fixes += 1
+            changed = True
         if not changed:
             break
 
-    return mapping, fixes, filled
+    return mapping, fixes
+
+
+def _separate(fg: str, bg: str, need: float) -> tuple[str, str]:
+    """Push fg away from bg (fg keeps its side); then bg, if fg hit the limit."""
+    fL, fC, fH = hex_to_oklch(fg)
+    bL, bC, bH = hex_to_oklch(bg)
+    up = fL >= bL
+    for _ in range(50):
+        if contrast(fg, bg) >= need:
+            return fg, bg
+        if (up and fL >= 1) or (not up and fL <= 0):
+            break
+        fL = _clamp(fL + (0.02 if up else -0.02), 0, 1)
+        fg = oklch_to_hex(fL, fC, fH)
+    for _ in range(50):
+        if contrast(fg, bg) >= need:
+            break
+        bL = _clamp(bL + (-0.02 if up else 0.02), 0, 1)
+        bg = oklch_to_hex(bL, bC, bH)
+        if bL in (0, 1):
+            break
+    return fg, bg
 
 
 def _anchors(req: GenerateThemeRequest, mapping: dict) -> list[ThemeAnchor]:
@@ -405,10 +389,7 @@ def _anchors(req: GenerateThemeRequest, mapping: dict) -> list[ThemeAnchor]:
             continue
         for role in ROLES:
             if (p.id, role) in mapping:
-                anchors.append(ThemeAnchor(
-                    role=role, src=src, dst=mapping[(p.id, role)],
-                    share=round(_share(p, role), 4),
-                ))
+                anchors.append(ThemeAnchor(role=role, src=src, dst=mapping[(p.id, role)], share=round(_share(p, role), 4)))
     return anchors
 
 
@@ -438,33 +419,25 @@ async def process_generate_theme(req: GenerateThemeRequest) -> ThemeRecord:
         raise ValueError("Missing host")
     if not req.palette:
         raise ValueError("Empty palette — nothing to theme")
-
     if req.detected_mode == "dark":
         raise ValueError("This site is already dark")
 
-    design: ThemeDesign | None = None
-    source = "ai"
-    notes = ""
     started = time.time()
-
+    source = "ai"
+    params = None
     try:
-        llm = configuration.navigator_smart_llm().with_structured_output(ThemeDesign, include_raw=True)
-        result = await llm.ainvoke([
-            SystemMessage(content=_system_prompt()),
-            HumanMessage(content=_human_prompt(req)),
-        ])
+        llm = configuration.navigator_smart_llm(reasoning_effort="low").with_structured_output(ThemeParams, include_raw=True)
+        result = await llm.ainvoke([SystemMessage(content=_SYSTEM), HumanMessage(content=_user_prompt(req))])
         _record_usage(result.get("raw"), host)
-        design = result.get("parsed")
-        if design is None:
-            raise ValueError(f"Unparseable design: {result.get('parsing_error')}")
-        notes = design.notes.strip()
+        params = result.get("parsed")
+        if params is None:
+            raise ValueError(f"Unparseable params: {result.get('parsing_error')}")
     except Exception as e:
-        log.warning("Site theme fell back to algorithmic palette", host=host, error=str(e))
-        design = None
+        log.warning("Site theme fell back to default parameters", host=host, error=str(e))
         source = "fallback"
-        notes = "Generated without AI because the model call failed."
 
-    mapping, fixes, filled = validate_design(req, design)
+    params = clean_params(params)
+    mapping, fixes = validate(req, params)
 
     record = ThemeRecord(
         host=host,
@@ -472,18 +445,15 @@ async def process_generate_theme(req: GenerateThemeRequest) -> ThemeRecord:
         original_mode="light",
         target_mode="dark",
         anchors=_anchors(req, mapping),
+        params=params,
         fingerprint=req.fingerprint,
-        notes=notes,
         source=source,
         updated_at=time.time(),
     )
     store.upsert(record.model_dump())
 
-    log.info(
-        "Site theme generated", host=host,
-        source=source, palette_size=len(req.palette), pairs=len(req.pairs),
-        fixes=fixes, filled=filled, seconds=round(time.time() - started, 1),
-    )
+    log.info("Site theme generated", host=host, source=source, params=params,
+             palette_size=len(req.palette), fixes=fixes, seconds=round(time.time() - started, 1))
     return record
 
 

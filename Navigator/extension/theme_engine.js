@@ -214,24 +214,37 @@
   // 2. The mapper: (colour, role) -> themed colour
   // ══════════════════════════════════════════════════════════════════
 
-  // Mirrors algorithmic_map() in Site_Theme.py — keep the two in sync.
-  // Role-aware light -> dark remap that keeps hue. Mirrors
-  // algorithmic_map() in Site_Theme.py — keep the two in sync.
-  function algorithmic({ L, C, H }, role) {
+  // The dark ladder: light-theme colour -> dark-theme colour by role and
+  // lightness, shaped by the theme's three params (brand tint hue, tint
+  // strength, page depth). Mirrors ladder() in Site_Theme.py — keep the
+  // two in sync.
+  const DEFAULT_PARAMS = { hue: null, tint: 0, page: 0.16 };
+
+  function ladder({ L, C, H }, role, p) {
+    const { page, tint, hue: th } = p;
     const accent = C > 0.08;
+    const tinted = C > 0.02 && C <= 0.08;
+    const tone = (lo, ownC) =>
+      tinted ? { L: lo, C: ownC, H }
+        : (th == null || tint <= 0) ? { L: lo, C: 0, H }
+          : { L: lo, C: tint, H: th };
+
     if (role === "bg") {
-      if (accent) return { L: Math.min(L, 0.62), C: C * 0.9, H };
-      if (L >= 0.5) return { L: 0.16 + (1 - L) * 0.22, C: Math.min(C, 0.025), H };
-      return { L, C, H };
+      if (accent) return { L: clamp(L, 0.42, 0.58), C: C * 0.9, H };
+      let lo;
+      if (L >= 0.75) lo = page + ((1 - L) / 0.25) * 0.12;
+      else if (L >= 0.5) lo = page + 0.12 + (0.75 - L) * 0.4;
+      else lo = clamp(L, page - 0.03, page + 0.06);
+      return tone(lo, Math.min(C * 0.6, 0.04));
     }
     if (role === "text") {
-      if (accent) return { L: Math.max(L, 0.72), C, H };
-      if (L < 0.6) return { L: 0.95 - L * 0.45, C: Math.min(C, 0.03), H };
-      return { L, C, H };
+      if (accent) return { L: clamp(L, 0.72, 0.85), C, H };
+      const lo = L < 0.65 ? 0.94 - ((L / 0.65) ** 1.5) * 0.26 : L;
+      return tone(Math.min(lo, 0.96), Math.min(C, 0.04));
     }
-    if (accent) return { L: Math.max(L, 0.6), C, H };
-    if (L >= 0.5) return { L: 0.30 + (1 - L) * 0.25, C: Math.min(C, 0.03), H };
-    return { L, C, H };
+    if (accent) return { L: clamp(L, 0.55, 0.7), C, H };
+    const lo = L >= 0.6 ? page + 0.10 + (1 - L) * 0.3 : 0.42;
+    return tone(lo, Math.min(C, 0.04));
   }
 
   const hueDelta = (a, b) => ((a - b + 540) % 360) - 180;
@@ -244,15 +257,17 @@
     const L = dst.L + (lch.L - src.L) * (inverted ? -1 : 1);
     const C = Math.max(0, dst.C + (lch.C - src.C));
     let H;
-    if (src.C < 0.02 || dst.C < 0.02) H = dst.C < 0.02 ? lch.H : dst.H;
+    // Greys have no meaningful hue: follow the theme's (tinted) hue unless
+    // the target is truly colourless.
+    if (src.C < 0.02 || dst.C < 0.02) H = dst.C < 0.005 ? lch.H : dst.H;
     else H = (dst.H + hueDelta(lch.H, src.H) + 360) % 360;
     return { L, C, H };
   }
 
   function mixLch(a, b, t) {
     let H;
-    if (a.C < 0.02) H = b.H;
-    else if (b.C < 0.02) H = a.H;
+    if (a.C < 0.005) H = b.H;
+    else if (b.C < 0.005) H = a.H;
     else H = (a.H + hueDelta(b.H, a.H) * t + 360) % 360;
     return { L: a.L + (b.L - a.L) * t, C: a.C + (b.C - a.C) * t, H };
   }
@@ -272,6 +287,7 @@
 
   function makeMapper(record) {
     const target = "dark";
+    const params = { ...DEFAULT_PARAMS, ...(record.params || {}) };
     const anchors = { bg: [], text: [], border: [] };
     let pageBg = null, pageBgShare = -1;
     let pageText = null, pageTextShare = -1;
@@ -298,7 +314,7 @@
     function mapRgb(rgb, role) {
       const lab = rgbToOklab(rgb);
       const lch = labToLch(lab);
-      const algo = algorithmic(lch, role);
+      const algo = ladder(lch, role, params);
       let best = null, bestD = Infinity;
       for (const a of anchors[role] || []) {
         const d = okDist(lab, a.srcLab);
@@ -391,8 +407,19 @@
       css: (m) =>
         `canvas.kix-canvas-tile-content{filter:invert(0.9) hue-rotate(180deg)!important}` +
         `.kix-cursor-caret{border-color:${m.pageText}!important}`,
+      // Painted deliberately above — the safety net must leave it alone.
+      keep: ".kix-cursor-caret",
     },
   ];
+
+  // Elements an adapter styles on purpose; the safety net skips them.
+  function adapterKeepSelector() {
+    const sel = [];
+    for (const a of SITE_ADAPTERS) {
+      try { if (a.keep && a.matches()) sel.push(a.keep); } catch (_) { /* ignore */ }
+    }
+    return sel.join(",");
+  }
 
   function adapterCss() {
     if (!mapper) return "";
@@ -582,8 +609,8 @@
 
   function allSheets() {
     const list = [];
-    try { for (const s of document.styleSheets) list.push(s); } catch (_) {}
-    try { for (const s of document.adoptedStyleSheets || []) list.push(s); } catch (_) {}
+    try { for (const s of document.styleSheets) list.push(s); } catch (_) { }
+    try { for (const s of document.adoptedStyleSheets || []) list.push(s); } catch (_) { }
     return list;
   }
 
@@ -841,8 +868,10 @@
 
   function fixTree(root, parentBg) {
     let count = 0;
+    const keep = adapterKeepSelector();
     const visit = (el, under) => {
       if (count++ > NET_MAX || NET_SKIP.has(el.tagName) || el.id === STYLE_ID) return;
+      if (keep && el.matches(keep)) return;
       const cs = getComputedStyle(el);
       if (cs.display === "none") return;
 
@@ -975,7 +1004,7 @@
     let sig = 0, n = 0;
     for (const s of allSheets()) {
       n++;
-      try { sig += s.cssRules ? s.cssRules.length : 0; } catch (_) {}
+      try { sig += s.cssRules ? s.cssRules.length : 0; } catch (_) { }
     }
     return n + ":" + sig;
   }
@@ -1283,8 +1312,8 @@
   };
 
   function teardown() {
-    try { chrome.storage.onChanged.removeListener(onStorageChanged); } catch (_) {}
-    try { chrome.runtime.onMessage.removeListener(onMessage); } catch (_) {}
+    try { chrome.storage.onChanged.removeListener(onStorageChanged); } catch (_) { }
+    try { chrome.runtime.onMessage.removeListener(onMessage); } catch (_) { }
     disable();
   }
 
