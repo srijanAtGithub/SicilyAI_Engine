@@ -259,28 +259,37 @@ body {
     animation: qaItemIn 0.36s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
 
-#quick-actions.open .qa-item:nth-child(1) {
+/* Staggered entrance, keyed by action so it never depends on menu position. */
+#quick-actions.open .qa-item[data-action="summarise-page"] {
     animation-delay: 0.03s;
 }
 
-#quick-actions.open .qa-item:nth-child(2) {
+#quick-actions.open .qa-item[data-action="organise-tabs"] {
     animation-delay: 0.07s;
 }
 
-#quick-actions.open .qa-item:nth-child(3) {
+#quick-actions.open .qa-item[data-action="find-more-like-this"] {
     animation-delay: 0.11s;
 }
 
-#quick-actions.open .qa-item:nth-child(5) {
+#quick-actions.open .qa-item[data-action="reading-list-groups"] {
     animation-delay: 0.15s;
 }
 
-#quick-actions.open .qa-item:nth-child(6) {
+#quick-actions.open .qa-item[data-action="saved-collections"] {
     animation-delay: 0.19s;
 }
 
-#quick-actions.open .qa-item:nth-child(8) {
+#quick-actions.open .qa-item[data-action="site-theme"] {
     animation-delay: 0.23s;
+}
+
+#quick-actions.open .qa-item[data-action="font-size"] {
+    animation-delay: 0.27s;
+}
+
+#quick-actions.open .qa-item[data-action="capability"] {
+    animation-delay: 0.31s;
 }
 
 @keyframes qaItemIn {

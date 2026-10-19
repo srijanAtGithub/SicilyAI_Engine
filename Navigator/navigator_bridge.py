@@ -67,6 +67,15 @@ from Navigator.Task_Files.Reading_List_Groups import (
     process_delete_reading_list_group,
     process_delete_reading_list_item,
 )
+from Navigator.Task_Files.Site_Theme import (
+    GenerateThemeRequest,
+    ThemeRecord,
+    ListThemesResponse,
+    process_generate_theme,
+    process_get_theme,
+    process_list_themes,
+    process_delete_theme,
+)
 
 log = structlog.get_logger()
 
@@ -175,6 +184,35 @@ async def set_reading_list_item_read(item_id: int, req: SetReadRequest):
     except ValueError as e:
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail=str(e))
+
+# ── Site Themes ──────────────────────────────────────────────────────
+# AI-designed dark themes per website. The side panel posts a
+# locally-measured palette summary (no page content) to /theme/generate;
+# the result is stored per hostname in ThemeStore (SQLite) and mirrored
+# into chrome.storage.local by the extension so theme_engine.js can apply
+# it at document_start. See Site_Theme.py.
+
+@app.post("/theme/generate", response_model=ThemeRecord)
+async def generate_theme(req: GenerateThemeRequest):
+    try:
+        return await process_generate_theme(req)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/themes", response_model=ListThemesResponse)
+async def list_themes():
+    return await process_list_themes()
+
+@app.get("/theme/{host}", response_model=ThemeRecord)
+async def get_theme(host: str):
+    record = await process_get_theme(host)
+    if record is None:
+        raise HTTPException(status_code=404, detail="No theme saved for this site")
+    return record
+
+@app.delete("/theme/{host}")
+async def delete_theme(host: str):
+    return await process_delete_theme(host)
 
 def _chunk_text(content) -> str:
     """

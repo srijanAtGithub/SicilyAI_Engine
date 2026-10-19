@@ -99,6 +99,29 @@
       </div>
     </div>
 
+    <!-- --- Site Theme Glass Overlay --- -->
+    <!-- Dark theme for the current site: one action at a time. Logic in
+         js/theme.js, styles in css/overlays.css. -->
+    <div id="theme-overlay">
+      <div class="organise-card theme-card">
+        <!-- Scene A: the current site -->
+        <div class="theme-scene" id="theme-main">
+          <div class="organise-header">Dark Theme</div>
+          <div class="organise-sub theme-host" id="theme-host">&nbsp;</div>
+          <div class="theme-status" id="theme-status"></div>
+          <button class="theme-action-btn hidden" id="theme-action-btn" type="button"></button>
+          <button class="theme-secondary-btn" id="theme-sites-btn" type="button">Manage themed sites</button>
+        </div>
+
+        <!-- Scene B: every site with a Sicily dark theme -->
+        <div class="theme-scene hidden" id="theme-sites">
+          <div class="organise-header">Themed sites</div>
+          <div class="collections-view-list theme-sites-list" id="theme-sites-list"></div>
+          <button class="theme-secondary-btn" id="theme-sites-back" type="button">&larr; Back</button>
+        </div>
+      </div>
+    </div>
+
     <!-- --- Add to Collections Picker Overlay --- -->
     <div id="collections-picker-overlay">
       <div class="organise-card collections-picker-card">
@@ -261,6 +284,16 @@
             </button>
 
             <div class="qa-divider"></div>
+
+            <button class="qa-item" data-action="site-theme">
+              <span class="qa-icon">
+                <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <circle cx="10" cy="10" r="6.5" stroke="currentColor" stroke-width="1.4" />
+                  <path d="M10 3.5a6.5 6.5 0 0 1 0 13z" fill="currentColor" />
+                </svg>
+              </span>
+              <span>Dark Theme</span>
+            </button>
 
             <div class="qa-item qa-font-size" data-action="font-size">
               <span class="qa-icon">

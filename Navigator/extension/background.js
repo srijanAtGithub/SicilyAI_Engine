@@ -26,6 +26,60 @@ chrome.sidePanel
 chrome.runtime.onInstalled.addListener(() => {
   console.log("[Sicily Navigator] extension installed.");
   setupContextMenu();
+  syncThemesFromBackend();
+});
+
+// ── Site Themes: SQLite → chrome.storage.local mirror ─────────────────
+// The backend's ThemeStore (SQLite) is the source of truth. theme_engine.js
+// reads a mirror of it from chrome.storage.local so a theme can be applied
+// at document_start, before the backend could ever answer. We re-sync the
+// mirror whenever the worker starts — install, browser start, and every
+// DevTools "reload extension" — so nothing is lost across reloads. Only
+// keys that actually changed are written, so open tabs aren't needlessly
+// re-themed. If the backend is down, the existing mirror is kept as is.
+const THEME_KEY_PREFIX = "sicily-theme:";
+
+async function syncThemesFromBackend() {
+  try {
+    const res = await fetch(`http://${BACKEND_HOST}/themes`);
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const { themes = [] } = await res.json();
+
+    const current = await chrome.storage.local.get(null);
+    const next = {};
+    for (const t of themes) next[THEME_KEY_PREFIX + t.host] = t;
+
+    const toRemove = Object.keys(current).filter(
+      (k) => k.startsWith(THEME_KEY_PREFIX) && !(k in next)
+    );
+    const toSet = {};
+    for (const [k, v] of Object.entries(next)) {
+      if (JSON.stringify(current[k]) !== JSON.stringify(v)) toSet[k] = v;
+    }
+
+    if (toRemove.length) await chrome.storage.local.remove(toRemove);
+    if (Object.keys(toSet).length) await chrome.storage.local.set(toSet);
+  } catch (err) {
+    console.log("[Sicily Navigator] theme sync skipped (backend unreachable?)", err?.message || err);
+  }
+}
+
+chrome.runtime.onStartup.addListener(syncThemesFromBackend);
+syncThemesFromBackend(); // also on every worker start (covers DevTools reloads)
+
+// Cross-origin stylesheets can't be read from the page (cssRules throws),
+// so theme_engine.js asks us to fetch their text. host_permissions
+// <all_urls> lets the worker do this without CORS getting in the way.
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type !== "sicily-theme-fetch-css") return false;
+  fetch(message.url, { credentials: "include" })
+    .then((res) => {
+      if (!res.ok) throw new Error(`status ${res.status}`);
+      return res.text();
+    })
+    .then((text) => sendResponse({ ok: true, text }))
+    .catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
+  return true;
 });
 
 // ── Tab-Specific Side Panel Management ────────────────────────────────

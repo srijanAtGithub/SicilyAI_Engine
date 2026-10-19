@@ -2,6 +2,7 @@ import { NotificationService } from "./notifications.js";
 import { appWrap } from "./ui.js";
 import { BACKEND_HOST } from "./api.js";
 import { isScriptableTab } from "./mentions.js";
+import { openThemeOverlay } from "./theme.js";
 
 const quickActionsWrap = document.getElementById("quick-actions");
 const quickActionsBtn = document.getElementById("quick-actions-btn");
@@ -172,6 +173,10 @@ function handleQuickAction(action) {
   }
   if (action === "reading-list-groups") {
     openReadingListGroupsView();
+    return;
+  }
+  if (action === "site-theme") {
+    openThemeOverlay();
     return;
   }
 

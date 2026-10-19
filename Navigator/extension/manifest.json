@@ -10,7 +10,8 @@
     "sidePanel",
     "tabs",
     "tabGroups",
-    "storage"
+    "storage",
+    "unlimitedStorage"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -22,6 +23,15 @@
     "service_worker": "background.js"
   },
   "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "theme_engine.js"
+      ],
+      "run_at": "document_start"
+    },
     {
       "matches": [
         "<all_urls>"

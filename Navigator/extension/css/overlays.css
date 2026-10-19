@@ -1467,3 +1467,167 @@
         transform: translateY(0);
     }
 }
+
+/* --- Dark Theme Glass Overlay --- */
+#theme-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 110;
+    background: rgba(10, 10, 12, 0.65);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+#theme-overlay.active {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+#theme-overlay .hidden {
+    display: none !important;
+}
+
+#theme-overlay.active .organise-card {
+    transform: scale(1);
+}
+
+.theme-card {
+    max-width: 340px;
+}
+
+.theme-host {
+    margin-top: -6px;
+    margin-bottom: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.theme-status {
+    font-size: 12px;
+    color: #a1a1aa;
+    text-align: center;
+    line-height: 1.5;
+}
+
+.theme-status:empty {
+    display: none;
+}
+
+.theme-scene {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+/* Secondary button: "Manage themed sites" / "Back" — same glass as the
+   main action, quieter so the main action stays primary. */
+.theme-secondary-btn {
+    width: 100%;
+    padding: 9px 14px;
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.04);
+    color: #a1a1aa;
+    font-size: 12.5px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease, transform 0.12s ease;
+}
+
+.theme-secondary-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(255, 255, 255, 0.18);
+    color: #f2f2f7;
+    transform: translateY(-1px);
+}
+
+.theme-secondary-btn:active {
+    transform: scale(0.98);
+}
+
+#theme-overlay.is-busy .theme-secondary-btn {
+    visibility: hidden;
+}
+
+/* Themed sites list — rows reuse .collection-view-item + .item-delete-btn */
+.theme-sites-list {
+    max-height: 50vh;
+}
+
+.theme-site-row {
+    cursor: default;
+}
+
+.theme-site-name {
+    padding-right: 32px;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* --- The one action --- */
+.theme-action-btn {
+    width: 100%;
+    padding: 11px 14px;
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    background: rgba(255, 255, 255, 0.1);
+    color: #f2f2f7;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s ease, border-color 0.2s ease, transform 0.12s ease;
+}
+
+.theme-action-btn:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.18);
+    transform: translateY(-1px);
+}
+
+.theme-action-btn:active:not(:disabled) {
+    transform: scale(0.98);
+}
+
+.theme-action-btn.is-remove {
+    background: rgba(255, 69, 58, 0.12);
+    border-color: rgba(255, 69, 58, 0.3);
+    color: #ff8a80;
+}
+
+.theme-action-btn.is-remove:hover:not(:disabled) {
+    background: rgba(255, 69, 58, 0.2);
+}
+
+/* While working, the overlay stays exactly as it is; only the label pulses. */
+.theme-action-btn:disabled {
+    cursor: default;
+    animation: themeBusyPulse 1.6s ease-in-out infinite;
+}
+
+@keyframes themeBusyPulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.55; }
+}
+
+/* --- Neural glow + scanline while a theme is being made ---
+   Same look as .wrap.busy in base.css, but drawn above the overlay
+   (z-index 110) so the overlay stays in front and visible. */
+.wrap.theme-busy .neural-glow {
+    z-index: 115;
+    opacity: 1;
+    animation: neuralPulse 3s ease-in-out infinite alternate;
+}
+
+.wrap.theme-busy::before {
+    z-index: 116;
+    opacity: 1;
+    animation: scanLine 2s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
