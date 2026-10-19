@@ -1,5 +1,7 @@
 const BACKEND_HOST = "localhost:8765";
 const EDIT_MENU_ID = "sicily-navigator-edit-selection";
+const EDIT_MENU_DOCS_ID = "sicily-navigator-edit-selection-docs";
+const GOOGLE_DOCS_PATTERNS = ["https://docs.google.com/document/*"];
 
 function setupContextMenu() {
   // removeAll then create avoids "duplicate id" errors when the service
@@ -15,8 +17,32 @@ function setupContextMenu() {
       // itself, so this is just the coarse "is there a selection at all" gate.
       contexts: ["selection"],
     });
+
+    // Google Docs draws text on a canvas, so Chrome never sees a text
+    // selection and the item above never appears there. This one shows on
+    // any right-click inside a Doc; content_script.js reads Docs' own
+    // selection. (Docs replaces the right-click menu with its own — the
+    // native one appears with Ctrl/Cmd+Shift+right-click, or use the
+    // keyboard shortcut instead.)
+    chrome.contextMenus.create({
+      id: EDIT_MENU_DOCS_ID,
+      title: "Use Sicily",
+      contexts: ["page", "editable", "frame"],
+      documentUrlPatterns: GOOGLE_DOCS_PATTERNS,
+    });
   });
 }
+
+// Keyboard shortcut (manifest "commands"). The reliable trigger on Google
+// Docs, and handy everywhere else. Change it at chrome://extensions/shortcuts.
+chrome.commands.onCommand.addListener(async (command) => {
+  if (command !== "open-edit-box") return;
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (tab?.id != null) {
+    chrome.tabs.sendMessage(tab.id, { type: "navigator-open-edit-box" }, { frameId: 0 })
+      .catch(() => { }); // no content script on this page (chrome://, store, etc.)
+  }
+});
 
 // Enable the side panel to open on extension icon click
 chrome.sidePanel
@@ -104,8 +130,11 @@ chrome.action.onClicked.addListener((tab) => {
 });
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
-  if (info.menuItemId === EDIT_MENU_ID && tab && tab.id != null) {
-    chrome.tabs.sendMessage(tab.id, { type: "navigator-open-edit-box" });
+  if ((info.menuItemId === EDIT_MENU_ID || info.menuItemId === EDIT_MENU_DOCS_ID) && tab && tab.id != null) {
+    // frameId 0: the top frame owns the edit box, even when the click
+    // landed in a frame (e.g. Docs' hidden input iframe).
+    chrome.tabs.sendMessage(tab.id, { type: "navigator-open-edit-box" }, { frameId: 0 })
+      .catch(() => { });
   }
 });
 
@@ -119,7 +148,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       selected_text: message.selected_text,
       instruction: message.instruction,
       action_type: message.action_type || "edit",
-      surrounding_context: message.surrounding_context || ""
+      surrounding_context: message.surrounding_context || "",
+      history: Array.isArray(message.history) ? message.history : []
     }),
   })
     .then((res) => {
@@ -127,7 +157,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return res.json();
     })
     .then((data) => {
-      sendResponse({ ok: true, edited_text: data.edited_text });
+      sendResponse({ ok: true, edited_text: data.edited_text, kind: data.kind });
     })
     .catch((err) => {
       console.log("[Sicily Navigator] edit-selection request failed", err);

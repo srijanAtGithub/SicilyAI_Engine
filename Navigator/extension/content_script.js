@@ -8,7 +8,9 @@
  *
  * Flow:
  *   1. User selects text and right-clicks (menu only shows when there IS
- *      a selection — see background.js's contexts: ["selection"]).
+ *      a selection — see background.js's contexts: ["selection"]), or
+ *      presses the keyboard shortcut (background.js's chrome.commands —
+ *      the reliable trigger on Google Docs, which hijacks right-click).
  *   2. background.js relays a "navigator-open-edit-box" message here.
  *      This script re-reads the live selection itself — background.js
  *      has no DOM access to inspect it.
@@ -47,6 +49,20 @@
  *      framework's own handler expects) — out of scope for this pass.
  *      So: read-only mode. We still call the backend and show the
  *      result, just as a copyable suggestion instead of an auto-apply.
+ *      [UPDATE: now applied with ONE execCommand("insertText") over the
+ *      re-selected range, so the framework sees a single native edit —
+ *      one undo step, no mid-stream re-render races.]
+ *
+ *   GOOGLE DOCS (checked before all of the above, async) — text is
+ *   painted on <canvas>, so there are no text nodes and
+ *   window.getSelection() is empty. Docs routes all keyboard/clipboard
+ *   input through a hidden same-origin iframe
+ *   (.docs-texteventtarget-iframe). We READ the selection by triggering
+ *   a copy in that iframe and capturing the text, and WRITE by
+ *   refocusing the iframe and dispatching a paste (with an
+ *   execCommand("insertText") fallback). Docs keeps its own selection
+ *   model, so refocusing restores the user's selection. Needs the
+ *   "clipboardRead" + "clipboardWrite" permissions.
  *
  *   Anything selected outside all of the above (plain read-only page
  *   text) gets the same copyable-suggestion treatment as tier 3, for
@@ -54,6 +70,9 @@
  */
 
 (() => {
+  // Only the top frame drives the edit box.
+  if (window !== window.top) return;
+
   const OPEN_BOX_MESSAGE = "navigator-open-edit-box";
   const EDIT_REQUEST_MESSAGE = "navigator-edit-selection-request";
 
@@ -62,7 +81,7 @@
     style.id = "navigator-highlight-style";
     // Using a nice transparent version of your #3a6df0 blue
     style.textContent = `::highlight(navigator-selection) { background-color: #6879a3ff !important; color: #ffffff !important; }`;
-    document.head.appendChild(style);
+    (document.head || document.documentElement).appendChild(style);
   }
 
   let activeBox = null; // only one edit box open at a time
@@ -81,6 +100,7 @@
     { name: "Draft.js", test: (root) => root.classList?.contains("DraftEditor-root") || !!root.closest?.(".DraftEditor-root") || !!root.querySelector?.('[data-contents="true"]') },
     { name: "Quill", test: (root) => root.classList?.contains("ql-editor") || !!root.closest?.(".ql-editor") },
     { name: "CKEditor", test: (root) => root.classList?.contains("ck-editor__editable") || !!root.closest?.(".ck-editor__editable") },
+    { name: "CodeMirror", test: (root) => root.classList?.contains("cm-content") || !!root.closest?.(".cm-editor") },
   ];
 
   function detectFramework(editableRoot) {
@@ -214,7 +234,11 @@
     }
     if (!block || block === document.body) block = containerEl;
 
-    const blockText = (block.innerText || block.textContent || "").trim();
+    // Form fields keep their text in .value — innerText/textContent of a
+    // <textarea> is only its initial markup, not what the user typed.
+    const blockText = (block.tagName === "TEXTAREA" || block.tagName === "INPUT")
+      ? (block.value || "").trim()
+      : (block.innerText || block.textContent || "").trim();
     if (!blockText) return "";
 
     // If the block itself is already short, just use the whole thing.
@@ -233,7 +257,149 @@
     return blockText.slice(start, end);
   }
 
-  function detectEditContext() {
+  // ── SITE ADAPTER: Google Docs (canvas-rendered) ─────────────────────
+
+  function isGoogleDocs() {
+    return location.hostname === "docs.google.com"
+      && location.pathname.startsWith("/document/")
+      && !!document.querySelector(".docs-texteventtarget-iframe");
+  }
+
+  function getDocsInputTarget() {
+    const iframe = document.querySelector(".docs-texteventtarget-iframe");
+    let idoc = null;
+    try { idoc = iframe?.contentDocument; } catch (e) { return null; }
+    if (!idoc) return null;
+    const target = idoc.querySelector('[contenteditable="true"]') || idoc.querySelector("[contenteditable]") || idoc.body;
+    return { idoc, iwin: idoc.defaultView, target };
+  }
+
+  function getDocsCaretRect() {
+    // Docs still draws the caret as a real DOM element over the canvas.
+    // Class names are internal and may change — verify in DevTools.
+    const caret = document.querySelector(".kix-cursor-caret") || document.querySelector(".kix-cursor");
+    const r = caret?.getBoundingClientRect();
+    if (r && (r.width || r.height)) return r;
+    // Fallback: top-centre of the viewport.
+    return { left: Math.max(8, window.innerWidth / 2 - 190), right: window.innerWidth / 2 + 190, top: 120, bottom: 140, width: 380, height: 20 };
+  }
+
+  // Clipboard helpers that go through a throwaway <textarea> and
+  // execCommand. With the "clipboardRead"/"clipboardWrite" permissions a
+  // content script can do this without a user gesture or a permission
+  // prompt (navigator.clipboard.readText() would prompt / need focus).
+  function readClipboardText() {
+    const ta = document.createElement("textarea");
+    ta.style.cssText = "position:fixed;top:-1000px;left:-1000px;opacity:0;";
+    document.body.appendChild(ta);
+    ta.focus();
+    let text = null;
+    try {
+      if (document.execCommand("paste")) text = ta.value;
+    } catch (e) { /* ignore */ }
+    ta.remove();
+    return text;
+  }
+
+  function writeClipboardText(text) {
+    const ta = document.createElement("textarea");
+    ta.style.cssText = "position:fixed;top:-1000px;left:-1000px;opacity:0;";
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand("copy"); } catch (e) { /* ignore */ }
+    ta.remove();
+  }
+
+  async function readGoogleDocsSelection() {
+    const io = getDocsInputTarget();
+    if (!io) return null;
+    const { idoc, iwin, target } = io;
+
+    // Copying overwrites the user's clipboard — remember it so we can
+    // put it back afterwards (plain text only).
+    const SENTINEL = `⁣sicily-${Date.now()}⁣`;
+    const previousClipboard = readClipboardText();
+    // Put a sentinel on the clipboard so we can tell whether Docs' copy
+    // actually happened (an empty Docs selection copies nothing).
+    writeClipboardText(SENTINEL);
+
+    // Path 1: catch the text Docs puts on the copy event. Bubble-phase
+    // listeners run after Docs' own handler has filled clipboardData.
+    let captured = "";
+    const onCopy = (e) => {
+      if (captured) return;
+      try { captured = e.clipboardData?.getData("text/plain") || ""; } catch (err) { /* ignore */ }
+    };
+    iwin.addEventListener("copy", onCopy);
+    idoc.addEventListener("copy", onCopy);
+    try {
+      target.focus(); // restores Docs' own selection
+      idoc.execCommand("copy");
+    } catch (e) { /* ignore */ }
+    iwin.removeEventListener("copy", onCopy);
+    idoc.removeEventListener("copy", onCopy);
+
+    // Path 2: Docs stopped propagation — read what landed on the clipboard.
+    if (!captured) {
+      await new Promise((r) => setTimeout(r, 50));
+      const fromClipboard = readClipboardText();
+      if (fromClipboard && fromClipboard !== SENTINEL) captured = fromClipboard;
+    }
+
+    // Put the user's clipboard back, then hand focus back to Docs.
+    writeClipboardText(previousClipboard ?? "");
+    try { target.focus(); } catch (e) { /* ignore */ }
+
+    // Docs sprinkles zero-width chars / trailing newlines into copies.
+    const text = (captured || "").replace(/[​‌‍﻿]/g, "").replace(/\s+$/, "");
+    if (!text.trim()) return null;
+
+    return {
+      tier: "gdocs",
+      text,
+      rect: getDocsCaretRect(),
+      getRect: getDocsCaretRect,
+      pageContext: "", // the rest of the doc isn't readable from the DOM
+    };
+  }
+
+  function writeGoogleDocsSelection(newText) {
+    const io = getDocsInputTarget();
+    if (!io) return false;
+    const { idoc, target } = io;
+
+    // Refocusing the input iframe restores Docs' own selection, so the
+    // paste/insert below replaces exactly what the user had selected.
+    target.focus();
+
+    let handled = false;
+    try {
+      const dt = new DataTransfer();
+      dt.setData("text/plain", newText);
+      const evt = new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true });
+      // Docs calls preventDefault() when it consumes the paste → returns false.
+      handled = !target.dispatchEvent(evt);
+    } catch (e) { /* ClipboardEvent init unsupported — fall through */ }
+
+    if (!handled) {
+      try { handled = idoc.execCommand("insertText", false, newText); } catch (e) { /* ignore */ }
+    }
+    return handled;
+  }
+
+  // Google Docs needs its own async path (clipboard round-trip); every
+  // other page goes through the synchronous tier detection below.
+  async function detectEditContext() {
+    if (isGoogleDocs()) {
+      const ctx = await readGoogleDocsSelection();
+      if (!ctx) console.log("[Sicily Navigator] couldn't read the Google Docs selection (clipboard permissions?).");
+      return ctx;
+    }
+    return detectGenericEditContext();
+  }
+
+  function detectGenericEditContext() {
     // Tier 1: an <input>/<textarea> with an active selection. Note that
     // window.getSelection() does NOT see into form controls in Chrome —
     // their selection only shows up via selectionStart/selectionEnd on
@@ -301,7 +467,7 @@
 
     const framework = detectFramework(editableRoot);
     if (framework) {
-      return { tier: "rich-text", frameworkName: framework, text, rect, range: range.cloneRange(), pageContext: extractSurroundingContext(text, editableRoot) };
+      return { tier: "rich-text", frameworkName: framework, root: editableRoot, text, rect, range: range.cloneRange(), pageContext: extractSurroundingContext(text, editableRoot) };
     }
 
     return {
@@ -316,7 +482,7 @@
 
   // Helper: Briefly flash a subtle highlight on an element to signal a change
   function pulseElement(el) {
-    if (!el) return;
+    if (!el || !el.style) return;
     const originalTransition = el.style.transition;
     const originalBg = el.style.backgroundColor;
 
@@ -334,30 +500,44 @@
     }, 200);
   }
 
+  // A saved Range is only safe to re-select if its nodes are still in the
+  // document — frameworks may have re-rendered them away since detection.
+  function rangeIsUsable(range) {
+    return !!range && range.startContainer?.isConnected && range.endContainer?.isConnected;
+  }
+
   // Smoothly apply edits with an adaptive typewriter animation
-  function applyEdit(context, newText) {
-    if (!newText) return;
+  // Returns true on success, false if it couldn't be applied safely (the
+  // Replace handler then falls back to copying the result).
+  async function applyEdit(context, newText) {
+    if (!newText) return false;
+
+    // ── Google Docs ─────────────────────────────────────────────────────
+    if (context.tier === "gdocs") {
+      return writeGoogleDocsSelection(newText);
+    }
 
     // ── TIER 1: Standard Form Fields (<input>, <textarea>) ─────────────────────
     if (context.tier === "form" && context.element) {
       const el = context.element;
-      const start = el.selectionStart || 0;
-      const end = el.selectionEnd || 0;
       const oldVal = el.value;
 
-      const prefix = oldVal.substring(0, start);
-      const suffix = oldVal.substring(end);
+      // Use the word-snapped offsets captured at detection time, not the
+      // live selectionStart/End (which are the un-snapped originals).
+      // Bail if the field changed underneath us.
+      if (oldVal.slice(context.start, context.end) !== context.text) return false;
 
+      const prefix = oldVal.substring(0, context.start);
+      const suffix = oldVal.substring(context.end);
+
+      el.focus();
       let charIndex = 0;
       const speed = Math.max(8, Math.floor(350 / newText.length));
 
       const timer = setInterval(() => {
         charIndex += Math.max(1, Math.floor(newText.length / 25));
-        if (charIndex >= newText.length) {
-          charIndex = newText.length;
-          clearInterval(timer);
-          pulseElement(el);
-        }
+        const done = charIndex >= newText.length;
+        if (done) charIndex = newText.length;
 
         const currentSlice = newText.substring(0, charIndex);
         el.value = prefix + currentSlice + suffix;
@@ -366,16 +546,45 @@
         el.setSelectionRange(newCursorPos, newCursorPos);
 
         el.dispatchEvent(new Event("input", { bubbles: true }));
+
+        if (done) {
+          clearInterval(timer);
+          // "change" only once the full text is in, not before typing starts
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          pulseElement(el);
+        }
       }, speed);
 
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-      return;
+      return true;
     }
 
-    // ── TIER 2 & 3: ContentEditable & Rich-Text Frameworks (Notion, Slack, etc.) ──
-    if ((context.tier === "contenteditable" || context.tier === "rich-text") && context.range) {
+    // ── TIER 3: Rich-Text Frameworks — ONE native insert, no typewriter ──
+    // Streaming chunks into ProseMirror/Lexical/etc. creates many undo
+    // steps and races the framework's re-render. A single insertText over
+    // the selection is seen as one ordinary user edit.
+    if (context.tier === "rich-text") {
+      if (!rangeIsUsable(context.range)) return false;
       const selection = window.getSelection();
-      if (!selection) return;
+      if (!selection) return false;
+
+      // 1. Force focus back to the target element if it slipped away
+      context.root?.focus?.();
+
+      // 2. Re-select the exact text block the user highlighted
+      selection.removeAllRanges();
+      selection.addRange(context.range);
+
+      // 3. Replace it in one go — insertText over a selection replaces it
+      const ok = document.execCommand("insertText", false, newText);
+      if (ok) pulseElement(context.root);
+      return ok;
+    }
+
+    // ── TIER 2: Plain ContentEditable ───────────────────────────────────
+    if (context.tier === "contenteditable" && context.range) {
+      if (!rangeIsUsable(context.range)) return false;
+      const selection = window.getSelection();
+      if (!selection) return false;
 
       // 1. Force focus back to the target element if it slipped away
       if (context.root && typeof context.root.focus === "function") {
@@ -415,8 +624,10 @@
         }
       }, speed);
 
-      return;
+      return true;
     }
+
+    return false;
   }
 
   // ── Floating box (Shadow DOM keeps page CSS from leaking in/out) ──────
@@ -815,7 +1026,7 @@
 
         /* Global Button Interactions */
         .submit-btn:active:not(:disabled), .btn:active { transform: scale(0.96); }
-        .submit-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .submit-btn:disabled, .btn:disabled { opacity: 0.4; cursor: not-allowed; }
         .btn-success { background: #34c759 !important; border-color: transparent !important; }
 
         /* --- Follow-up row (result view) --- */
@@ -956,7 +1167,10 @@
     function getFreshRect() {
       if (context.tier === "form" && context.element) {
         return context.element.getBoundingClientRect();
-      } else if (context.range) {
+      } else if (typeof context.getRect === "function") {
+        // Google Docs: no Range — re-measure the caret element instead
+        return context.getRect();
+      } else if (rangeIsUsable(context.range)) {
         return context.range.getBoundingClientRect();
       }
       return context.rect;
@@ -1111,7 +1325,7 @@
 
       chrome.runtime.sendMessage(
         {
-          type: "navigator-edit-selection-request",
+          type: EDIT_REQUEST_MESSAGE,
           selected_text: context.text,
           instruction,
           action_type: actionType,
@@ -1229,10 +1443,29 @@
     input.addEventListener("keyup", (e) => e.stopPropagation());
     input.addEventListener("keypress", (e) => e.stopPropagation());
 
-    replaceBtn.addEventListener("click", () => {
-      if (lastEditText) {
-        applyEdit(context, lastEditText);
+    replaceBtn.addEventListener("click", async () => {
+      if (!lastEditText) {
+        closeActiveBox();
+        return;
       }
+
+      replaceBtn.disabled = true;
+      let ok = false;
+      try {
+        ok = await applyEdit(context, lastEditText);
+      } catch (e) {
+        console.warn("[Sicily Navigator] applyEdit failed:", e);
+      }
+
+      if (!ok) {
+        // Couldn't write safely (text changed, editor re-rendered, Docs
+        // rejected the paste…) — never silently lose the result.
+        navigator.clipboard?.writeText(lastEditText).catch(() => { });
+        showError("Couldn't apply it here — copied the edit to your clipboard instead.");
+        replaceBtn.disabled = false;
+        return;
+      }
+
       closeActiveBox();
     });
 
@@ -1263,15 +1496,22 @@
   chrome.runtime.onMessage.addListener((message) => {
     if (message.type !== OPEN_BOX_MESSAGE) return;
 
-    const context = detectEditContext();
-    if (!context) {
-      // Menu is gated on contexts: ["selection"], so this shouldn't
-      // normally happen — but selection can vanish between the
-      // right-click and this message arriving. Log for visibility while
-      // testing rather than failing completely silently.
-      console.log("[Sicily Navigator] no selection found when edit box was requested.");
-      return;
-    }
-    openEditBox(context);
+    // detectEditContext is async now (the Google Docs path does a
+    // clipboard round-trip), so wait for it before opening the box.
+    detectEditContext()
+      .then((context) => {
+        if (!context) {
+          // Menu is gated on contexts: ["selection"], so this shouldn't
+          // normally happen — but selection can vanish between the
+          // right-click and this message arriving. Log for visibility while
+          // testing rather than failing completely silently.
+          console.log("[Sicily Navigator] no selection found when edit box was requested.");
+          return;
+        }
+        openEditBox(context);
+      })
+      .catch((err) => {
+        console.warn("[Sicily Navigator] selection detection failed:", err);
+      });
   });
 })();

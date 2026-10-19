@@ -11,8 +11,19 @@
     "tabs",
     "tabGroups",
     "storage",
-    "unlimitedStorage"
+    "unlimitedStorage",
+    "clipboardRead",
+    "clipboardWrite"
   ],
+  "commands": {
+    "open-edit-box": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+K",
+        "mac": "Command+Shift+K"
+      },
+      "description": "Use Sicily on the selected text"
+    }
+  },
   "host_permissions": [
     "<all_urls>"
   ],
