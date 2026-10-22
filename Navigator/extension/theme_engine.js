@@ -415,6 +415,32 @@
       // Painted deliberately above — the safety net must leave it alone.
       keep: ".kix-cursor-caret",
     },
+    {
+      // Google Maps draws the map itself on a WebGL <canvas>, so colour
+      // rules can't reach it (the panels, search box and menus are normal
+      // DOM and get the regular theme). Same treatment as Docs: invert +
+      // hue-rotate turns the light road map into a night-style map while
+      // keeping road, water, park and place-label hues.
+      // Selectors follow Dark Reader's Google Maps fix (MIT-licensed,
+      // src/config/dynamic-theme-fixes.config): the current layout
+      // ([jstrack] … [role=application] > canvas) and the older one
+      // (#app-container.vasquette … .widget-scene-canvas). Satellite
+      // (.app-imagery-mode) and globe (.app-globe-mode) views are left
+      // alone, so real imagery is never inverted.
+      matches: () =>
+        /(^|\.)google\.[a-z.]+$/.test(location.hostname) && location.pathname.startsWith("/maps"),
+      css: () => {
+        const sel = [
+          '#app-container.vasquette:not(.app-imagery-mode):not(.app-globe-mode) .widget-scene-canvas',
+          '#app-container.vasquette:not(.app-imagery-mode):not(.app-globe-mode) .canvas-container > canvas',
+          'div[jstrack="1"]:not(.app-imagery-mode):not(.app-globe-mode):not(.Nkjr6c):not(.K1N2o) [role="application"] > canvas',
+          'div[jstrack="1"]:not(.app-imagery-mode):not(.app-globe-mode):not(.Nkjr6c):not(.K1N2o) [role="application"] .mAWRAc',
+        ].join(",");
+        return `${sel}{filter:invert(0.92) hue-rotate(180deg)!important}`;
+      },
+      // The inverted map layers must not also be darkened by the safety net.
+      keep: '[role="application"] .mAWRAc',
+    },
   ];
 
   // Elements an adapter styles on purpose; the safety net skips them.
@@ -1357,6 +1383,11 @@
           const parentStat = bgStats.get(parentKey);
           if (parentStat) parentStat.v = Math.max(0, parentStat.v - area);
           bg = eff; bgKey = k; d = depth + 1;
+        } else if (cs.position === "fixed" || cs.position === "absolute") {
+          // A floating panel in the page's own colour (Maps' white side
+          // panel over the full-screen map) re-covers whatever an earlier
+          // overlay took from that colour, so give its area back.
+          addStat(bgStats, k, area, depth);
         }
       }
 
@@ -1448,7 +1479,22 @@
       .sort((a, b) => b.share - a.share)
       .slice(0, 24);
 
-    // ── Light or dark? Area-weighted background lightness, text as a tiebreak ──
+    // ── Light or dark? ──
+    // Primary signal: the backgrounds that text actually sits on (what the
+    // user reads). Area alone misleads on canvas-heavy apps — e.g. Google
+    // Maps: the map is a <canvas> we skip, and the big containers behind it
+    // carry a dark/grey background nobody ever sees, which outweighed the
+    // white search box and side panel. Area-weighting is only the fallback
+    // for pages with very little text.
+    const lOf = new Map(kept.map((c) => [c.id, labToLch(c.lab).L]));
+    let pL = 0, pW = 0;
+    for (const [k, share] of pairAgg) {
+      const bgId = k.split("|")[1];
+      if (!lOf.has(bgId)) continue;
+      pL += lOf.get(bgId) * share;
+      pW += share;
+    }
+
     let bgL = 0, bgW = 0, txL = 0, txW = 0;
     for (const c of kept) {
       const L = labToLch(c.lab).L;
@@ -1457,8 +1503,16 @@
     }
     const avgBg = bgW ? bgL / bgW : labToLch(rgbToOklab(base)).L;
     const avgText = txW ? txL / txW : 0.3;
-    let detected = avgBg >= 0.5 ? "light" : "dark";
-    if (avgBg > 0.4 && avgBg < 0.6) detected = avgText > 0.6 ? "dark" : "light";
+
+    let detected;
+    if (pW >= 0.25) {
+      const readBg = pL / pW;
+      detected = readBg >= 0.5 ? "light" : "dark";
+      if (readBg > 0.4 && readBg < 0.6) detected = avgText > 0.6 ? "dark" : "light";
+    } else {
+      detected = avgBg >= 0.5 ? "light" : "dark";
+      if (avgBg > 0.4 && avgBg < 0.6) detected = avgText > 0.6 ? "dark" : "light";
+    }
 
     const pageBgCluster = [...kept].sort((a, b) => b.bg - a.bg)[0];
     const fingerprint = kept.slice(0, 8)

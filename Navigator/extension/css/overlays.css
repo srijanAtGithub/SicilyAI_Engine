@@ -1516,9 +1516,14 @@
     line-height: 1.5;
 }
 
+.theme-status:empty {
+    display: none;
+}
+
 /* "Fine-tuning for this site…" — same sliding shimmer as "Thinking…" */
 .theme-status.is-working {
-    align-self: center;   /* shrink to the text so the light sweeps across the words, not the whole card width */
+    align-self: center;
+    /* shrink to the text so the light sweeps across the words, not the whole card width */
     font-size: 13px;
     font-weight: 500;
     color: transparent;
@@ -1535,10 +1540,6 @@
         color: #d8d8de;
         background: none;
     }
-}
-
-.theme-status:empty {
-    display: none;
 }
 
 .theme-scene {
@@ -1634,8 +1635,15 @@
 }
 
 @keyframes themeBusyPulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.55; }
+
+    0%,
+    100% {
+        opacity: 1;
+    }
+
+    50% {
+        opacity: 0.55;
+    }
 }
 
 /* --- Quick-action status pill ---
@@ -1811,6 +1819,8 @@
 #collections-view-overlay .organise-card,
 #reading-list-groups-view-overlay .organise-card,
 .chats-panel {
+    width: 100%;
+    /* overrides the old fixed 550px, so the card shrinks with the panel */
     max-width: 480px;
     max-height: 80vh;
     flex: 0 1 auto;

@@ -155,10 +155,15 @@ function setBusy(on, label) {
 }
 
 async function makeDark() {
+  cancelRepair(state.host); // a regenerated theme gets its own repair
   setBusy(true, "Making it dark…");
   try {
     const m = await sendToTab(state.tab.id, { type: "sicily-theme-measure" });
     if (!m?.ok || !m.summary?.palette?.length) throw new Error(m?.error || "Nothing to measure");
+
+    // "Make it dark anyway": the user overrode a dark detection, so theme
+    // the page as the light page they say it is.
+    if (state.detected === "dark") m.summary.detected_mode = "light";
 
     const res = await fetch(`http://${BACKEND_HOST}/theme/generate`, {
       method: "POST",
@@ -187,7 +192,14 @@ async function makeDark() {
 // Saving the returned record to chrome.storage.local makes every open tab
 // on the site pick the fixes up. Never blocks the overlay.
 const REPAIR_SETTLE_MS = 1500;
-const repairing = new Set();
+const repairing = new Map(); // host -> AbortController of the running repair
+
+function cancelRepair(host) {
+  const ctl = repairing.get(host);
+  if (!ctl) return;
+  ctl.abort();
+  repairing.delete(host);
+}
 
 function setRepairStatus(host, text, working = false) {
   if (state.host === host && overlay.classList.contains("active") && !state.busy) {
@@ -198,21 +210,31 @@ function setRepairStatus(host, text, working = false) {
 
 async function repairInBackground(tabId, host) {
   if (repairing.has(host)) return;
-  repairing.add(host);
+  const ctl = new AbortController();
+  repairing.set(host, ctl);
   setRepairStatus(host, "Fine-tuning for this site…", true);
   try {
     await new Promise((r) => setTimeout(r, REPAIR_SETTLE_MS));
+    if (ctl.signal.aborted) return;
 
     const c = await sendToTab(tabId, { type: "sicily-theme-collect" });
+    if (ctl.signal.aborted) return;
     if (!c?.ok || !c.input) throw new Error(c?.error || "Nothing collected");
 
     const res = await fetch(`http://${BACKEND_HOST}/theme/repair`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(c.input),
+      signal: ctl.signal,
     });
     if (!res.ok) throw new Error(`status ${res.status}`);
     const record = await res.json();
+
+    // Removed or regenerated while we waited: drop this result. (The
+    // backend refuses to save it too; this keeps the local mirror clean.)
+    if (ctl.signal.aborted) return;
+    const stillThere = (await chrome.storage.local.get(keyFor(host)))[keyFor(host)];
+    if (!stillThere) return;
 
     await chrome.storage.local.set({ [keyFor(record.host)]: record });
     if (state.host === host) state.record = record;
@@ -220,17 +242,19 @@ async function repairInBackground(tabId, host) {
     const n = (record.repairs?.fixes?.length || 0) + (record.repairs?.images?.length || 0);
     setRepairStatus(host, record.repairs?.repaired_at ? (n ? "Fine-tuned for this site." : "") : "");
   } catch (err) {
+    if (ctl.signal.aborted) return; // cancelled on purpose
     // Not fatal: the base theme stays as it is, and the next open retries.
     console.warn("Theme repair skipped:", err);
     setRepairStatus(host, "");
   } finally {
-    repairing.delete(host);
+    if (repairing.get(host) === ctl) repairing.delete(host);
   }
 }
 
 // Deletes a site's theme in SQLite and the local mirror; open tabs on
 // that site switch back to their own look straight away.
 async function deleteTheme(host) {
+  cancelRepair(host); // never let a late repair bring the theme back
   const res = await fetch(`http://${BACKEND_HOST}/theme/${encodeURIComponent(host)}`, { method: "DELETE" });
   if (!res.ok) throw new Error(`status ${res.status}`);
   await chrome.storage.local.remove(keyFor(host));
@@ -337,8 +361,10 @@ function render() {
     statusEl.textContent = "Reload the tab and try again.";
     actionBtn.classList.add("hidden");
   } else if (state.detected === "dark") {
-    statusEl.textContent = "This site is already dark.";
-    actionBtn.classList.add("hidden");
+    // Detection can be fooled (canvas-heavy apps, hidden backgrounds), so
+    // this is a note, not a dead end.
+    statusEl.textContent = "This site already looks dark.";
+    actionBtn.textContent = "Make it dark anyway";
   } else {
     actionBtn.textContent = "Make it dark";
   }

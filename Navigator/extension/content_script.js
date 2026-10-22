@@ -798,8 +798,7 @@
         /* --- Skeleton placeholder (shown in the result view while loading) --- */
         .skeleton { display: none; margin-bottom: 16px; }
         .result-view.loading .skeleton { display: block; }
-        .result-view.loading .result-text,
-        .result-view.loading .actions { display: none; }
+        .result-view.loading .result-text { display: none; }
         .sk-line {
           height: 10px;
           border-radius: 6px;
@@ -866,20 +865,10 @@
           to { background-position: 0 0; opacity: 0; }
         }
 
-        /* Copy/Replace settle in just after the text */
-        .result-view.just-revealed .actions {
-          animation: navFadeUp 0.45s cubic-bezier(0.16, 1, 0.3, 1) 0.55s both;
-        }
-        @keyframes navFadeUp {
-          from { opacity: 0; transform: translateY(4px); }
-          to { opacity: 1; transform: none; }
-        }
-
         @media (prefers-reduced-motion: reduce) {
           .iri, .sk-line { animation: none; }
           .result-text.revealing .rt-base,
           .result-text.revealing .rt-sheen { animation-duration: 0.01s; }
-          .result-view.just-revealed .actions { animation: none; }
         }
 
         /* Tier Notice (Blurred Golden Style) */
@@ -1060,10 +1049,26 @@
         }
         .result-text::-webkit-scrollbar { display: none; } /* Chrome/Safari */
 
-        .actions {
+        /* --- Result action bar: Copy · Replace · Ask more ---
+           Only the buttons that apply are shown (Replace needs a new
+           version + an editable target). "Ask more" opens the follow-up
+           box underneath; it stays closed until asked for. */
+        .result-actions {
           display: flex;
           justify-content: flex-end;
-          gap: 10px;
+          gap: 8px;
+          padding-top: 12px;
+          border-top: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        .result-view.loading .result-actions { display: none; }
+        .btn-askmore {
+          background: rgba(255, 255, 255, 0.06);
+          color: #f2f2f7;
+        }
+        .btn-askmore:hover { background: rgba(255, 255, 255, 0.12); }
+        .btn-askmore.on {
+          background: rgba(255, 255, 255, 0.14);
+          border-color: rgba(255, 255, 255, 0.22);
         }
 
         /* The Copy & Cancel Buttons - Standard Translucent Gray */
@@ -1081,14 +1086,51 @@
         .btn-success { background: #34c759 !important; border-color: transparent !important; }
 
         /* --- Follow-up row (result view) --- */
+        /* Follow-up box: folded away until "Ask more". It unfolds with a
+           height (grid 0fr -> 1fr), fade and slight slide; the box grows
+           with it since its own height is auto. visibility keeps the
+           folded input out of the Tab order. */
+        .followup-wrap {
+          display: grid;
+          grid-template-rows: 0fr;
+          margin-top: 0;
+          opacity: 0;
+          visibility: hidden;
+          transition:
+            grid-template-rows 0.34s cubic-bezier(0.16, 1, 0.3, 1),
+            margin-top 0.34s cubic-bezier(0.16, 1, 0.3, 1),
+            opacity 0.22s ease,
+            visibility 0s linear 0.34s;
+        }
+        .followup-inner {
+          min-height: 0;
+          overflow: clip;
+          overflow-clip-margin: 16px; /* let the input's focus glow show */
+        }
         .followup-row {
           display: flex;
           gap: 8px;
           align-items: flex-end;
-          margin-top: 12px;
-          padding-top: 12px;
-          border-top: 1px solid rgba(255, 255, 255, 0.08);
+          transform: translateY(-6px);
+          transition: transform 0.34s cubic-bezier(0.16, 1, 0.3, 1);
         }
+        .result-view.asking .followup-wrap {
+          grid-template-rows: 1fr;
+          margin-top: 10px;
+          opacity: 1;
+          visibility: visible;
+          transition:
+            grid-template-rows 0.34s cubic-bezier(0.16, 1, 0.3, 1),
+            margin-top 0.34s cubic-bezier(0.16, 1, 0.3, 1),
+            opacity 0.25s ease 0.05s,
+            visibility 0s;
+        }
+        .result-view.asking .followup-row { transform: none; }
+        /* While a follow-up loads, the box shows only skeleton + this row. */
+        .result-view.asking.loading .followup-wrap { margin-top: 0; }
+        /* Instant fold, used when an answer arrives (the box's own height
+           animation takes care of the motion then). */
+        .followup-wrap.snap, .followup-wrap.snap .followup-row { transition: none !important; }
         .followup-input {
           flex: 1;
           height: 36px;
@@ -1150,13 +1192,18 @@
           <div class="view result-view">
             <div class="skeleton"></div>
             <div class="result-text"></div>
-            <div class="actions">
+            <div class="result-actions">
               <button class="btn btn-copy">Copy</button>
               <button class="btn btn-replace">Replace</button>
+              <button class="btn btn-askmore">Ask more</button>
             </div>
-            <div class="followup-row">
-              <textarea class="followup-input" placeholder="Ask a follow-up..." rows="1"></textarea>
-              <button class="submit-btn btn-followup">Send</button>
+            <div class="followup-wrap">
+              <div class="followup-inner">
+                <div class="followup-row">
+                  <textarea class="followup-input" placeholder="Ask a follow-up..." rows="1"></textarea>
+                  <button class="submit-btn btn-followup">Send</button>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -1180,6 +1227,8 @@
     const noticeEl = shadow.querySelector(".notice");
     const resultText = shadow.querySelector(".result-text");
     const skeletonEl = shadow.querySelector(".skeleton");
+    const askMoreBtn = shadow.querySelector(".btn-askmore");
+    const followupWrap = shadow.querySelector(".followup-wrap");
 
     // The reveal class is one-shot: drop it when the band finishes (the
     // event bubbles up from .rt-sheen) so only the plain text remains.
@@ -1199,12 +1248,9 @@
     const followupInput = shadow.querySelector(".followup-input");
     const followupBtn = shadow.querySelector(".btn-followup");
 
-    // What's currently shown in the result pane (an edit OR a reply).
+    // What's currently shown in the result pane. Copy and Replace always
+    // use exactly this — what you see is what you get.
     let pendingAiText = "";
-    // The most recent *edit* (new version of the selection). This is the
-    // only thing Replace/Copy should ever insert — a conversational reply
-    // like "Glad that works!" must never land in the user's document.
-    let lastEditText = "";
 
     // Turn history for THIS open box only. Lives entirely in this
     // closure — created fresh every time openEditBox() runs, and gone
@@ -1284,23 +1330,29 @@
       // 6. Set the height to the end point to trigger the CSS transition
       wrapEl.style.height = `${endHeight}px`;
 
-      // 7. Cleanup after the animation finishes
-      function cleanupTransition() {
+      // 7. Cleanup after the animation finishes. Only the box's own height
+      //    transition counts (children's transitionend events bubble up
+      //    here too), and a timer covers the case where the height didn't
+      //    change at all, so no transition fires — otherwise a fixed
+      //    height could be left behind and stop the box from growing.
+      let cleaned = false;
+      function cleanupTransition(e) {
+        if (e && (e.target !== wrapEl || e.propertyName !== "height")) return;
+        if (cleaned) return;
+        cleaned = true;
+        clearTimeout(fallback);
         wrapEl.style.height = ""; // Restore to 'auto' so it can resize with text
         wrapEl.removeEventListener("transitionend", cleanupTransition);
         reposition(); // Perform collision check after new layout is stable
       }
+      const fallback = setTimeout(() => cleanupTransition(), 600);
       wrapEl.addEventListener("transitionend", cleanupTransition);
     }
 
-    // Placeholder bars roughly shaped like the answer we expect: an edit
-    // is about as long as the selection, a summary is short.
-    function buildSkeleton(actionType) {
-      const len = (context.text || "").length;
-      let count = actionType === "summarise" ? 2
-        : actionType === "ask" ? 3
-        : Math.ceil(len / 45);
-      count = Math.min(5, Math.max(2, count));
+    // Placeholder bars while the answer loads — always 5 lines.
+    const SKELETON_LINES = 5;
+    function buildSkeleton() {
+      const count = SKELETON_LINES;
       const widths = [100, 94, 97, 91, 96];
       let html = "";
       for (let i = 0; i < count; i++) {
@@ -1314,7 +1366,7 @@
     // in for the answer. Works both from the input view (first submit) and
     // from an existing result (follow-ups replace the old answer in place).
     function showLoading(actionType) {
-      buildSkeleton(actionType);
+      buildSkeleton();
       animateHeightChange(() => {
         inputView.classList.remove("active");
         status.style.display = "none";
@@ -1364,6 +1416,16 @@
     }
 
     // Morph the window from Input to Preview mode with animation
+    // Fold the follow-up box away instantly (inside a height animation).
+    function foldFollowup() {
+      if (!resultView.classList.contains("asking")) return;
+      followupWrap.classList.add("snap");
+      resultView.classList.remove("asking");
+      askMoreBtn.classList.remove("on");
+      void followupWrap.offsetHeight;
+      followupWrap.classList.remove("snap");
+    }
+
     function showPreviewMode(text, actionType, kind) {
       pendingAiText = text;
 
@@ -1374,6 +1436,9 @@
         status.style.display = "none";
 
         resultView.classList.remove("loading");
+        // A follow-up was answered: tuck the box away again ("Ask more"
+        // brings it back).
+        foldFollowup();
         // Real text + an aria-hidden copy that carries the colour band
         const base = document.createElement("span");
         base.className = "rt-base";
@@ -1394,31 +1459,23 @@
         updateResultFade();
         updateFollowupState();
 
+        // Replace only when the pane shows a new version of the selection
+        // (not a chat reply) and there's somewhere to write it back to.
         const canReplace =
-          context.tier !== "readonly" && actionType !== "ask" && !!lastEditText;
+          context.tier !== "readonly" && actionType !== "ask" && kind === "edit";
 
         // Show the warning ONLY if the user tried to execute an 'edit' on static text
         if (actionType === "edit" && context.tier === "readonly") {
           noticeEl.textContent = "Static text detected — edits will show as a copyable result.";
           noticeEl.style.display = "block";
-        } else if (kind === "reply" && lastEditText && actionType !== "ask") {
-          // The pane is showing a chat reply, not a new version — make it
-          // clear what Replace/Copy will actually use.
-          noticeEl.textContent = canReplace
-            ? "Replace will insert your last edited version."
-            : "Copy will copy your last edited version.";
-          noticeEl.style.display = "block";
         } else {
           noticeEl.style.display = "none";
         }
 
-        // Hide Replace on read-only fields, in 'ask' mode, or when there's no edit yet
         replaceBtn.style.display = canReplace ? "" : "none";
       });
 
-      // Let the user immediately keep the conversation going without an
-      // extra click — this is the whole point of not dead-ending here.
-      followupInput.focus();
+
     }
 
     function submit(actionType, instructionOverride) {
@@ -1472,7 +1529,6 @@
 
           // Older backends don't send `kind`; fall back to the old behaviour.
           const kind = response.kind || (actionType === "ask" ? "reply" : "edit");
-          if (kind === "edit") lastEditText = response.edited_text;
 
           if (instructionOverride !== undefined) {
             followupInput.value = "";
@@ -1503,6 +1559,16 @@
     }
 
     followupBtn.addEventListener("click", submitFollowup);
+
+    // "Ask more" opens (or closes) the follow-up box under the action bar.
+    // The CSS animates it; the box's auto height follows along.
+    askMoreBtn.addEventListener("click", () => {
+      wrapEl.style.height = ""; // never let a leftover fixed height clip it
+      const open = resultView.classList.toggle("asking");
+      askMoreBtn.classList.toggle("on", open);
+      if (open) followupInput.focus();
+      else askMoreBtn.focus();
+    });
 
     followupInput.addEventListener("input", () => {
       updateFollowupState();
@@ -1562,7 +1628,7 @@
     input.addEventListener("keypress", (e) => e.stopPropagation());
 
     replaceBtn.addEventListener("click", async () => {
-      if (!lastEditText) {
+      if (!pendingAiText) {
         closeActiveBox();
         return;
       }
@@ -1570,7 +1636,7 @@
       replaceBtn.disabled = true;
       let ok = false;
       try {
-        ok = await applyEdit(context, lastEditText);
+        ok = await applyEdit(context, pendingAiText);
       } catch (e) {
         console.warn("[Sicily Navigator] applyEdit failed:", e);
       }
@@ -1578,7 +1644,7 @@
       if (!ok) {
         // Couldn't write safely (text changed, editor re-rendered, Docs
         // rejected the paste…) — never silently lose the result.
-        navigator.clipboard?.writeText(lastEditText).catch(() => { });
+        navigator.clipboard?.writeText(pendingAiText).catch(() => { });
         showError("Couldn't apply it here — copied the edit to your clipboard instead.");
         replaceBtn.disabled = false;
         return;
@@ -1588,7 +1654,7 @@
     });
 
     copyBtn.addEventListener("click", () => {
-      navigator.clipboard?.writeText(lastEditText || pendingAiText).catch(() => { });
+      navigator.clipboard?.writeText(pendingAiText).catch(() => { });
       copyBtn.textContent = "Copied";
       copyBtn.classList.add("btn-success"); // Apply Green Success Gradient
       setTimeout(() => {

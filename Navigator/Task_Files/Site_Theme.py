@@ -666,6 +666,10 @@ async def process_repair_theme(req: RepairThemeRequest) -> ThemeRecord:
     if not row:
         raise ValueError("No theme saved for this site")
 
+    # The theme this repair was judged against. If it's removed or
+    # regenerated while the model is thinking, the result is discarded.
+    base_updated_at = row["updated_at"]
+
     issues = [x for x in req.issues if _safe_selector(x.sel)][:MAX_ISSUES]
     images = [x for x in req.images if _safe_selector(x.sel)][:MAX_IMAGES]
     page_bg = normalize_hex(req.page_bg) or "#16181d"
@@ -722,7 +726,12 @@ async def process_repair_theme(req: RepairThemeRequest) -> ThemeRecord:
                  fixes=len(repairs["fixes"]), image_actions=len(repairs["images"]),
                  seconds=round(time.time() - started, 1))
 
-    record = dict(row)
+    current = store.get(host)
+    if current is None or current["updated_at"] != base_updated_at:
+        log.info("Theme repair discarded: theme was removed or regenerated meanwhile", host=host)
+        raise ValueError("Theme was removed or regenerated during repair")
+
+    record = dict(current)
     record["repairs"] = repairs
     record["updated_at"] = time.time()
     saved = store.upsert(record)
