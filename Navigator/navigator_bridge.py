@@ -69,9 +69,11 @@ from Navigator.Task_Files.Reading_List_Groups import (
 )
 from Navigator.Task_Files.Site_Theme import (
     GenerateThemeRequest,
+    RepairThemeRequest,
     ThemeRecord,
     ListThemesResponse,
     process_generate_theme,
+    process_repair_theme,
     process_get_theme,
     process_list_themes,
     process_delete_theme,
@@ -198,6 +200,14 @@ async def generate_theme(req: GenerateThemeRequest):
         return await process_generate_theme(req)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/theme/repair", response_model=ThemeRecord)
+async def repair_theme(req: RepairThemeRequest):
+    """AI repair pass: small per-site fixes on top of the instant base theme."""
+    try:
+        return await process_repair_theme(req)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 @app.get("/themes", response_model=ListThemesResponse)
 async def list_themes():
@@ -550,11 +560,15 @@ async def websocket_endpoint(websocket: WebSocket, tab_id: str):
                     async def generate_and_save_title():
                         try:
                             llm = configuration.navigator_basic_llm()
+                            # The opening of each side is plenty to name a
+                            # chat — no need to pay for the full first reply.
+                            TITLE_CTX_CHARS = 300
                             prompt = (
                                 "Generate a chat title based on this first interaction. "
                                 "Keep the name very short and concise. Just a few words. "
                                 "Do not use quotes or prefixes. Just the title.\n\n"
-                                f"User: {user_text}\n\nAI: {reply_text}"
+                                f"User: {user_text[:TITLE_CTX_CHARS]}\n\n"
+                                f"AI: {reply_text[:TITLE_CTX_CHARS]}"
                             )
                             title_msg = await llm.ainvoke(prompt)
                             title = content_to_text(title_msg.content).strip(' "')

@@ -11,6 +11,11 @@
  *                                       for this site (e.g. the site turns
  *                                       out to have its own dark mode).
  *
+ * After a theme is applied, a one-time AI repair pass runs in the
+ * background (repairInBackground): the page engine lists what the base
+ * theme had to force-fix, the backend designs a few small fixes, and they
+ * are saved with the site's theme — later visits apply them instantly.
+ *
  * "Manage themed sites" switches the card to a list of every themed
  * site, each removable from there.
  *
@@ -118,6 +123,12 @@ export async function openThemeOverlay() {
   }
 
   render();
+
+  // Themes made before the repair pass existed (or whose repair failed)
+  // get it now, once.
+  if (state.ready && state.record && !state.record.repairs?.repaired_at) {
+    repairInBackground(tab.id, host);
+  }
 }
 
 // ── Actions ──────────────────────────────────────────────────────────
@@ -165,6 +176,55 @@ async function makeDark() {
   } finally {
     setBusy(false);
     render();
+  }
+
+  if (state.record) repairInBackground(state.tab.id, state.host);
+}
+
+// ── AI repair pass (once per site, in the background) ───────────────
+// Waits for the base theme to settle on the page, collects what the
+// engine had to force-fix, and asks the backend for small per-site fixes.
+// Saving the returned record to chrome.storage.local makes every open tab
+// on the site pick the fixes up. Never blocks the overlay.
+const REPAIR_SETTLE_MS = 1500;
+const repairing = new Set();
+
+function setRepairStatus(host, text, working = false) {
+  if (state.host === host && overlay.classList.contains("active") && !state.busy) {
+    statusEl.textContent = text;
+    statusEl.classList.toggle("is-working", working);
+  }
+}
+
+async function repairInBackground(tabId, host) {
+  if (repairing.has(host)) return;
+  repairing.add(host);
+  setRepairStatus(host, "Fine-tuning for this site…", true);
+  try {
+    await new Promise((r) => setTimeout(r, REPAIR_SETTLE_MS));
+
+    const c = await sendToTab(tabId, { type: "sicily-theme-collect" });
+    if (!c?.ok || !c.input) throw new Error(c?.error || "Nothing collected");
+
+    const res = await fetch(`http://${BACKEND_HOST}/theme/repair`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(c.input),
+    });
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const record = await res.json();
+
+    await chrome.storage.local.set({ [keyFor(record.host)]: record });
+    if (state.host === host) state.record = record;
+
+    const n = (record.repairs?.fixes?.length || 0) + (record.repairs?.images?.length || 0);
+    setRepairStatus(host, record.repairs?.repaired_at ? (n ? "Fine-tuned for this site." : "") : "");
+  } catch (err) {
+    // Not fatal: the base theme stays as it is, and the next open retries.
+    console.warn("Theme repair skipped:", err);
+    setRepairStatus(host, "");
+  } finally {
+    repairing.delete(host);
   }
 }
 
@@ -265,7 +325,9 @@ function renderSites(hosts) {
 // ── Rendering ────────────────────────────────────────────────────────
 
 function render() {
-  statusEl.textContent = "";
+  const working = repairing.has(state.host);
+  statusEl.textContent = working ? "Fine-tuning for this site…" : "";
+  statusEl.classList.toggle("is-working", working);
   actionBtn.classList.remove("hidden", "is-remove");
 
   if (state.record) {

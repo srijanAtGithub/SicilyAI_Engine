@@ -8,6 +8,11 @@
  *      hostname (a mirror of the backend's SQLite ThemeStore, kept in
  *      sync by background.js and the side panel), recolour the page as
  *      early as possible.
+ *   1b. REPAIR — a theme record may carry per-site "repairs" (small CSS
+ *      fixes + image inversions designed once by the AI repair pass, see
+ *      Site_Theme.py). They're applied on top of the base theme, and
+ *      collectRepairInput() gathers what the base theme had to force-fix
+ *      so the repair pass knows what to look at.
  *   2. MEASURE — when the side panel asks, measure the ORIGINAL page:
  *      area per background colour, text weight per text colour, border
  *      usage, surface depth, and which text sits on which background.
@@ -431,6 +436,59 @@
   }
 
   // ══════════════════════════════════════════════════════════════════
+  // 2c. Per-site repairs (designed once by the AI repair pass)
+  // ══════════════════════════════════════════════════════════════════
+  // record.repairs = {
+  //   fixes:  [{ selector, background?, color?, border? }]   (6-digit hex)
+  //   images: [{ selector, action: "invert" | "dim" }]
+  // }
+  // Applied as !important rules at the end of our stylesheet. The safety
+  // net leaves any property a repair sets alone, so the two never fight.
+
+  const HEX6 = /^#[0-9a-f]{6}$/i;
+
+  function safeSelector(sel) {
+    if (typeof sel !== "string" || !sel || sel.length > 300 || /[{}<>;]/.test(sel)) return false;
+    try { document.querySelector(sel); return true; } catch (_) { return false; }
+  }
+
+  function safeMatches(el, sel) {
+    if (!sel) return false;
+    try { return el.matches(sel); } catch (_) { return false; }
+  }
+
+  function buildRepairSels(record) {
+    const out = { bg: [], fg: [], border: [] };
+    for (const f of record?.repairs?.fixes || []) {
+      if (!safeSelector(f.selector)) continue;
+      if (HEX6.test(f.background || "")) out.bg.push(f.selector);
+      if (HEX6.test(f.color || "")) out.fg.push(f.selector);
+      if (HEX6.test(f.border || "")) out.border.push(f.selector);
+    }
+    return { bg: out.bg.join(","), fg: out.fg.join(","), border: out.border.join(",") };
+  }
+
+  function repairCss() {
+    const r = currentRecord?.repairs;
+    if (!r) return "";
+    let css = "";
+    for (const f of r.fixes || []) {
+      if (!safeSelector(f.selector)) continue;
+      const d = [];
+      if (HEX6.test(f.background || "")) d.push(`background-color:${f.background}!important`);
+      if (HEX6.test(f.color || "")) d.push(`color:${f.color}!important`);
+      if (HEX6.test(f.border || "")) d.push(`border-color:${f.border}!important`);
+      if (d.length) css += `${f.selector}{${d.join(";")}}`;
+    }
+    for (const im of r.images || []) {
+      if (!safeSelector(im.selector)) continue;
+      if (im.action === "invert") css += `${im.selector}{filter:invert(0.88) hue-rotate(180deg)!important}`;
+      else if (im.action === "dim") css += `${im.selector}{filter:brightness(0.82)!important}`;
+    }
+    return css;
+  }
+
+  // ══════════════════════════════════════════════════════════════════
   // 3. Stylesheet rewriting
   // ══════════════════════════════════════════════════════════════════
 
@@ -438,6 +496,8 @@
   let mapper = null;
   let mapperId = 0;
   let pendingRemote = 0;
+  let currentRecord = null;
+  let repairSels = { bg: "", fg: "", border: "" };
 
   const sheetCache = new WeakMap();   // CSSStyleSheet -> { sig, mapperId, css }
   const remoteSheets = new Map();     // href -> { status, sheet, css, mapperId }
@@ -625,6 +685,7 @@
       const css = sheetCss(sheet);
       if (css) chunks.push(css);
     }
+    chunks.push(repairCss());
     return chunks.join("\n");
   }
 
@@ -758,6 +819,7 @@
       inlineState.delete(el);
     }
     touchedInline.clear();
+    forcedLog = new Map();
   }
 
   function reapplyInline() {
@@ -812,9 +874,19 @@
     return out;
   }
 
-  function setForced(el, prop, value) {
+  // What the safety net had to force, per element — the repair pass's
+  // input. was = the colour on screen before forcing, now = what we forced.
+  let forcedLog = new Map(); // el -> Map(prop -> { was, now })
+
+  function setForced(el, prop, value, was) {
     const st = el.style;
     if (!st) return;
+    if (was != null) {
+      let m = forcedLog.get(el);
+      if (!m) { m = new Map(); forcedLog.set(el, m); }
+      if (!m.has(prop)) m.set(prop, { was, now: value });
+      else m.get(prop).now = value;
+    }
     let state = inlineState.get(el);
     const prev = state && state.get(prop);
     const orig = prev ? prev.orig : st.getPropertyValue(prop);
@@ -875,15 +947,20 @@
       const cs = getComputedStyle(el);
       if (cs.display === "none") return;
 
+      // A per-site repair owns these properties on this element.
+      const repBg = safeMatches(el, repairSels.bg);
+      const repFg = safeMatches(el, repairSels.fg);
+      const repBorder = safeMatches(el, repairSels.border);
+
       let bg = under;
       const own = parseColor(cs.backgroundColor);
       if (own && own.a > 0.05) {
         let eff = blend(own, under);
         const lch = toOklch(eff);
         const tooLight = lch.C > 0.08 ? lch.L > 0.8 : lch.L > 0.6;
-        if (tooLight && own.a > 0.3) {
+        if (tooLight && own.a > 0.3 && !repBg) {
           const dark = { ...mapper.mapRgb(own, "bg"), a: own.a };
-          setForced(el, "background-color", fmt(dark));
+          setForced(el, "background-color", fmt(dark), fmt(own));
           eff = blend(dark, under);
         }
         bg = eff;
@@ -891,21 +968,22 @@
 
       // Light borders and outline-style shadows left from the original look.
       for (const side of ["top", "right", "bottom", "left"]) {
+        if (repBorder) break;
         if (!(parseFloat(cs[`border-${side}-width`]) > 0)) continue;
         const c = parseColor(cs[`border-${side}-color`]);
-        if (c && c.a > 0.05 && toOklch(c).L > 0.6) setForced(el, `border-${side}-color`, fmt({ ...mapper.mapRgb(c, "border"), a: c.a }));
+        if (c && c.a > 0.05 && toOklch(c).L > 0.6) setForced(el, `border-${side}-color`, fmt({ ...mapper.mapRgb(c, "border"), a: c.a }), fmt(c));
       }
       if (cs.boxShadow && cs.boxShadow !== "none") {
         const lightShadow = (cs.boxShadow.match(COLOR_TOKEN) || []).some((t) => { const c = parseColor(t); return c && c.a > 0.05 && toOklch(c).L > 0.6; });
         if (lightShadow) { const m = mapper.mapValue(cs.boxShadow, "border"); if (m) setForced(el, "box-shadow", m); }
       }
 
-      if (hasOwnText(el)) {
+      if (!repFg && hasOwnText(el)) {
         const fg = parseColor(cs.color);
         if (fg && fg.a > 0.05) {
           // Dimmed / disabled text keeps a lower bar so it still reads as dimmed.
           const need = fg.a < 0.7 ? 3 : 4.5;
-          if (contrastRatio(blend(fg, bg), bg) < need) setForced(el, "color", fmt(readableOn(fg, bg, need)));
+          if (contrastRatio(blend(fg, bg), bg) < need) setForced(el, "color", fmt(readableOn(fg, bg, need)), fmt(fg));
         }
       }
 
@@ -1036,6 +1114,8 @@
 
   function enable(record) {
     const changedMapping = active;
+    currentRecord = record;
+    repairSels = buildRepairSels(record);
     mapper = makeMapper(record);
     mapperId++;
     if (!active) {
@@ -1062,6 +1142,130 @@
     inlineQueue.clear();
     fixRoots.clear();
     mapper = null;
+    currentRecord = null;
+    repairSels = { bg: "", fg: "", border: "" };
+  }
+
+  // ══════════════════════════════════════════════════════════════════
+  // 6b. Repair input — what the base theme couldn't handle cleanly
+  // ══════════════════════════════════════════════════════════════════
+  // Run on the THEMED page, after the safety net: every element it had to
+  // force-correct (with its colours before/after), plus visible images.
+  // Elements are addressed by short, stable CSS selectors so the saved
+  // fixes still apply on the next visit.
+
+  const MAX_ISSUES = 40;
+  const MAX_IMAGES = 25;
+
+  // Rejects generated class names / ids (css-1x2y3z, Button_root__a1B2c,
+  // sc-…, long digit runs) that change between deploys.
+  function stableToken(t) {
+    if (!/^[A-Za-z][\w-]{1,40}$/.test(t)) return false;
+    if (/^(css|sc|jsx|svelte|emotion|tw|ng|v)-/i.test(t)) return false;
+    if (/\d{3,}/.test(t)) return false;
+    const tail = t.split(/[_-]/).pop();
+    if (tail.length >= 5 && /\d/.test(tail) && /[a-z]/i.test(tail)) return false;
+    return true;
+  }
+
+  function cssPath(el) {
+    const parts = [];
+    let node = el;
+    for (let d = 0; node && node.nodeType === 1 && node !== document.body && node !== document.documentElement && d < 4; d++) {
+      if (node.id && stableToken(node.id)) { parts.unshift("#" + CSS.escape(node.id)); break; }
+      const cls = [...node.classList].filter(stableToken).slice(0, 2);
+      parts.unshift(node.tagName.toLowerCase() + cls.map((c) => "." + CSS.escape(c)).join(""));
+      node = node.parentElement;
+    }
+    if (!parts.length) return null;
+    const sel = parts.join(" ");
+    try {
+      const all = document.querySelectorAll(sel);
+      // A selector that hits a few similar elements is fine (all the tabs
+      // in a tab bar should get the same fix); one that hits everything isn't.
+      if (!all.length || all.length > 30 || ![...all].includes(el)) return null;
+    } catch (_) {
+      return null;
+    }
+    return sel;
+  }
+
+  const area = (el) => { const r = el.getBoundingClientRect(); return r.width * r.height; };
+
+  function collectRepairInput() {
+    if (!active || !mapper || !document.body) return null;
+
+    // Make sure the safety net has just run over the whole page.
+    fixAll = true;
+    runFix();
+
+    const issues = [];
+    const seen = new Set();
+    const forced = [...forcedLog]
+      .filter(([el]) => el.isConnected)
+      .map(([el, props]) => ({ el, props, a: area(el) }))
+      .filter((e) => e.a > 0)
+      .sort((x, y) => y.a - x.a);
+
+    for (const { el, props } of forced) {
+      if (issues.length >= MAX_ISSUES) break;
+      const sel = cssPath(el);
+      if (!sel || seen.has(sel)) continue;
+      seen.add(sel);
+      const o = {
+        i: issues.length,
+        sel,
+        tag: el.tagName.toLowerCase(),
+        text: (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 40),
+        behind: toHex(backdropOf(el.parentElement || el)),
+      };
+      const hint = [
+        el.getAttribute("role"),
+        el.getAttribute("aria-selected") === "true" && "selected",
+        el.getAttribute("aria-current") && "current",
+        el.getAttribute("aria-pressed") === "true" && "pressed",
+        el.disabled && "disabled",
+        ...[...el.classList].filter(stableToken).slice(0, 3),
+      ].filter(Boolean).join(" ");
+      if (hint) o.hint = hint.slice(0, 80);
+      for (const [prop, { was, now }] of props) {
+        const k = prop === "background-color" ? "bg" : prop === "color" ? "fg" : prop.startsWith("border") ? "border" : null;
+        if (!k || o[k + "_was"]) continue;
+        o[k + "_was"] = was;
+        o[k + "_now"] = now;
+      }
+      issues.push(o);
+    }
+
+    const images = [];
+    const seenImg = new Set();
+    const imgs = [...document.images]
+      .filter((img) => img.complete && img.isConnected && getComputedStyle(img).display !== "none")
+      .map((img) => ({ img, a: area(img) }))
+      .filter((e) => e.a >= 576) // ≥ 24×24
+      .sort((x, y) => y.a - x.a);
+
+    for (const { img } of imgs) {
+      if (images.length >= MAX_IMAGES) break;
+      const sel = cssPath(img);
+      if (!sel || seenImg.has(sel)) continue;
+      seenImg.add(sel);
+      const src = img.currentSrc || img.src || "";
+      const ext = (src.match(/\.(svg|png|jpe?g|gif|webp|avif)(?:[?#]|$)/i) || [])[1];
+      const r = img.getBoundingClientRect();
+      images.push({
+        i: images.length,
+        sel,
+        type: src.startsWith("data:image/svg") ? "svg" : (ext || "other").toLowerCase(),
+        w: Math.round(r.width),
+        h: Math.round(r.height),
+        alt: (img.alt || "").slice(0, 40),
+        file: (src.split(/[?#]/)[0].split("/").pop() || "").slice(0, 40),
+        header: !!img.closest("header, nav, [role=banner]"),
+      });
+    }
+
+    return { host: HOST, page_bg: mapper.pageBg, page_text: mapper.pageText, issues, images };
   }
 
   // ══════════════════════════════════════════════════════════════════
@@ -1295,6 +1499,8 @@
     try {
       if (msg.type === "sicily-theme-ping") {
         sendResponse({ ok: true, host: HOST, active });
+      } else if (msg.type === "sicily-theme-collect") {
+        sendResponse({ ok: true, input: collectRepairInput() });
       } else if (msg.type === "sicily-theme-measure") {
         sendResponse({ ok: true, summary: measure() });
       } else if (msg.type === "sicily-theme-status") {

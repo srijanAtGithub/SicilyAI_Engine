@@ -20,7 +20,7 @@ Pipeline:
      Returns title + url + a relevance-ranked content snippet per result —
      already close to publish-ready, no extraction step needed.
 
-  3. RANK (via navigator_smart_llm(schema=_RankResult)): hand
+  3. RANK (via navigator_basic_llm, structured as _RankResult): hand
      Tavily's candidates (title + url + snippet) back to the model
      alongside the fingerprint, ask for exactly 5 best matches with a
      one-line reason each — same structured-output pattern as step 1.
@@ -101,10 +101,54 @@ class _Fingerprint(BaseModel):
 
 
 class _RankResult(BaseModel):
-    """Internal only — the schema passed to navigator_smart_llm(schema=...)
+    """Internal only — the schema used for the ranking call
     for step 3. Wraps RelatedLink in the { "results": [...] } shape the
     ranking prompt asks for."""
     results: List[RelatedLink]
+
+
+# ── ONE STRUCTURED CALL (parsed result + usage, no second request) ─────
+#
+# Previously each step streamed events to capture usage and, if the parsed
+# object wasn't caught from that stream, called the model AGAIN with
+# ainvoke — a second, fully billed request (and on the smart model for
+# ranking). include_raw=True returns the parsed object and the raw message
+# (which carries usage_metadata) from a single request.
+
+# Caps on what the ranking step sees. Tavily's snippets can be long
+# paragraphs; ~350 chars is enough to judge topic/style.
+SNIPPET_MAX_CHARS = 350
+MAX_RANK_CANDIDATES = 12
+
+
+async def _structured_call(schema, messages, session_prefix: str):
+    llm = configuration.navigator_basic_llm().with_structured_output(
+        schema, include_raw=True
+    )
+    out = await llm.ainvoke(messages)
+
+    raw = out.get("raw") if isinstance(out, dict) else None
+    if raw is not None and getattr(raw, "usage_metadata", None):
+        try:
+            from usage_tracker import record_usage
+            usage = raw.usage_metadata
+            record_usage(
+                dimension="navigator",
+                session_id=f"{session_prefix}_{uuid.uuid4().hex[:8]}",
+                model_name=raw.response_metadata.get("model_name", "unknown"),
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+                cached_input_tokens=usage.get("input_token_details", {}).get("cache_read_tokens", 0),
+                message_id=getattr(raw, "id", None),
+            )
+        except Exception as rec_err:
+            log.warning("record_usage failed", step=session_prefix, error=str(rec_err))
+
+    parsed = out.get("parsed") if isinstance(out, dict) else None
+    if parsed is None:
+        err = out.get("parsing_error") if isinstance(out, dict) else None
+        raise ValueError(f"{session_prefix}: model output didn't match {schema.__name__}: {err}")
+    return parsed
 
 
 # ── STEP 1: FINGERPRINT ─────────────────────────────────────────────────
@@ -130,12 +174,6 @@ _FINGERPRINT_SYSTEM = SystemMessage(content=(
 async def _build_fingerprint(
     url: str, title: str, content: str, already_shown_count: int = 0
 ) -> _Fingerprint:
-    # Passing the schema makes navigator_basic_llm return a
-    # with_structured_output-wrapped model (see configuration.py) — the
-    # call below returns an already-validated _Fingerprint instance
-    # directly, not a chat message we'd need to parse JSON out of.
-    llm = configuration.navigator_basic_llm(schema=_Fingerprint)
-
     extra_instruction = ""
     if already_shown_count > 0:
         extra_instruction = (
@@ -150,43 +188,7 @@ async def _build_fingerprint(
         content=f"URL: {url}\nTitle: {title}\n\nContent:\n{content}{extra_instruction}"
     )
 
-    fingerprint = None
-    session_id = f"fingerprint_{uuid.uuid4().hex[:8]}"
-    
-    try:
-        from usage_tracker import record_usage
-        async for event in llm.astream_events([_FINGERPRINT_SYSTEM, human_msg], version="v2"):
-            
-            if event["event"] == "on_chat_model_end":
-                output = event.get("data", {}).get("output")
-                if output and hasattr(output, "usage_metadata") and output.usage_metadata:
-                    usage = output.usage_metadata
-                    model_name = output.response_metadata.get("model_name", "unknown")
-                    
-                    try:
-                        record_usage(
-                            dimension="navigator",
-                            session_id=session_id,
-                            model_name=model_name,
-                            input_tokens=usage.get("input_tokens", 0),
-                            output_tokens=usage.get("output_tokens", 0),
-                            cached_input_tokens=usage.get("input_token_details", {}).get("cache_read_tokens", 0)
-                        )
-                    except Exception as rec_err:
-                        log.warning("record_usage failed for fingerprint", error=str(rec_err))
-                        
-            elif event["event"] == "on_chain_end":
-                data_out = event.get("data", {}).get("output")
-                if isinstance(data_out, _Fingerprint):
-                    fingerprint = data_out
-                    
-    except Exception as e:
-        log.warning("Failed during fingerprint event stream tracking", error=str(e))
-    
-    if not fingerprint:
-        fingerprint = await llm.ainvoke([_FINGERPRINT_SYSTEM, human_msg])
-
-    return fingerprint
+    return await _structured_call(_Fingerprint, [_FINGERPRINT_SYSTEM, human_msg], "fingerprint")
 
 
 # ── STEP 2: SEARCH (Tavily API — real API, no scraping, no LLM) ─────────
@@ -272,7 +274,7 @@ async def _search_all_queries(
     return candidates
 
 
-# ── STEP 3: RANK (via navigator_smart_llm) ──────────────────────────────
+# ── STEP 3: RANK (via navigator_basic_llm) ──────────────────────────────
 
 _RANK_SYSTEM = SystemMessage(content=(
     "You are given a description of a web page (the 'source') and a list of "
@@ -295,9 +297,13 @@ async def _rank_candidates(
     if not candidates:
         return []
 
+    # Trim before ranking: Tavily already orders results by relevance, so
+    # keeping the first N and shortening each snippet loses little signal
+    # but cuts this prompt substantially.
+    trimmed = candidates[:MAX_RANK_CANDIDATES]
     candidates_block = "\n".join(
-        f"- title: {c['title']}\n  url: {c['url']}\n  snippet: {c['snippet']}"
-        for c in candidates
+        f"- title: {c['title']}\n  url: {c['url']}\n  snippet: {c['snippet'][:SNIPPET_MAX_CHARS]}"
+        for c in trimmed
     )
 
     human_msg = HumanMessage(content=(
@@ -309,45 +315,9 @@ async def _rank_candidates(
         f"CANDIDATES\n{candidates_block}"
     ))
 
-    # Same pattern as _build_fingerprint — schema=_RankResult gets back an
-    # already-validated instance, no manual JSON parsing needed.
-    llm = configuration.navigator_smart_llm(schema=_RankResult)
-    
-    rank_result = None
-    session_id = f"rank_{uuid.uuid4().hex[:8]}"
-    
-    try:
-        from usage_tracker import record_usage
-        async for event in llm.astream_events([_RANK_SYSTEM, human_msg], version="v2"):
-            
-            if event["event"] == "on_chat_model_end":
-                output = event.get("data", {}).get("output")
-                if output and hasattr(output, "usage_metadata") and output.usage_metadata:
-                    usage = output.usage_metadata
-                    model_name = output.response_metadata.get("model_name", "unknown")
-                    
-                    try:
-                        record_usage(
-                            dimension="navigator",
-                            session_id=session_id,
-                            model_name=model_name,
-                            input_tokens=usage.get("input_tokens", 0),
-                            output_tokens=usage.get("output_tokens", 0),
-                            cached_input_tokens=usage.get("input_token_details", {}).get("cache_read_tokens", 0)
-                        )
-                    except Exception as rec_err:
-                        log.warning("record_usage failed for rank", error=str(rec_err))
-                        
-            elif event["event"] == "on_chain_end":
-                data_out = event.get("data", {}).get("output")
-                if isinstance(data_out, _RankResult):
-                    rank_result = data_out
-                    
-    except Exception as e:
-        log.warning("Failed during rank event stream tracking", error=str(e))
-        
-    if not rank_result:
-        rank_result = await llm.ainvoke([_RANK_SYSTEM, human_msg])
+    # Picking 5 links from titles + short snippets is a light task — the
+    # basic model handles it (this used to run on navigator_smart_llm).
+    rank_result = await _structured_call(_RankResult, [_RANK_SYSTEM, human_msg], "rank")
 
     results = rank_result.results
 

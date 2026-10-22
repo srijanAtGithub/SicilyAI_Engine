@@ -68,6 +68,19 @@ def _sanitize_groups(groups: list, allowed_ids: set[int]) -> list[dict]:
     return clean
 
 
+def _short_url(url: str) -> str:
+    """host + path only (no scheme, query string or fragment)."""
+    from urllib.parse import urlparse
+    try:
+        p = urlparse(url)
+    except Exception:
+        return url
+    if not p.netloc:
+        return url  # chrome://, about:, file paths etc. — leave as is
+    host = p.netloc[4:] if p.netloc.startswith("www.") else p.netloc
+    return f"{host}{p.path.rstrip('/')}"
+
+
 # ── ORGANISE TABS LOGIC ─────────────────────────────────────────────
 async def process_organise_tabs(tabs: list[TabInfo]) -> dict:
     """
@@ -114,12 +127,19 @@ async def process_organise_tabs(tabs: list[TabInfo]) -> dict:
         )
     )
 
-    # Only send unpinned tabs to the LLM
+    # Only send unpinned tabs to the LLM. Kept compact to save tokens:
+    #   - no indent/whitespace in the JSON
+    #   - URLs reduced to host + path (query strings / fragments are mostly
+    #     tracking params and session ids — noise for grouping)
+    #   - groupId dropped (the model never used it)
     tabs_data = [
-        {"id": t.id, "title": t.title, "url": t.url, "groupId": t.groupId}
+        {"id": t.id, "title": t.title, "url": _short_url(t.url)}
         for t in groupable_tabs
     ]
-    prompt_text = f"Please organize these active browser tabs:\n\n{json.dumps(tabs_data, indent=2)}"
+    prompt_text = (
+        "Please organize these active browser tabs:\n\n"
+        + json.dumps(tabs_data, separators=(",", ":"), ensure_ascii=False)
+    )
 
     log.info("Organising tabs with LLM", tab_count=len(groupable_tabs))
 

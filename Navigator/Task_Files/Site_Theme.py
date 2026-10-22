@@ -1,9 +1,11 @@
 """
 Site_Theme.py
 -------------
-AI dark themes for light websites.
+Dark themes for light websites.
 
-Design: colour fundamentals in code, AI only for taste.
+Design: the base theme is fully deterministic — no model call, so it is
+instant and free. AI is used only for what a rule-based engine can't do
+— the per-site REPAIR PASS at the bottom of this file.
   - theme_engine.js measures the rendered page locally and sends a compact
     palette summary (clustered colours, their background / text / border
     share, surface depth, text-on-background pairs). No page content.
@@ -12,22 +14,25 @@ Design: colour fundamentals in code, AI only for taste.
     surfaces, primary / secondary / disabled text, subtle borders, and
     accents that keep their hue. This guarantees depth and contrast on
     every site.
-  - The smart model makes only the taste decisions: which brand hue (if
-    any) faintly tints the dark surfaces, how strongly, and how deep the
-    page sits within a safe range. ~20 output tokens, low reasoning effort.
+  - The three taste decisions — which brand hue (if any) faintly tints
+    the dark surfaces, how strongly, and how deep the page sits — are made
+    by choose_params() from the measured palette. These used to come from
+    the smart model, but they barely change the result and a rule picks
+    them just as well, without latency or cost.
   - validate() then enforces text contrast and surface separation.
   - Results are stored per hostname in ThemeStore (SQLite).
 """
 
 import math
 import re
+import json
 import time
 import uuid
 from typing import Literal, Optional
 
 import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 import configuration
 from Navigator.Task_Files.ThemeStore import ThemeStore
@@ -75,7 +80,7 @@ class ThemeAnchor(BaseModel):
 
 
 class ThemeParams(BaseModel):
-    """The model's whole answer — the three taste decisions."""
+    """The three taste decisions (see choose_params)."""
     hue: Optional[float] = Field(description="OKLCH hue (0-360) of the brand colour that faintly tints dark surfaces, or null for neutral grey")
     tint: float = Field(description="Tint chroma, 0 to 0.02")
     page: float = Field(description="Page surface OKLCH lightness, 0.12 to 0.18")
@@ -90,7 +95,13 @@ class ThemeRecord(BaseModel):
     params: dict = {}
     fingerprint: str = ""
     notes: str = ""
-    source: Literal["ai", "fallback"] = "ai"
+    # "auto" = deterministic base theme. "ai" / "fallback" are kept so
+    # themes saved by the old model-based version still load.
+    source: Literal["auto", "ai", "fallback"] = "auto"
+    # Per-site AI repairs (see the REPAIR PASS section). Empty until the
+    # repair pass has run for this site; reset whenever the base theme is
+    # regenerated, since its selectors/colours were judged against it.
+    repairs: dict = {}
     updated_at: float
 
 
@@ -273,21 +284,54 @@ def ladder(hex_value: str, role: str, p: dict) -> str:
     return tone(lo, min(C, 0.04))
 
 
-# ── PROMPT ──────────────────────────────────────────────────────────────
+# ── TASTE DECISIONS (deterministic) ─────────────────────────────────────
+#
+# hue   — the site's brand colour: the most-used saturated colour (weighted
+#         by where it appears: surfaces > text > borders). Red / orange /
+#         yellow / brown and deep pink brands are skipped (grey instead),
+#         because tinting dark surfaces with them looks muddy.
+# tint  — stronger when the brand colour is more prominent, 0.006-0.012.
+# page  — app-like UIs (many distinct surfaces, nested panels) get a crisp,
+#         deeper page; reading sites get a softer one.
 
-_SYSTEM = """You choose dark-theme parameters for a website from its colours. Reply with JSON only.
-hue: OKLCH hue (0-360) of the site's brand colour, used to faintly tint dark surfaces; null for plain grey (monochrome sites, or red/orange/yellow brands, where tinted dark surfaces look muddy).
-tint: tint strength 0-0.02 (0.006-0.012 typical; 0 if hue is null).
-page: page surface lightness 0.12-0.18 (0.13 crisp and high-contrast for tools and apps; 0.16-0.18 softer for reading sites)."""
+ACCENT_MIN_CHROMA = 0.08
+BRAND_MIN_SCORE = 0.004
+MUDDY_HUES = ((0.0, 115.0), (345.0, 360.0))  # red, orange, yellow, brown, deep pink
 
 
-def _user_prompt(req: GenerateThemeRequest) -> str:
-    rows = []
-    for p in sorted(req.palette, key=lambda c: -(c.bg_share + c.text_share + c.border_share))[:10]:
-        use = max(("bg", p.bg_share), ("text", p.text_share), ("border", p.border_share), key=lambda x: x[1])
-        L, C, H = hex_to_oklch(p.hex)
-        rows.append(f"{normalize_hex(p.hex)} {use[0]} {use[1]:.2f} h{round(H)} c{C:.2f}")
-    return f"{req.host}\n" + "\n".join(rows)
+def _brand_hue(req: GenerateThemeRequest) -> tuple[Optional[float], float]:
+    best_h, best_score = None, 0.0
+    for p in req.palette:
+        hx = normalize_hex(p.hex)
+        if not hx:
+            continue
+        L, C, H = hex_to_oklch(hx)
+        if C <= ACCENT_MIN_CHROMA or L < 0.2 or L > 0.95:
+            continue
+        score = p.bg_share + 0.5 * p.text_share + 0.25 * p.border_share
+        if score > best_score:
+            best_h, best_score = H, score
+    if best_h is None or best_score < BRAND_MIN_SCORE:
+        return None, 0.0
+    if any(lo <= best_h < hi for lo, hi in MUDDY_HUES):
+        return None, best_score
+    return best_h, best_score
+
+
+def _page_depth(req: GenerateThemeRequest) -> float:
+    surfaces = [p for p in req.palette if p.bg_share >= 0.01]
+    max_depth = max((p.depth for p in surfaces), default=0)
+    if len(surfaces) >= 4 or max_depth >= 2:
+        return 0.13   # app / tool: crisp, high contrast
+    if len(surfaces) <= 2 and max_depth <= 1:
+        return 0.16   # reading site: softer
+    return 0.145
+
+
+def choose_params(req: GenerateThemeRequest) -> dict:
+    hue, score = _brand_hue(req)
+    tint = 0.0 if hue is None else _clamp(0.006 + score * 0.06, 0.006, 0.012)
+    return clean_params({"hue": hue, "tint": tint, "page": _page_depth(req)})
 
 
 # ── VALIDATION ──────────────────────────────────────────────────────────
@@ -393,24 +437,6 @@ def _anchors(req: GenerateThemeRequest, mapping: dict) -> list[ThemeAnchor]:
     return anchors
 
 
-def _record_usage(raw, host: str) -> None:
-    try:
-        from usage_tracker import record_usage
-        if raw is not None and getattr(raw, "usage_metadata", None):
-            usage = raw.usage_metadata
-            record_usage(
-                dimension="navigator",
-                session_id=f"theme_{uuid.uuid4().hex[:8]}",
-                model_name=raw.response_metadata.get("model_name", "unknown"),
-                input_tokens=usage.get("input_tokens", 0),
-                output_tokens=usage.get("output_tokens", 0),
-                cached_input_tokens=usage.get("input_token_details", {}).get("cache_read_tokens", 0),
-                message_id=getattr(raw, "id", None),
-            )
-    except Exception as rec_err:
-        log.warning("record_usage failed for site theme", host=host, error=str(rec_err))
-
-
 # ── PROCESS FUNCTIONS (called from navigator_bridge.py) ─────────────────
 
 async def process_generate_theme(req: GenerateThemeRequest) -> ThemeRecord:
@@ -423,20 +449,7 @@ async def process_generate_theme(req: GenerateThemeRequest) -> ThemeRecord:
         raise ValueError("This site is already dark")
 
     started = time.time()
-    source = "ai"
-    params = None
-    try:
-        llm = configuration.navigator_smart_llm(reasoning_effort="low").with_structured_output(ThemeParams, include_raw=True)
-        result = await llm.ainvoke([SystemMessage(content=_SYSTEM), HumanMessage(content=_user_prompt(req))])
-        _record_usage(result.get("raw"), host)
-        params = result.get("parsed")
-        if params is None:
-            raise ValueError(f"Unparseable params: {result.get('parsing_error')}")
-    except Exception as e:
-        log.warning("Site theme fell back to default parameters", host=host, error=str(e))
-        source = "fallback"
-
-    params = clean_params(params)
+    params = choose_params(req)
     mapping, fixes = validate(req, params)
 
     record = ThemeRecord(
@@ -447,13 +460,14 @@ async def process_generate_theme(req: GenerateThemeRequest) -> ThemeRecord:
         anchors=_anchors(req, mapping),
         params=params,
         fingerprint=req.fingerprint,
-        source=source,
+        source="auto",
         updated_at=time.time(),
     )
     store.upsert(record.model_dump())
 
-    log.info("Site theme generated", host=host, source=source, params=params,
-             palette_size=len(req.palette), fixes=fixes, seconds=round(time.time() - started, 1))
+    log.info("Site theme generated", host=host, params=params,
+             palette_size=len(req.palette), fixes=fixes,
+             ms=round((time.time() - started) * 1000))
     return record
 
 
@@ -469,3 +483,249 @@ async def process_list_themes() -> ListThemesResponse:
 async def process_delete_theme(host: str) -> dict:
     existed = store.delete(host.strip().lower())
     return {"status": "deleted", "existed": existed}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# REPAIR PASS (AI)
+# ══════════════════════════════════════════════════════════════════════
+# The base theme is applied first, instantly. theme_engine.js then lists
+# what it had to force-correct on the live page (element selector, a hint
+# of what it is, colours before/after) plus the visible images. The model
+# sees that list in context and returns a FEW small fixes — only where the
+# forced result loses meaning (selected tabs, primary buttons, badges…) —
+# and which images to invert or dim. Every fix is validated here (dark
+# backgrounds, readable text, hex only, safe selectors) before it's saved
+# with the site's theme, so the next visit applies it with no model call.
+#
+# Cost shape: generous input (the issue list), tiny output (indices + hex).
+
+MAX_ISSUES = 40
+MAX_IMAGES = 25
+
+
+class RepairIssue(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    i: int
+    sel: str
+    tag: str = ""
+    hint: str = ""
+    text: str = ""
+    behind: str = ""
+    bg_was: Optional[str] = None
+    bg_now: Optional[str] = None
+    fg_was: Optional[str] = None
+    fg_now: Optional[str] = None
+    border_was: Optional[str] = None
+    border_now: Optional[str] = None
+
+
+class RepairImage(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    i: int
+    sel: str
+    type: str = ""
+    w: int = 0
+    h: int = 0
+    alt: str = ""
+    file: str = ""
+    header: bool = False
+
+
+class RepairThemeRequest(BaseModel):
+    host: str
+    page_bg: str = ""
+    page_text: str = ""
+    issues: list[RepairIssue] = []
+    images: list[RepairImage] = []
+
+
+class _Fix(BaseModel):
+    i: int = Field(description="Issue index")
+    background: Optional[str] = Field(default=None, description="New background, 6-digit hex, or null to keep")
+    color: Optional[str] = Field(default=None, description="New text colour, 6-digit hex, or null to keep")
+    border: Optional[str] = Field(default=None, description="New border colour, 6-digit hex, or null to keep")
+
+
+class _ImageAction(BaseModel):
+    i: int = Field(description="Image index")
+    action: Literal["invert", "dim"]
+
+
+class _RepairPlan(BaseModel):
+    fixes: list[_Fix] = Field(default_factory=list)
+    images: list[_ImageAction] = Field(default_factory=list)
+
+
+_REPAIR_SYSTEM = """You refine an automatic dark theme for one website.
+A rule-based pass already turned the page dark. The ISSUES are elements it had to force-correct, so their result may be flat or may have lost its meaning. Each issue has: i, sel (CSS selector), tag, hint (role / state / class names), text, behind (colour painted behind it), and for each changed property *_was (original light-theme colour) and *_now (the forced dark colour).
+
+Return a fix ONLY where the forced result is clearly worse than it should be, for example:
+- a selected / active / current item that no longer stands out from its siblings
+- a primary button, badge, tag, alert or highlight that lost its colour meaning
+- a surface that should match the page or its neighbours but now looks off
+Most issues need no fix — omit them.
+
+Fix rules: backgrounds stay dark (close to the page colour, or a deep shade of the original hue for meaningful items; saturated mid-tones only for primary buttons). Text must be clearly readable on its background. Keep the site's original hues for accents. Colours are 6-digit hex.
+
+IMAGES: list only images that should change. "invert" for diagrams, charts, screenshots of light interfaces, and dark single-colour logos or icons that would vanish on a dark page (often svg/png in a header). "dim" for very bright large graphics that would glare. Never change photos."""
+
+
+def _any_to_hex(value: Optional[str]) -> Optional[str]:
+    """Hex, or rgb()/rgba() from the engine (alpha ignored) -> #rrggbb."""
+    if not value:
+        return None
+    h = normalize_hex(value)
+    if h:
+        return h
+    m = re.match(r"^\s*rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)", value)
+    if not m:
+        return None
+    return rgb_to_hex(tuple(min(255.0, float(x)) / 255 for x in m.groups()))
+
+
+def _safe_selector(sel: str) -> bool:
+    return bool(sel) and len(sel) <= 300 and not re.search(r"[{}<>;]", sel)
+
+
+def _validate_fix(fix: _Fix, issue: RepairIssue, page_bg: str) -> Optional[dict]:
+    bg = normalize_hex(fix.background) if fix.background else None
+    if bg:
+        L, C, _ = hex_to_oklch(bg)
+        # Neutral surfaces must stay dark; saturated ones (buttons, badges)
+        # may sit at a mid tone, never light.
+        if L > (0.62 if C > 0.08 else 0.40):
+            bg = None
+
+    fg = normalize_hex(fix.color) if fix.color else None
+    border = normalize_hex(fix.border) if fix.border else None
+
+    # Text must stay readable on whatever ends up behind it — including
+    # when only the background was changed.
+    has_text = bool(issue.text) or bool(issue.fg_now or issue.fg_was)
+    if has_text and (fg or bg):
+        eff_bg = bg or _any_to_hex(issue.bg_now) or _any_to_hex(issue.behind) or page_bg
+        text = fg or _any_to_hex(issue.fg_now)
+        if text and eff_bg and contrast(text, eff_bg) < 4.5:
+            new_fg, _ = _separate(text, eff_bg, 4.5)
+            fg = new_fg if contrast(new_fg, eff_bg) >= 4.5 else (fg if not bg else None)
+            if fg is None and bg:
+                bg = None  # couldn't make the new background readable: drop it
+
+    if not (bg or fg or border):
+        return None
+    out = {"selector": issue.sel}
+    if bg:
+        out["background"] = bg
+    if fg:
+        out["color"] = fg
+    if border:
+        out["border"] = border
+    return out
+
+
+def _repair_prompt(req: RepairThemeRequest, issues, images) -> str:
+    def compact(model, drop=()):
+        d = model.model_dump(exclude_none=True, exclude_defaults=True)
+        d["i"] = model.i  # always keep the index, even when it's 0
+        for k in drop:
+            d.pop(k, None)
+        return d
+    lines = [
+        f"site: {req.host}",
+        f"page background: {normalize_hex(req.page_bg) or req.page_bg}",
+        f"page text: {normalize_hex(req.page_text) or req.page_text}",
+        "ISSUES:",
+        *(json.dumps(compact(x), separators=(",", ":"), ensure_ascii=False) for x in issues),
+        "IMAGES:",
+        *(json.dumps(compact(x, drop=("sel",)), separators=(",", ":"), ensure_ascii=False) for x in images),
+    ]
+    return "\n".join(lines)
+
+
+def _record_usage(raw, host: str) -> None:
+    try:
+        from usage_tracker import record_usage
+        if raw is not None and getattr(raw, "usage_metadata", None):
+            usage = raw.usage_metadata
+            record_usage(
+                dimension="navigator",
+                session_id=f"theme_repair_{uuid.uuid4().hex[:8]}",
+                model_name=raw.response_metadata.get("model_name", "unknown"),
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+                cached_input_tokens=usage.get("input_token_details", {}).get("cache_read_tokens", 0),
+                message_id=getattr(raw, "id", None),
+            )
+    except Exception as rec_err:
+        log.warning("record_usage failed for theme repair", host=host, error=str(rec_err))
+
+
+async def process_repair_theme(req: RepairThemeRequest) -> ThemeRecord:
+    host = req.host.strip().lower()
+    row = store.get(host)
+    if not row:
+        raise ValueError("No theme saved for this site")
+
+    issues = [x for x in req.issues if _safe_selector(x.sel)][:MAX_ISSUES]
+    images = [x for x in req.images if _safe_selector(x.sel)][:MAX_IMAGES]
+    page_bg = normalize_hex(req.page_bg) or "#16181d"
+
+    repairs = {
+        "fixes": [],
+        "images": [],
+        "issues_seen": len(issues),
+        "images_seen": len(images),
+        "repaired_at": time.time(),
+    }
+
+    # Nothing flagged and no images: the base theme is already clean —
+    # mark the site repaired without a model call.
+    if issues or images:
+        started = time.time()
+        try:
+            llm = configuration.navigator_smart_llm(reasoning_effort="low").with_structured_output(
+                _RepairPlan, include_raw=True
+            )
+            result = await llm.ainvoke([
+                SystemMessage(content=_REPAIR_SYSTEM),
+                HumanMessage(content=_repair_prompt(req, issues, images)),
+            ])
+            _record_usage(result.get("raw"), host)
+            plan = result.get("parsed")
+            if plan is None:
+                raise ValueError(f"Unparseable repair plan: {result.get('parsing_error')}")
+        except Exception as e:
+            # Leave the site un-repaired so it can be retried later.
+            log.warning("Theme repair failed", host=host, error=str(e))
+            return ThemeRecord(**row)
+
+        by_issue = {x.i: x for x in issues}
+        seen = set()
+        for f in plan.fixes:
+            issue = by_issue.get(f.i)
+            if not issue or f.i in seen:
+                continue
+            seen.add(f.i)
+            v = _validate_fix(f, issue, page_bg)
+            if v:
+                repairs["fixes"].append(v)
+
+        by_image = {x.i: x for x in images}
+        seen = set()
+        for a in plan.images:
+            img = by_image.get(a.i)
+            if img and a.i not in seen:
+                seen.add(a.i)
+                repairs["images"].append({"selector": img.sel, "action": a.action})
+
+        log.info("Theme repaired", host=host, issues=len(issues), images=len(images),
+                 fixes=len(repairs["fixes"]), image_actions=len(repairs["images"]),
+                 seconds=round(time.time() - started, 1))
+
+    record = dict(row)
+    record["repairs"] = repairs
+    record["updated_at"] = time.time()
+    saved = store.upsert(record)
+    if saved is None:
+        raise RuntimeError(f"Theme for {host} vanished while saving its repairs")
+    return ThemeRecord(**saved)

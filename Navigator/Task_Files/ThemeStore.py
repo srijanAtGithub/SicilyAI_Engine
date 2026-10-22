@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS site_themes (
     notes          TEXT NOT NULL DEFAULT '',
     source         TEXT NOT NULL DEFAULT 'ai',
     params_json    TEXT NOT NULL DEFAULT '{}',
+    repairs_json   TEXT NOT NULL DEFAULT '{}',
     created_at     REAL NOT NULL,
     updated_at     REAL NOT NULL
 )
@@ -48,6 +49,9 @@ class ThemeStore:
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(site_themes)")}
             if "params_json" not in cols:
                 conn.execute("ALTER TABLE site_themes ADD COLUMN params_json TEXT NOT NULL DEFAULT '{}'")
+            # ...and the per-site AI repairs column.
+            if "repairs_json" not in cols:
+                conn.execute("ALTER TABLE site_themes ADD COLUMN repairs_json TEXT NOT NULL DEFAULT '{}'")
             conn.commit()
 
     def _conn(self):
@@ -67,6 +71,7 @@ class ThemeStore:
             "notes": row["notes"],
             "source": row["source"],
             "params": json.loads(row["params_json"] or "{}"),
+            "repairs": json.loads(row["repairs_json"] or "{}"),
             "updated_at": row["updated_at"],
         }
 
@@ -87,8 +92,8 @@ class ThemeStore:
                 """
                 INSERT INTO site_themes
                     (host, enabled, original_mode, target_mode, anchors_json,
-                     fingerprint, notes, source, params_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     fingerprint, notes, source, params_json, repairs_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(host) DO UPDATE SET
                     enabled       = excluded.enabled,
                     original_mode = excluded.original_mode,
@@ -98,6 +103,7 @@ class ThemeStore:
                     notes         = excluded.notes,
                     source        = excluded.source,
                     params_json   = excluded.params_json,
+                    repairs_json  = excluded.repairs_json,
                     updated_at    = excluded.updated_at
                 """,
                 (
@@ -110,6 +116,7 @@ class ThemeStore:
                     record.get("notes", ""),
                     record.get("source", "ai"),
                     json.dumps(record.get("params", {})),
+                    json.dumps(record.get("repairs", {})),
                     now,
                     record.get("updated_at") or now,
                 ),

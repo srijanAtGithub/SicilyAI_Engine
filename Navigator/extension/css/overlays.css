@@ -1516,6 +1516,27 @@
     line-height: 1.5;
 }
 
+/* "Fine-tuning for this site…" — same sliding shimmer as "Thinking…" */
+.theme-status.is-working {
+    align-self: center;   /* shrink to the text so the light sweeps across the words, not the whole card width */
+    font-size: 13px;
+    font-weight: 500;
+    color: transparent;
+    background: linear-gradient(90deg,
+            #6b6b70 0 40%, #f2f2f7 50%, #6b6b70 60% 100%) 100% 0 / 250% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    animation: thinkingShimmer 1.6s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .theme-status.is-working {
+        animation: none;
+        color: #d8d8de;
+        background: none;
+    }
+}
+
 .theme-status:empty {
     display: none;
 }
