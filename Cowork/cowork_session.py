@@ -365,16 +365,10 @@ async def run_local_session():
             print("\nGoodbye!")
             break
 
-        # A fresh human message just arrived — this is the only point in
-        # the loop that represents a genuinely new turn (as opposed to a
-        # model tool call within the same turn), so it's the only place
-        # a pending run_script change is allowed to become apply-able.
-        # See the STATUS note at the bottom of cowork_tool_sandbox_exec.py.
-        from Cowork.cowork_sandbox_exec import _CHANGES
-        for cs in _CHANGES.values():
-            if not cs.applied and not cs.confirmed:
-                cs.confirmed = True
-
+        # No pending-change approval step here: run_script writes through
+        # immediately (see cowork_tool_sandbox_exec.py STATUS note), and
+        # ChangeSet has no `confirmed` field — reading it would raise
+        # AttributeError and crash the chat loop.
         messages.append(HumanMessage(content=user_input))
 
         # Summarize exactly once per user turn, here — this is the only
@@ -403,6 +397,13 @@ async def run_local_session():
         turn_llm_calls = 0
         turn_input_tokens = 0
         turn_output_tokens = 0
+
+        # Running copy of this turn's conversation, updated after every
+        # graph node finishes. The root graph's final output (step 4 below)
+        # never arrives if the run dies on GraphRecursionError, so without
+        # this the fallback would only see the pre-turn history and none of
+        # the tool results gathered this turn.
+        turn_messages = list(messages)
 
         try:
             # 1. Start the rich status spinner
@@ -473,8 +474,22 @@ async def run_local_session():
                         if DEBUG:
                             status.update(f"[yellow]{tool_name} hit an error: {error}[/yellow]")
                     
+                    # Each completed graph node ("main" or "tools") returns
+                    # only its NEW messages — append them as they arrive so
+                    # turn_messages always reflects everything done so far.
+                    # Matching name == langgraph_node skips inner runnables
+                    # that execute inside a node.
+                    elif (
+                        event["event"] == "on_chain_end"
+                        and event.get("name") in ("main", "tools")
+                        and event.get("metadata", {}).get("langgraph_node") == event.get("name")
+                    ):
+                        output = event.get("data", {}).get("output")
+                        if isinstance(output, dict) and output.get("messages"):
+                            turn_messages.extend(output["messages"])
+
                     # 4. Capture the final state when the main graph finishes
-                    elif event["event"] == "on_chain_end" and event.get("run_id") == root_run_id:
+                    if event["event"] == "on_chain_end" and event.get("run_id") == root_run_id:
                         output = event.get("data", {}).get("output")
                         if output and "messages" in output:
                             messages = output["messages"]
@@ -497,8 +512,9 @@ async def run_local_session():
         except GraphRecursionError:
             log.warning("Recursion limit hit", tool_calls=tool_call_count)
             # Don't just error out — ask the model to summarize whatever it
-            # already found, using the same message history (tool results
+            # already found, using this turn's history (tool results
             # included), but this time forbid further tool calls.
+            messages = _close_dangling_tool_calls(turn_messages)
             messages.append(
                 HumanMessage(
                     content=(
@@ -564,6 +580,32 @@ async def run_local_session():
                 print_ai(f"Something went wrong: {e}")
             else:
                 print_ai("An unexpected error occurred. Please try again later")
+
+
+# ── Recursion-limit fallback helper ───────────────────────────────────────────
+def _close_dangling_tool_calls(msgs: list) -> list:
+    """
+    If the run was cut off between the model asking for tools and those
+    tools running, the last AIMessage has tool_calls with no matching
+    ToolMessages. Providers reject that history outright, which would make
+    the "give your best answer" fallback fail. Add a stub ToolMessage for
+    each unanswered call so the history is valid and the model can see
+    those calls never ran.
+    """
+    from langchain_core.messages import ToolMessage
+
+    msgs = list(msgs)
+    answered = {m.tool_call_id for m in msgs if isinstance(m, ToolMessage)}
+    for m in reversed(msgs):
+        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+            for call in m.tool_calls:
+                if call.get("id") and call["id"] not in answered:
+                    msgs.append(ToolMessage(
+                        content="Not run: the tool-call budget for this turn was reached.",
+                        tool_call_id=call["id"],
+                    ))
+            break
+    return msgs
 
 
 # ── Terminal I/O helpers ──────────────────────────────────────────────────────
