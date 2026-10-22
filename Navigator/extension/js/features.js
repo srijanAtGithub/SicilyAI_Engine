@@ -1,5 +1,5 @@
 import { NotificationService } from "./notifications.js";
-import { appWrap } from "./ui.js";
+import { startActionStatus, endActionStatus } from "./ui.js";
 import { BACKEND_HOST } from "./api.js";
 import { isScriptableTab } from "./mentions.js";
 import { openThemeOverlay } from "./theme.js";
@@ -459,8 +459,7 @@ organiseTabsOverlay.addEventListener("click", (e) => {
 
 async function startOrganiseTabs(includeGrouped) {
   hideOrganiseTabsOverlay();
-  NotificationService.show("Organising your tabs...");
-  appWrap.classList.add("busy");
+  startActionStatus("Organising tabs…");
 
   try {
     const tabs = await chrome.tabs.query({ currentWindow: true });
@@ -475,7 +474,7 @@ async function startOrganiseTabs(includeGrouped) {
     }
 
     if (filteredTabs.length === 0) {
-      appWrap.classList.remove("busy");
+      endActionStatus();
       NotificationService.show(
         pinnedCount > 0
           ? "No unpinned tabs found that need organising."
@@ -523,18 +522,18 @@ async function startOrganiseTabs(includeGrouped) {
           }
         }
       }
-      appWrap.classList.remove("busy");
+      endActionStatus();
       NotificationService.show(
         createdCount > 0
           ? `Successfully organised tabs into ${createdCount} groups!`
           : "No valid groupings could be applied."
       );
     } else {
-      appWrap.classList.remove("busy");
+      endActionStatus();
       NotificationService.show("FastAPI LLM suggested no groupings.");
     }
   } catch (err) {
-    appWrap.classList.remove("busy");
+    endActionStatus();
     console.error("Error organizing tabs:", err);
     NotificationService.show("Could not contact the Sicily Bridge. Is uvicorn active?");
   }
@@ -549,9 +548,8 @@ export function clearAttachedContexts() {
 }
 
 async function startSummarisePage() {
-  // 1. Show notification and trigger neural glow
-  NotificationService.show("Summarising page...");
-  appWrap.classList.add("busy");
+  // 1. Show the status pill (blurs the panel behind it)
+  startActionStatus("Summarising page…");
 
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -564,7 +562,7 @@ async function startSummarisePage() {
     // error that wrongly implies the backend is down.
     if (!isScriptableTab(tab)) {
       NotificationService.show("This page can't be summarised — browser security blocks reading it.");
-      appWrap.classList.remove("busy");
+      endActionStatus();
       return;
     }
 
@@ -614,8 +612,8 @@ async function startSummarisePage() {
     console.error("Summarise error:", err);
     NotificationService.show("Failed to summarise page. Is the backend running?");
   } finally {
-    // Stop the neural glow
-    appWrap.classList.remove("busy");
+    // Hide the status pill
+    endActionStatus();
   }
 }
 
@@ -705,8 +703,7 @@ function renderFindMoreResults(results, { append = false } = {}) {
 }
 
 async function startFindMoreLikeThis({ append = false } = {}) {
-  NotificationService.show(append ? "Finding more..." : "Finding related pages...");
-  appWrap.classList.add("busy");
+  startActionStatus(append ? "Finding more…" : "Finding related pages…");
 
   // Fresh open (not a "Find More" click) starts a clean session — clear
   // whatever was tracked from a previous page/overlay open.
@@ -723,7 +720,7 @@ async function startFindMoreLikeThis({ append = false } = {}) {
     // and having that read as a backend/network failure.
     if (!isScriptableTab(tab)) {
       NotificationService.show("This page can't be analysed — browser security blocks reading it.");
-      appWrap.classList.remove("busy");
+      endActionStatus();
       return;
     }
 
@@ -786,7 +783,7 @@ async function startFindMoreLikeThis({ append = false } = {}) {
     console.error("Find more like this error:", err);
     NotificationService.show("Failed to find related pages. Is the backend running?");
   } finally {
-    appWrap.classList.remove("busy");
+    endActionStatus();
   }
 }
 

@@ -1617,17 +1617,271 @@
     50% { opacity: 0.55; }
 }
 
-/* --- Neural glow + scanline while a theme is being made ---
-   Same look as .wrap.busy in base.css, but drawn above the overlay
-   (z-index 110) so the overlay stays in front and visible. */
-.wrap.theme-busy .neural-glow {
-    z-index: 115;
-    opacity: 1;
-    animation: neuralPulse 3s ease-in-out infinite alternate;
+/* --- Quick-action status pill ---
+   Shown by ui.js startActionStatus() while Summarise Page / Organise Tabs /
+   Find More Like This run. Sits just under the header, above the busy
+   click-blocker (z-index 9999), with the panel blurred behind it. */
+.action-status {
+    position: absolute;
+    top: 72px;
+    left: 50%;
+    z-index: 10002;
+    max-width: calc(100% - 32px);
+    padding: 18px 32px;
+    border-radius: 999px;
+    background: rgba(25, 25, 26, 0.85);
+    -webkit-backdrop-filter: blur(20px);
+    backdrop-filter: blur(20px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    box-shadow:
+        0 8px 24px rgba(0, 0, 0, 0.4),
+        inset 0 0 1px rgba(255, 255, 255, 0.1);
+    font-size: 18px;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    pointer-events: none;
+    opacity: 0;
+    transform: translate(-50%, -8px) scale(0.95);
+    transition:
+        opacity 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+        transform 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
-.wrap.theme-busy::before {
-    z-index: 116;
+.action-status.active {
     opacity: 1;
-    animation: scanLine 2s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+    transform: translate(-50%, 0) scale(1);
+}
+
+/* Same shimmer as the chat's "Thinking…" label (keyframes in chat.css) */
+.action-status-label {
+    color: transparent;
+    background: linear-gradient(90deg,
+            #6b6b70 0 40%, #f2f2f7 50%, #6b6b70 60% 100%) 100% 0 / 250% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    animation: thinkingShimmer 1.6s linear infinite;
+}
+
+/* Blur whatever is behind the pill (chat or start screen) and keep it
+   non-interactive. chat.css lifts #messages/#bottom-dock above the click
+   blocker during a chat reply; that lift is undone here for quick actions. */
+.wrap.action-busy #messages,
+.wrap.action-busy #bottom-dock {
+    filter: blur(6px);
+    opacity: 0.6;
+    pointer-events: none;
+    user-select: none;
+}
+
+.wrap.action-busy #messages {
+    z-index: 2;
+}
+
+.wrap.action-busy #bottom-dock {
+    z-index: 3;
+}
+
+.wrap.action-busy #header {
+    opacity: 0.5;
+}
+
+#messages,
+#bottom-dock,
+#header {
+    transition: filter 0.35s ease, opacity 0.35s ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .action-status-label {
+        animation: none;
+        color: #d8d8de;
+        background: none;
+    }
+}
+
+
+/* --- Blur the panel behind every overlay ---
+   Matches #drag-overlay. Each overlay's own dim tint stays as it is;
+   this adds the frosted blur on top of it. */
+#organise-tabs-overlay,
+#summary-overlay,
+#find-more-overlay,
+#theme-overlay,
+#collections-picker-overlay,
+#collections-view-overlay,
+#reading-list-picker-overlay,
+#reading-list-groups-view-overlay,
+#chats-overlay {
+    -webkit-backdrop-filter: blur(12px) saturate(120%);
+    backdrop-filter: blur(12px) saturate(120%);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   OVERLAY SYSTEM — one set of sizes for every overlay card.
+   Appended last on purpose: it overrides the older per-overlay values
+   above, so every card shares the same edges, sizes and glass.
+
+   Sizes:  compact  360px  quick choices + pickers (Organise Tabs,
+                           Dark Theme, Collections/Reading List pickers)
+           wide     480px  lists + reading (Summary, Find More, Saved
+                           Collections, Reading Lists, Chats)
+   Height: 80vh max, sized to content
+   Edges:  16px from the panel on every side
+   Radius: 20px cards, 12px for anything inside them
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* Outer shell: same 16px breathing room everywhere, cards centred */
+#organise-tabs-overlay,
+#summary-overlay,
+#find-more-overlay,
+#theme-overlay,
+#collections-picker-overlay,
+#collections-view-overlay,
+#reading-list-picker-overlay,
+#reading-list-groups-view-overlay {
+    padding: 16px;
+    gap: 12px;
+    justify-content: center;
+}
+
+/* Chats stays anchored under the header, with the same 16px sides */
+#chats-overlay {
+    padding: 56px 16px 16px;
+}
+
+/* Shared card: one glass, one shadow, one radius, one height cap */
+.organise-card,
+.chats-panel {
+    width: 100%;
+    max-height: 80vh;
+    min-height: 0;
+    border-radius: 20px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: rgba(28, 28, 30, 0.88);
+    -webkit-backdrop-filter: blur(30px);
+    backdrop-filter: blur(30px);
+    box-shadow:
+        0 16px 40px rgba(0, 0, 0, 0.45),
+        inset 0 0 1px rgba(255, 255, 255, 0.1);
+}
+
+.organise-card {
+    max-width: 360px;
+    padding: 20px;
+    gap: 12px;
+    flex: 0 1 auto;
+    transform: scale(0.95);
+    transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Compact cards (pickers, Organise Tabs, Dark Theme) */
+.collections-picker-card,
+.reading-list-picker-card,
+.theme-card {
+    max-width: 360px;
+    max-height: 80vh;
+}
+
+/* Wide cards */
+#summary-overlay .organise-card,
+#find-more-overlay .organise-card,
+#collections-view-overlay .organise-card,
+#reading-list-groups-view-overlay .organise-card,
+.chats-panel {
+    max-width: 480px;
+    max-height: 80vh;
+    flex: 0 1 auto;
+}
+
+/* One "open" state for every card — also fixes Reading Lists, whose
+   card previously stayed shrunk at 95% while open */
+#organise-tabs-overlay.active .organise-card,
+#summary-overlay.active .organise-card,
+#find-more-overlay.active .organise-card,
+#theme-overlay.active .organise-card,
+#collections-picker-overlay.active .organise-card,
+#collections-view-overlay.active .organise-card,
+#reading-list-picker-overlay.active .organise-card,
+#reading-list-groups-view-overlay.active .organise-card {
+    transform: scale(1);
+}
+
+/* 12px radius for everything inside a card */
+.organise-option-btn,
+.collection-picker-item,
+.collections-picker-input,
+.collections-picker-preview,
+.reading-list-picker-preview,
+.collections-create-btn,
+.collection-view-item,
+.snippet-view-item,
+.link-result-item,
+.theme-action-btn,
+.theme-secondary-btn,
+.summary-floating-btn,
+.chats-item {
+    border-radius: 12px;
+}
+
+/* Card headers: centred 16px title everywhere, Chats included */
+.chats-panel-header {
+    position: relative;
+    justify-content: center;
+    padding: 16px 44px 12px;
+}
+
+.chats-panel-title {
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: 0;
+    text-align: center;
+}
+
+.chats-panel-close {
+    position: absolute;
+    right: 14px;
+    top: 50%;
+    transform: translateY(-50%);
+}
+
+.chats-panel-close:active {
+    transform: translateY(-50%) scale(0.9);
+}
+
+/* Footer actions now live inside the card (no floating row) */
+.summary-actions {
+    gap: 10px;
+    margin-top: 4px;
+    transform: none;
+}
+
+.summary-floating-btn {
+    flex: 1;
+    padding: 10px 16px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+    box-shadow: none;
+}
+
+.summary-floating-btn:hover {
+    background: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.2);
+    transform: translateY(-1px);
+}
+
+.summary-floating-btn:active {
+    transform: scale(0.98);
+}
+
+.summary-floating-btn.highlight {
+    background: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.22);
+}
+
+.summary-floating-btn.highlight:hover {
+    background: rgba(255, 255, 255, 0.18);
 }

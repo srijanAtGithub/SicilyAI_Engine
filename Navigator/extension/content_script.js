@@ -84,6 +84,16 @@
     (document.head || document.documentElement).appendChild(style);
   }
 
+  // @property only works at document level (it's ignored inside shadow
+  // roots), so the angle the iridescent ring rotates through is registered
+  // here. The name is namespaced so it can't collide with the page's own.
+  if (!document.getElementById("navigator-anim-props")) {
+    const style = document.createElement("style");
+    style.id = "navigator-anim-props";
+    style.textContent = `@property --nav-angle { syntax: "<angle>"; inherits: false; initial-value: 0deg; }`;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
   let activeBox = null; // only one edit box open at a time
 
   // ── Tier 3 fingerprints ─────────────────────────────────────────────
@@ -690,7 +700,7 @@
           /* Glassmorphism Effect */
           backdrop-filter: blur(20px); 
           -webkit-backdrop-filter: blur(20px); /* Safari support */
-          background: rgba(25, 25, 26, 0.65); /* Premium Dark Mode Gray */
+          background: rgba(15, 15, 15, 0.65); /* Premium Dark Mode Gray */
           
           /* The "Shader" / Glowing Border Effect */
           box-shadow: 
@@ -743,92 +753,133 @@
           pointer-events: auto; /* Enable interaction */
         }
 
-        /* --- Full Window Scanning Scanline --- */
-        .wrap::before {
-          content: '';
-          position: absolute;
-          inset: 0;
-          background: linear-gradient(to bottom, transparent, rgba(130, 240, 255, 0.15), transparent);
-          transform: translateY(-100%);
-          pointer-events: none;
-          z-index: 5;
-          opacity: 0;
-          transition: opacity 0.3s ease;
+        /* --- Apple-style iridescent "thinking" state ---
+           --nav-angle is registered on the page itself (see the
+           navigator-anim-props style near the top): @property is ignored
+           inside shadow roots, and without registration the conic
+           gradient can't rotate smoothly. */
+        .iri {
+          background: conic-gradient(from var(--nav-angle, 0deg),
+            #ff8fb1, #c38bff, #7aa7ff, #6ee7f2, #ffc27a, #ff8fb1);
+          animation: navSpin 3s linear infinite;
         }
-        .wrap.busy::before {
-          opacity: 1;
-          animation: scanLine 2s cubic-bezier(0.4, 0, 0.2, 1) infinite;
-        }
+        @keyframes navSpin { to { --nav-angle: 360deg; } }
 
-        @keyframes scanLine {
-          0% { transform: translateY(-100%); }
-          100% { transform: translateY(100%); }
-        }
-
-        /* --- Neural Glow Edge (Rotating Inner Border) & full container color drift --- */
-        .neural-glow {
+        /* Thin rotating ring hugging the panel edge */
+        .ring {
           position: absolute;
           inset: 0;
           border-radius: 18px;
-          pointer-events: none;
+          padding: 1.5px; /* ring thickness */
+          -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+          -webkit-mask-composite: xor;
+          mask-composite: exclude;
           opacity: 0;
-          /* Animated color drift when busy */
-          background: radial-gradient(circle at 20% 30%, rgba(94, 92, 230, 0.25), transparent 50%),
-                      radial-gradient(circle at 80% 70%, rgba(249, 81, 165, 0.25), transparent 50%);
-          mix-blend-mode: screen;
           transition: opacity 0.5s ease;
-          z-index: 1;
+          pointer-events: none;
+          z-index: 6;
         }
-        .wrap.busy .neural-glow { 
-          opacity: 1; 
-          animation: neuralPulse 3s ease-in-out infinite alternate;
-        }
+        /*.wrap.busy .ring { opacity: 1; }*/
 
-        @keyframes neuralPulse {
-          0% { filter: hue-rotate(0deg); }
-          100% { filter: hue-rotate(90deg); }
-        }
-
-        /* --- Outer Radiant Glow Backdrop (Escapes overflow: hidden) --- */
+        /* Soft dark halo behind the panel while thinking */
         .glow-backdrop {
           position: absolute;
-          top: 0; left: 0; right: 0; bottom: 0;
+          inset: 6px;
           border-radius: 18px;
-          pointer-events: none; /* Let clicks pass straight through */
-          z-index: -1; /* Render behind the main panel */
+          background: rgba(15, 15, 15, 0.65);
+          filter: blur(22px);
           opacity: 0;
-          transition: opacity 0.4s ease;
+          transition: opacity 0.6s ease;
+          pointer-events: none;
+          z-index: -1;
+        }
+        .wrap.busy ~ .glow-backdrop { opacity: 1; }
+
+        /* --- Skeleton placeholder (shown in the result view while loading) --- */
+        .skeleton { display: none; margin-bottom: 16px; }
+        .result-view.loading .skeleton { display: block; }
+        .result-view.loading .result-text,
+        .result-view.loading .actions { display: none; }
+        .sk-line {
+          height: 10px;
+          border-radius: 6px;
+          margin-bottom: 12px;
+          background: linear-gradient(100deg,
+            rgba(255, 255, 255, 0.05) 35%,
+            rgba(255, 143, 177, 0.35) 45%,
+            rgba(195, 139, 255, 0.40) 50%,
+            rgba(122, 167, 255, 0.35) 55%,
+            rgba(255, 255, 255, 0.05) 65%) 0 0 / 300% 100%;
+          animation: navShimmer 1.8s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+        }
+        .sk-line:last-child { margin-bottom: 0; }
+        @keyframes navShimmer {
+          0% { background-position: 100% 0; }
+          100% { background-position: 0 0; }
         }
 
-        /* When the panel is busy, ignite the backdrop with synced rotation and breathing */
-        /*UNCOMMENT THE FOLLOWING TO HAVE THE BORDER GLOW AS WELL*/
-        /*
-        .wrap.busy ~ .glow-backdrop {
-          opacity: 1;
-          animation: 
-            glowRotate 2s linear infinite, 
-            radiantPulse 1.5s ease-in-out infinite alternate;
+        /* --- Result reveal ---
+           Two layers so the text never changes weight:
+           .rt-base  = the real text, drawn normally, wiped in L→R with a mask
+           .rt-sheen = a transparent copy on top that only shows the
+                       iridescent band, tinting just the letters under it.
+           (Gradient-filled text renders thinner in Chrome, so only the
+           band uses it; everything else is the real text from frame one.)
+           Same size + timing keeps the band riding the wipe's edge. */
+        .result-text { position: relative; }
+        .rt-base { display: block; }
+        .rt-sheen {
+          display: none;
+          position: absolute;
+          top: 0;
+          left: 0;
+          right: 8px; /* matches .result-text's padding-right, so lines wrap identically */
+          color: transparent;
+          pointer-events: none;
+          user-select: none;
+          background: linear-gradient(90deg,
+            transparent 0 40%, #ffb3cf 44%, #c9a4ff 50%, #8fb5ff 56%, transparent 60% 100%)
+            100% 0 / 250% 100% no-repeat;
+          -webkit-background-clip: text;
+          background-clip: text;
         }
-        */
-
-        @keyframes glowRotate { 
-          100% { filter: hue-rotate(360deg); } 
+        .result-text.revealing .rt-base {
+          -webkit-mask-image: linear-gradient(90deg, #000 40%, transparent 60%);
+          mask-image: linear-gradient(90deg, #000 40%, transparent 60%);
+          -webkit-mask-size: 250% 100%;
+          mask-size: 250% 100%;
+          -webkit-mask-repeat: no-repeat;
+          mask-repeat: no-repeat;
+          -webkit-mask-position: 100% 0;
+          mask-position: 100% 0;
+          animation: navWipe 1.1s cubic-bezier(0.3, 0.7, 0.3, 1) forwards;
+        }
+        .result-text.revealing .rt-sheen {
+          display: block;
+          animation: navReveal 1.1s cubic-bezier(0.3, 0.7, 0.3, 1) forwards;
+        }
+        @keyframes navWipe {
+          to { -webkit-mask-position: 0 0; mask-position: 0 0; }
+        }
+        @keyframes navReveal {
+          85% { opacity: 1; }
+          to { background-position: 0 0; opacity: 0; }
         }
 
-        /* Subtle, elegant, close-to-the-border glow */
-        @keyframes radiantPulse {
-          0% {
-            box-shadow: 
-              0 0 15px rgba(94, 92, 230, 0.4),      /* Tight inner purple */
-              0 0 30px rgba(130, 240, 255, 0.2),     /* Soft middle cyan */
-              0 0 50px rgba(94, 92, 230, 0.08);     /* Barely visible outer ambient */
-          }
-          100% {
-            box-shadow: 
-              0 0 25px rgba(94, 92, 230, 0.6),      /* Tight hot purple */
-              0 0 45px rgba(130, 240, 255, 0.35),    /* Medium cyan bloom */
-              0 0 75px rgba(94, 92, 230, 0.15);     /* Gentle outer glow */
-          }
+        /* Copy/Replace settle in just after the text */
+        .result-view.just-revealed .actions {
+          animation: navFadeUp 0.45s cubic-bezier(0.16, 1, 0.3, 1) 0.55s both;
+        }
+        @keyframes navFadeUp {
+          from { opacity: 0; transform: translateY(4px); }
+          to { opacity: 1; transform: none; }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+          .iri, .sk-line { animation: none; }
+          .result-text.revealing .rt-base,
+          .result-text.revealing .rt-sheen { animation-duration: 0.01s; }
+          .result-view.just-revealed .actions { animation: none; }
         }
 
         /* Tier Notice (Blurred Golden Style) */
@@ -1075,7 +1126,7 @@
       </style>
 
       <div class="wrap">
-        <div class="neural-glow"></div>
+        <div class="ring iri"></div>
         <div class="notice" style="display: none;"></div>
         <div class="content">
           <div class="view input-view active">
@@ -1097,6 +1148,7 @@
           <div class="status"></div>
           
           <div class="view result-view">
+            <div class="skeleton"></div>
             <div class="result-text"></div>
             <div class="actions">
               <button class="btn btn-copy">Copy</button>
@@ -1127,6 +1179,13 @@
     const status = shadow.querySelector(".status");
     const noticeEl = shadow.querySelector(".notice");
     const resultText = shadow.querySelector(".result-text");
+    const skeletonEl = shadow.querySelector(".skeleton");
+
+    // The reveal class is one-shot: drop it when the band finishes (the
+    // event bubbles up from .rt-sheen) so only the plain text remains.
+    resultText.addEventListener("animationend", (e) => {
+      if (e.animationName === "navReveal") resultText.classList.remove("revealing");
+    });
 
     // Fade the top/bottom edges only when there is more content in that direction
     function updateResultFade() {
@@ -1234,10 +1293,54 @@
       wrapEl.addEventListener("transitionend", cleanupTransition);
     }
 
+    // Placeholder bars roughly shaped like the answer we expect: an edit
+    // is about as long as the selection, a summary is short.
+    function buildSkeleton(actionType) {
+      const len = (context.text || "").length;
+      let count = actionType === "summarise" ? 2
+        : actionType === "ask" ? 3
+        : Math.ceil(len / 45);
+      count = Math.min(5, Math.max(2, count));
+      const widths = [100, 94, 97, 91, 96];
+      let html = "";
+      for (let i = 0; i < count; i++) {
+        const w = i === count - 1 ? 58 : widths[i];
+        html += `<div class="sk-line" style="width:${w}%;animation-delay:${(i * 0.1).toFixed(1)}s"></div>`;
+      }
+      skeletonEl.innerHTML = html;
+    }
+
+    // Switch to the result layout immediately, with skeleton bars standing
+    // in for the answer. Works both from the input view (first submit) and
+    // from an existing result (follow-ups replace the old answer in place).
+    function showLoading(actionType) {
+      buildSkeleton(actionType);
+      animateHeightChange(() => {
+        inputView.classList.remove("active");
+        status.style.display = "none";
+        noticeEl.style.display = "none";
+        resultView.classList.remove("just-revealed");
+        resultView.classList.add("active", "loading");
+      });
+    }
+
+    // Undo showLoading after a failed request: back to the previous answer
+    // if there is one, otherwise back to the input view so the user can retry.
+    function leaveLoading() {
+      if (!resultView.classList.contains("loading")) return;
+      resultView.classList.remove("loading");
+      if (!pendingAiText) {
+        resultView.classList.remove("active");
+        inputView.classList.add("active");
+      }
+    }
+
     function showError(msg) {
-      status.textContent = msg;
-      status.style.display = "block";
-      animateHeightChange(() => { }); // Re-calc height with error text visible
+      animateHeightChange(() => {
+        leaveLoading();
+        status.textContent = msg;
+        status.style.display = "block";
+      });
     }
 
     // Follow-up send is only enabled when there's text and we're not busy
@@ -1252,7 +1355,7 @@
       followupInput.disabled = isBusy;
       updateFollowupState();
 
-      // Toggle neural glow/border shaders
+      // Toggle the iridescent ring + backdrop bloom
       if (isBusy) {
         wrapEl.classList.add("busy");
       } else {
@@ -1270,9 +1373,24 @@
         inputView.classList.remove("active");
         status.style.display = "none";
 
-        resultText.textContent = text;
+        resultView.classList.remove("loading");
+        // Real text + an aria-hidden copy that carries the colour band
+        const base = document.createElement("span");
+        base.className = "rt-base";
+        base.textContent = text;
+        const sheen = document.createElement("span");
+        sheen.className = "rt-sheen";
+        sheen.setAttribute("aria-hidden", "true");
+        sheen.textContent = text;
+        resultText.replaceChildren(base, sheen);
         resultView.classList.add("active");
         resultText.scrollTop = 0;
+
+        // Restart the one-shot reveal wipe (reflow so it replays on follow-ups)
+        resultText.classList.remove("revealing");
+        void resultText.offsetWidth;
+        resultText.classList.add("revealing");
+        resultView.classList.add("just-revealed");
         updateResultFade();
         updateFollowupState();
 
@@ -1321,7 +1439,7 @@
       }
 
       setBusy(true);
-      status.style.display = "none";
+      showLoading(actionType);
 
       chrome.runtime.sendMessage(
         {

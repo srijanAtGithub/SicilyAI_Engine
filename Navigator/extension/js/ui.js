@@ -90,6 +90,107 @@ function makeCopyButton(text) {
   return copyBtn;
 }
 
+// ── Quick-action status pill ──────────────────────────────────────────
+// For actions that don't reply in the chat (Summarise Page, Organise Tabs,
+// Find More Like This): a glass pill with the "Thinking…" shimmer that
+// stays up until the action finishes, while the chat/start screen behind
+// it is blurred. Still sets "busy" so a chat turn can't be sent meanwhile.
+const actionStatusEl = document.getElementById("action-status");
+const actionStatusLabel = actionStatusEl?.querySelector(".action-status-label");
+
+export function startActionStatus(label) {
+  if (actionStatusLabel) actionStatusLabel.textContent = label;
+  appWrap.classList.add("busy", "action-busy");
+  actionStatusEl?.classList.add("active");
+}
+
+export function endActionStatus() {
+  appWrap.classList.remove("busy", "action-busy");
+  actionStatusEl?.classList.remove("active");
+}
+
+// ── Thinking indicator + word reveal ───────────────────────────────────
+// A placeholder AI bubble ("Thinking…" shimmer + a light on the rail),
+// shown from send until the first streamed token or the final reply.
+// main.js shows it; anything that puts a reply/notice on screen removes it.
+let thinkingEl = null;
+
+export function showThinking() {
+  removeThinking();
+  hideEmptyState();
+  const el = document.createElement("div");
+  el.className = "msg ai thinking";
+  el.innerHTML = `<div class="thinking-rail"></div><span class="thinking-label">Thinking…</span>`;
+  messagesEl.appendChild(el);
+  thinkingEl = el;
+  requestAnimationFrame(() => {
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  });
+}
+
+export function removeThinking() {
+  if (thinkingEl) {
+    thinkingEl.remove();
+    thinkingEl = null;
+  }
+}
+
+// Word-by-word blur-in. Streaming re-renders the whole bubble every frame,
+// so each word's "birth" time is remembered by position; on every render a
+// word still inside its animation gets a negative animation-delay and picks
+// up exactly where it was, instead of restarting or popping in.
+const WORD_ANIM_MS = 500;
+
+function createWordRevealer() {
+  const births = [];
+  return function reveal(container) {
+    const now = performance.now();
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+      acceptNode: (n) =>
+        n.parentElement?.closest("pre, code") || !n.data.trim()
+          ? NodeFilter.FILTER_REJECT
+          : NodeFilter.FILTER_ACCEPT,
+    });
+    const nodes = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+
+    // Count new words first so a big chunk (or a whole non-streamed reply)
+    // staggers in over at most ~0.9s rather than word by word forever.
+    let total = 0;
+    for (const n of nodes) total += n.data.split(/\s+/).filter(Boolean).length;
+    const fresh = Math.max(1, total - births.length);
+    const step = Math.min(35, 900 / fresh);
+
+    let i = 0;
+    for (const node of nodes) {
+      const frag = document.createDocumentFragment();
+      for (const part of node.data.split(/(\s+)/)) {
+        if (!part) continue;
+        if (/^\s+$/.test(part)) {
+          frag.appendChild(document.createTextNode(part));
+          continue;
+        }
+        if (births[i] === undefined) {
+          const prev = births[i - 1];
+          births[i] = Math.max(now, prev !== undefined ? prev + step : now);
+        }
+        const age = now - births[i];
+        if (age < WORD_ANIM_MS) {
+          const span = document.createElement("span");
+          span.className = "w-in";
+          span.style.animationDelay = `${Math.round(-age)}ms`;
+          span.textContent = part;
+          frag.appendChild(span);
+        } else {
+          frag.appendChild(document.createTextNode(part));
+        }
+        i++;
+      }
+      node.replaceWith(frag);
+    }
+  };
+}
+
 // ── Streaming AI replies ──────────────────────────────────────────────
 // The bubble is created lazily by the first chunk (api.js), grows as
 // chunks arrive, and is re-rendered through the same markdownToHtml()
@@ -102,6 +203,7 @@ function makeCopyButton(text) {
 // The per-block code "copy" buttons and the message copy button are only
 // added in finish(), since re-rendering would wipe them every frame.
 export function beginStreamingMessage() {
+  removeThinking();
   hideEmptyState();
 
   const el = document.createElement("div");
@@ -111,6 +213,7 @@ export function beginStreamingMessage() {
 
   let buffer = "";
   let raf = 0;
+  const reveal = createWordRevealer();
 
   // Only follow the stream if the reader hasn't scrolled up to read.
   const nearBottom = () =>
@@ -120,6 +223,7 @@ export function beginStreamingMessage() {
     raf = 0;
     const stick = nearBottom();
     el.innerHTML = markdownToHtml(buffer);
+    reveal(el);
     if (stick) messagesEl.scrollTop = messagesEl.scrollHeight;
   };
 
@@ -137,6 +241,7 @@ export function beginStreamingMessage() {
       el.classList.remove("streaming");
       appWrap.classList.remove("streaming");
       el.innerHTML = markdownToHtml(full);
+      reveal(el); // let the last words finish their fade-in
       addCodeBlockCopyButtons(el);
       el.appendChild(makeCopyButton(full));
       if (opts.stopped) el.appendChild(makeStoppedNote());
@@ -156,6 +261,7 @@ export function beginStreamingMessage() {
 // Grey "Response stopped" line for when the user hit stop before any
 // text had streamed in (so there is no bubble to attach the note to).
 export function addStoppedNote() {
+  removeThinking();
   const el = document.createElement("div");
   el.className = "msg stopped-note";
   el.textContent = "Response stopped";
@@ -267,6 +373,11 @@ function startEditing(el, originalText) {
 // For AI messages, `meta.stopped` marks a reply the user cut short.
 // Returns the created element.
 export function addMessage(text, role, meta = {}) {
+  // A reply arriving while busy replaces the thinking indicator (and gets
+  // the word reveal); history renders happen while idle and stay static.
+  const isLiveReply = role === "ai" && appWrap.classList.contains("busy");
+  removeThinking();
+
   // Once there's a real message (user, ai, or even a system notice),
   // the "nothing here yet" placeholder no longer applies.[cite: 2]
   hideEmptyState();
@@ -329,6 +440,7 @@ export function addMessage(text, role, meta = {}) {
     el.classList.add("md-body");
     el.innerHTML = markdownToHtml(text);
     addCodeBlockCopyButtons(el);
+    if (isLiveReply) createWordRevealer()(el);
   } else {
     // User/system messages are shown as plain text, not markdown-rendered:
     // markdown syntax someone actually typed (e.g. "what does * do in
@@ -398,6 +510,7 @@ export function clearMessagesUI() {
   // it (it's markup in the DOM, not generated by JS), so pull it out
   // first and put it back afterwards instead of hardcoding its HTML here.
   const empty = document.getElementById("empty-state");
+  thinkingEl = null; // wiped along with everything else below
   messagesEl.innerHTML = "";
   if (empty) {
     empty.classList.remove("hidden");
@@ -451,7 +564,10 @@ export function setSending(isSending) {
   if (spinner) spinner.style.display = "none"; // replaced by the stop icon
   if (stopIcon) stopIcon.style.display = isSending ? "inline-block" : "none";
   appWrap.classList.toggle("busy", isSending);
-  if (!isSending) appWrap.classList.remove("streaming");
+  if (!isSending) {
+    appWrap.classList.remove("streaming");
+    removeThinking();
+  }
   syncSendBtn();
 }
 

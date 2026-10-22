@@ -1,5 +1,5 @@
 import { NotificationService } from "./notifications.js";
-import { addMessage, clearMessagesUI, addContextTrail, setSending, sendBtn, appWrap, showEmptyState, messagesEl, setEditHandler, cancelActiveEdit, syncSendBtn } from "./ui.js";
+import { addMessage, clearMessagesUI, addContextTrail, setSending, sendBtn, appWrap, showEmptyState, messagesEl, setEditHandler, cancelActiveEdit, syncSendBtn, showThinking } from "./ui.js";
 import { socket, getActiveTabInfo, loadHistory, deleteSessionOnBackend, connectSocket, closeSocket, resolveSessionKey, carrySessionToUrl, startNewSessionForUrl, pinSessionKeyToUrl, fetchAllSessions, renameSessionOnBackend, BACKEND_HOST } from "./api.js";
 import { attachedContexts, clearAttachedContexts, currentCapability } from "./features.js";
 import {
@@ -214,6 +214,7 @@ async function sendMessage() {
   inputEl.style.overflowY = 'hidden';
 
   setSending(true);
+  showThinking();
 
   // Send the FULL content to the backend
   const fresh = await getActiveTabInfo();
@@ -302,6 +303,7 @@ async function editAndResend(userEl, newText) {
   pendingUserEl = addMessage(newText, "user", { contextSnippets: snippets, trailSnippets: trail });
 
   setSending(true);
+  showThinking();
 
   const fresh = await getActiveTabInfo();
   socket.send(JSON.stringify({
