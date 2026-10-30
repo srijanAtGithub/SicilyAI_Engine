@@ -10,8 +10,20 @@
     "sidePanel",
     "tabs",
     "tabGroups",
-    "storage"
+    "storage",
+    "unlimitedStorage",
+    "clipboardRead",
+    "clipboardWrite"
   ],
+  "commands": {
+    "open-edit-box": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+K",
+        "mac": "Command+Shift+K"
+      },
+      "description": "Use Sicily on the selected text"
+    }
+  },
   "host_permissions": [
     "<all_urls>"
   ],
@@ -22,6 +34,15 @@
     "service_worker": "background.js"
   },
   "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "theme_engine.js"
+      ],
+      "run_at": "document_start"
+    },
     {
       "matches": [
         "<all_urls>"

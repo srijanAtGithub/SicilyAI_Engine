@@ -23,6 +23,11 @@ const COPY_ICON = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org
   <path d="M16 18V20C16 21.1046 15.1046 22 14 22H4C2.89543 22 2 21.1046 2 20V8C2 6.89543 2.89543 6 4 6H6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>`;
 
+const EDIT_ICON = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <path d="M12 20h9" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`;
+
 const CHECK_ICON = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
   <path d="M20 6L9 17L4 12" stroke="#34c759" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>`;
@@ -60,7 +65,319 @@ function addCodeBlockCopyButtons(container) {
   });
 }
 
-export function addMessage(text, role) {
+// Grey "Response stopped" line shown under an AI reply the user cut short.
+function makeStoppedNote() {
+  const note = document.createElement("div");
+  note.className = "stopped-note";
+  note.textContent = "Response stopped";
+  return note;
+}
+
+// Floating "copy message" button, shared by normal and streamed bubbles.
+function makeCopyButton(text) {
+  const copyBtn = document.createElement("button");
+  copyBtn.className = "copy-btn";
+  copyBtn.title = "Copy text";
+  copyBtn.innerHTML = COPY_ICON;
+  copyBtn.addEventListener("click", () => {
+    navigator.clipboard.writeText(text).then(() => {
+      copyBtn.innerHTML = CHECK_ICON;
+      setTimeout(() => {
+        copyBtn.innerHTML = COPY_ICON;
+      }, 1500);
+    }).catch(err => console.error("Failed to copy text:", err));
+  });
+  return copyBtn;
+}
+
+// ── Quick-action status pill ──────────────────────────────────────────
+// For actions that don't reply in the chat (Summarise Page, Organise Tabs,
+// Find More Like This): a glass pill with the "Thinking…" shimmer that
+// stays up until the action finishes, while the chat/start screen behind
+// it is blurred. Still sets "busy" so a chat turn can't be sent meanwhile.
+const actionStatusEl = document.getElementById("action-status");
+const actionStatusLabel = actionStatusEl?.querySelector(".action-status-label");
+
+export function startActionStatus(label) {
+  if (actionStatusLabel) actionStatusLabel.textContent = label;
+  appWrap.classList.add("busy", "action-busy");
+  actionStatusEl?.classList.add("active");
+}
+
+export function endActionStatus() {
+  appWrap.classList.remove("busy", "action-busy");
+  actionStatusEl?.classList.remove("active");
+}
+
+// ── Thinking indicator + word reveal ───────────────────────────────────
+// A placeholder AI bubble ("Thinking…" shimmer + a light on the rail),
+// shown from send until the first streamed token or the final reply.
+// main.js shows it; anything that puts a reply/notice on screen removes it.
+let thinkingEl = null;
+
+export function showThinking() {
+  removeThinking();
+  hideEmptyState();
+  const el = document.createElement("div");
+  el.className = "msg ai thinking";
+  el.innerHTML = `<div class="thinking-rail"></div><span class="thinking-label">Thinking…</span>`;
+  messagesEl.appendChild(el);
+  thinkingEl = el;
+  requestAnimationFrame(() => {
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  });
+}
+
+export function removeThinking() {
+  if (thinkingEl) {
+    thinkingEl.remove();
+    thinkingEl = null;
+  }
+}
+
+// Word-by-word blur-in. Streaming re-renders the whole bubble every frame,
+// so each word's "birth" time is remembered by position; on every render a
+// word still inside its animation gets a negative animation-delay and picks
+// up exactly where it was, instead of restarting or popping in.
+const WORD_ANIM_MS = 500;
+
+function createWordRevealer() {
+  const births = [];
+  return function reveal(container) {
+    const now = performance.now();
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+      acceptNode: (n) =>
+        n.parentElement?.closest("pre, code") || !n.data.trim()
+          ? NodeFilter.FILTER_REJECT
+          : NodeFilter.FILTER_ACCEPT,
+    });
+    const nodes = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+
+    // Count new words first so a big chunk (or a whole non-streamed reply)
+    // staggers in over at most ~0.9s rather than word by word forever.
+    let total = 0;
+    for (const n of nodes) total += n.data.split(/\s+/).filter(Boolean).length;
+    const fresh = Math.max(1, total - births.length);
+    const step = Math.min(35, 900 / fresh);
+
+    let i = 0;
+    for (const node of nodes) {
+      const frag = document.createDocumentFragment();
+      for (const part of node.data.split(/(\s+)/)) {
+        if (!part) continue;
+        if (/^\s+$/.test(part)) {
+          frag.appendChild(document.createTextNode(part));
+          continue;
+        }
+        if (births[i] === undefined) {
+          const prev = births[i - 1];
+          births[i] = Math.max(now, prev !== undefined ? prev + step : now);
+        }
+        const age = now - births[i];
+        if (age < WORD_ANIM_MS) {
+          const span = document.createElement("span");
+          span.className = "w-in";
+          span.style.animationDelay = `${Math.round(-age)}ms`;
+          span.textContent = part;
+          frag.appendChild(span);
+        } else {
+          frag.appendChild(document.createTextNode(part));
+        }
+        i++;
+      }
+      node.replaceWith(frag);
+    }
+  };
+}
+
+// ── Streaming AI replies ──────────────────────────────────────────────
+// The bubble is created lazily by the first chunk (api.js), grows as
+// chunks arrive, and is re-rendered through the same markdownToHtml()
+// used for finished messages — markdown.js already degrades gracefully on
+// partial input (an unclosed ``` fence just renders as a code block so
+// far; unfinished **bold** shows literally until it closes).
+//
+// Rendering is coalesced to one pass per animation frame so a fast token
+// stream doesn't re-parse the whole message hundreds of times a second.
+// The per-block code "copy" buttons and the message copy button are only
+// added in finish(), since re-rendering would wipe them every frame.
+export function beginStreamingMessage() {
+  removeThinking();
+  hideEmptyState();
+
+  const el = document.createElement("div");
+  el.className = "msg ai md-body streaming";
+  messagesEl.appendChild(el);
+  appWrap.classList.add("streaming");
+
+  let buffer = "";
+  let raf = 0;
+  const reveal = createWordRevealer();
+
+  // Only follow the stream if the reader hasn't scrolled up to read.
+  const nearBottom = () =>
+    messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 80;
+
+  const render = () => {
+    raf = 0;
+    const stick = nearBottom();
+    el.innerHTML = markdownToHtml(buffer);
+    reveal(el);
+    if (stick) messagesEl.scrollTop = messagesEl.scrollHeight;
+  };
+
+  return {
+    append(chunk) {
+      buffer += chunk;
+      if (!raf) raf = requestAnimationFrame(render);
+    },
+
+    // finalText is the backend's authoritative full reply (what was saved).
+    finish(finalText, opts = {}) {
+      if (raf) { cancelAnimationFrame(raf); raf = 0; }
+      const full = finalText ?? buffer;
+      const stick = nearBottom();
+      el.classList.remove("streaming");
+      appWrap.classList.remove("streaming");
+      el.innerHTML = markdownToHtml(full);
+      reveal(el); // let the last words finish their fade-in
+      addCodeBlockCopyButtons(el);
+      el.appendChild(makeCopyButton(full));
+      if (opts.stopped) el.appendChild(makeStoppedNote());
+      if (stick) messagesEl.scrollTop = messagesEl.scrollHeight;
+    },
+
+    // Stream died before completing — nothing was saved server-side, so
+    // don't leave a half-answer on screen that won't survive a reload.
+    abort() {
+      if (raf) { cancelAnimationFrame(raf); raf = 0; }
+      el.remove();
+      appWrap.classList.remove("streaming");
+    },
+  };
+}
+
+// Grey "Response stopped" line for when the user hit stop before any
+// text had streamed in (so there is no bubble to attach the note to).
+export function addStoppedNote() {
+  removeThinking();
+  const el = document.createElement("div");
+  el.className = "msg stopped-note";
+  el.textContent = "Response stopped";
+  messagesEl.appendChild(el);
+  requestAnimationFrame(() => {
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  });
+}
+
+// ── Edit & resend (user messages) ─────────────────────────────────────
+// main.js registers the handler that actually truncates history and
+// re-sends; ui.js only owns the inline editor. The handler returns
+// false to keep the editor open (e.g. socket not connected), anything
+// else means "done, the bubble has been replaced".
+let editHandler = null;
+let activeEdit = null;
+
+export function setEditHandler(fn) {
+  editHandler = fn;
+}
+
+export function cancelActiveEdit() {
+  if (activeEdit) activeEdit.cancel();
+}
+
+function startEditing(el, originalText) {
+  if (appWrap.classList.contains("busy")) return; // no edits mid-reply
+  if (activeEdit) activeEdit.cancel();
+
+  // Keep the original nodes (text / collapsible head+body / buttons)
+  // so Cancel can put the bubble back exactly as it was.
+  const saved = Array.from(el.childNodes);
+  el.classList.add("editing");
+
+  const editor = document.createElement("div");
+  editor.className = "msg-editor";
+
+  const ta = document.createElement("textarea");
+  ta.className = "msg-edit-input";
+  ta.rows = 1;
+  ta.value = originalText;
+
+  const actions = document.createElement("div");
+  actions.className = "msg-edit-actions";
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.className = "msg-edit-btn";
+  cancelBtn.textContent = "Cancel";
+
+  const submitBtn = document.createElement("button");
+  submitBtn.type = "button";
+  submitBtn.className = "msg-edit-btn primary";
+  submitBtn.textContent = "Send";
+
+  actions.appendChild(cancelBtn);
+  actions.appendChild(submitBtn);
+  editor.appendChild(ta);
+  editor.appendChild(actions);
+
+  const autosize = () => {
+    ta.style.height = "auto";
+    ta.style.height = Math.min(ta.scrollHeight + 2, 200) + "px";
+  };
+
+  const close = () => {
+    el.classList.remove("editing");
+    el.replaceChildren(...saved);
+    activeEdit = null;
+  };
+
+  const submit = async () => {
+    const newText = ta.value.trim();
+    if (!newText || !editHandler) return;
+    submitBtn.disabled = true;
+    const ok = await editHandler(el, newText);
+    if (ok === false) {
+      submitBtn.disabled = false;
+    } else {
+      activeEdit = null; // the handler has replaced this bubble
+    }
+  };
+
+  ta.addEventListener("input", autosize);
+  ta.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      submit();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      close();
+    }
+  });
+  cancelBtn.addEventListener("click", close);
+  submitBtn.addEventListener("click", submit);
+
+  activeEdit = { el, cancel: close };
+
+  el.replaceChildren(editor);
+  autosize();
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+}
+
+// `meta` (optional, user messages only) lets main.js remember what was
+// attached to this turn so an edit can re-send the same context:
+//   { contextSnippets: string[]  // full text that goes to the backend
+//     trailSnippets:   string[]  // what addContextTrail displayed }
+// For AI messages, `meta.stopped` marks a reply the user cut short.
+// Returns the created element.
+export function addMessage(text, role, meta = {}) {
+  // A reply arriving while busy replaces the thinking indicator (and gets
+  // the word reveal); history renders happen while idle and stay static.
+  const isLiveReply = role === "ai" && appWrap.classList.contains("busy");
+  removeThinking();
+
   // Once there's a real message (user, ai, or even a system notice),
   // the "nothing here yet" placeholder no longer applies.[cite: 2]
   hideEmptyState();
@@ -123,6 +440,7 @@ export function addMessage(text, role) {
     el.classList.add("md-body");
     el.innerHTML = markdownToHtml(text);
     addCodeBlockCopyButtons(el);
+    if (isLiveReply) createWordRevealer()(el);
   } else {
     // User/system messages are shown as plain text, not markdown-rendered:
     // markdown syntax someone actually typed (e.g. "what does * do in
@@ -130,32 +448,36 @@ export function addMessage(text, role) {
     el.textContent = text;
   }
 
-  // Create the copy button[cite: 2]
-  const copyBtn = document.createElement("button");
-  copyBtn.className = "copy-btn";
-  copyBtn.title = "Copy text";
-  copyBtn.innerHTML = COPY_ICON;
+  el.appendChild(makeCopyButton(text));
 
-  // Handle clipboard functionality[cite: 2]
-  copyBtn.addEventListener("click", () => {
-    navigator.clipboard.writeText(text).then(() => {
-      copyBtn.innerHTML = CHECK_ICON;
-      setTimeout(() => {
-        copyBtn.innerHTML = COPY_ICON;
-      }, 1500);
-    }).catch(err => console.error("Failed to copy text:", err));
-  });
+  // Replies saved as "stopped" (history reload) get the same grey note.
+  if (role === "ai" && meta.stopped) el.appendChild(makeStoppedNote());
 
-  el.appendChild(copyBtn);
+  if (role === "user") {
+    el._meta = meta;
+    const editBtn = document.createElement("button");
+    editBtn.className = "copy-btn edit-btn";
+    editBtn.type = "button";
+    editBtn.title = "Edit and resend";
+    editBtn.innerHTML = EDIT_ICON;
+    editBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      startEditing(el, text);
+    });
+    el.appendChild(editBtn);
+  }
+
   messagesEl.appendChild(el);
 
   requestAnimationFrame(() => {
     messagesEl.scrollTop = messagesEl.scrollHeight;
   });
+
+  return el;
 }
 
 export function addContextTrail(snippets) {
-  if (!snippets || snippets.length === 0) return;
+  if (!snippets || snippets.length === 0) return null;
   const trail = document.createElement("div");
   trail.className = "msg-context-trail";
   snippets.forEach((text) => {
@@ -180,6 +502,7 @@ export function addContextTrail(snippets) {
   requestAnimationFrame(() => {
     messagesEl.scrollTop = messagesEl.scrollHeight;
   });
+  return trail;
 }
 
 export function clearMessagesUI() {
@@ -187,6 +510,7 @@ export function clearMessagesUI() {
   // it (it's markup in the DOM, not generated by JS), so pull it out
   // first and put it back afterwards instead of hardcoding its HTML here.
   const empty = document.getElementById("empty-state");
+  thinkingEl = null; // wiped along with everything else below
   messagesEl.innerHTML = "";
   if (empty) {
     empty.classList.remove("hidden");
@@ -213,48 +537,53 @@ export function showOnline() {
   disconnectedScreen.classList.remove("retrying");
 }
 
+let isSendingNow = false;
+
+// While a reply is pending the send button becomes a *stop* button: it
+// stays enabled and clickable (main.js decides send-vs-stop from the
+// "busy" class), and shows a stop square instead of the old spinner.
+const STOP_ICON_SVG = `<svg id="send-stop" viewBox="0 0 20 20" width="16" height="16" fill="none" xmlns="http://www.w3.org/2000/svg" style="display:none"><rect x="0" y="0" width="20" height="20" rx="4" fill="currentColor"/></svg>`;
+
+function getStopIcon() {
+  let el = document.getElementById("send-stop");
+  if (!el) {
+    sendBtn.insertAdjacentHTML("beforeend", STOP_ICON_SVG);
+    el = document.getElementById("send-stop");
+  }
+  return el;
+}
+
 export function setSending(isSending) {
-  sendBtn.disabled = isSending;
+  isSendingNow = isSending;
+  sendBtn.disabled = false;
+  sendBtn.title = isSending ? "Stop generating" : "Send";
   const icon = document.getElementById("send-icon");
   const spinner = document.getElementById("send-spinner");
+  const stopIcon = getStopIcon();
   if (icon) icon.style.display = isSending ? "none" : "";
-  if (spinner) spinner.style.display = isSending ? "inline-block" : "none";
-  if (isSending) {
-    appWrap.classList.add("busy");
-  } else {
-    appWrap.classList.remove("busy");
+  if (spinner) spinner.style.display = "none"; // replaced by the stop icon
+  if (stopIcon) stopIcon.style.display = isSending ? "inline-block" : "none";
+  appWrap.classList.toggle("busy", isSending);
+  if (!isSending) {
+    appWrap.classList.remove("streaming");
+    removeThinking();
   }
+  syncSendBtn();
 }
 
 export const inputRow = document.getElementById("input-row");
-export const PROXIMITY_THRESHOLD = 90;
-let sendBtnRevealTimer = null;
+export const inputBox = document.getElementById("input-box");
 
-export function revealSendBtn() {
-  clearTimeout(sendBtnRevealTimer);
-  sendBtn.classList.add("revealed");
+// Show the send button only when there's something to send
+// (or while a send is in flight, so the spinner stays visible).
+export function syncSendBtn() {
+  const hasText = !!inputBox && inputBox.value.trim().length > 0;
+  sendBtn.classList.toggle("revealed", hasText || isSendingNow);
 }
 
-export function hideSendBtn(delay = 400) {
-  clearTimeout(sendBtnRevealTimer);
-  sendBtnRevealTimer = setTimeout(() => {
-    if (!sendBtn.matches(":hover")) {
-      sendBtn.classList.remove("revealed");
-    }
-  }, delay);
+if (inputBox) {
+  inputBox.addEventListener("input", syncSendBtn);
 }
 
-sendBtn.addEventListener("mouseenter", revealSendBtn);
-sendBtn.addEventListener("mouseleave", () => hideSendBtn(300));
-
-document.addEventListener("mousemove", (e) => {
-  const rect = inputRow.getBoundingClientRect();
-  const dx = Math.max(rect.left - e.clientX, 0, e.clientX - rect.right);
-  const dy = Math.max(rect.top - e.clientY, 0, e.clientY - rect.bottom);
-  const dist = Math.sqrt(dx * dx + dy * dy);
-  if (dist <= PROXIMITY_THRESHOLD) {
-    revealSendBtn();
-  } else {
-    hideSendBtn(300);
-  }
-});
+// Initial state on load
+syncSendBtn();

@@ -1,7 +1,10 @@
-import { setStatus, showOnline, showOffline, addMessage, setSending } from "./ui.js";
+import { setStatus, showOnline, showOffline, addMessage, setSending, beginStreamingMessage, addStoppedNote } from "./ui.js";
 
 export const BACKEND_HOST = "localhost:8765";
 export let socket = null;
+
+// The AI bubble currently being streamed into, if any (see ui.js).
+let streamHandle = null;
 
 export async function getActiveTabInfo() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -152,6 +155,11 @@ export async function deleteSessionOnBackend(sessionKey) {
 }
 
 export function closeSocket() {
+  // Intentional close (new chat / switch / delete): drop any partial bubble.
+  if (streamHandle) {
+    streamHandle.abort();
+    streamHandle = null;
+  }
   if (socket && socket.readyState !== WebSocket.CLOSED) {
     socket.close();
   }
@@ -169,17 +177,63 @@ export function connectSocket(sessionKey) {
   socket.onmessage = (event) => {
     try {
       const data = JSON.parse(event.data);
-      addMessage(data.reply ?? "(empty response)", "ai");
-      
-      // Dispatch a custom event so main.js knows a turn finished
-      window.dispatchEvent(new Event("chat-turn-complete"));
+
+      // Streaming chunk: grow the bubble and stay in the "busy" state.
+      if (data.type === "delta") {
+        if (!streamHandle) streamHandle = beginStreamingMessage();
+        streamHandle.append(data.text || "");
+        return;
+      }
+
+      if (data.type === "stopped") {
+        // The user hit stop. `reply` is whatever had streamed so far, and
+        // `saved` says whether the backend kept the turn (it doesn't when
+        // nothing had been generated yet).
+        if (streamHandle && data.saved) {
+          streamHandle.finish(data.reply, { stopped: true });
+        } else {
+          if (streamHandle) streamHandle.abort();
+          addStoppedNote();
+        }
+        streamHandle = null;
+
+        window.dispatchEvent(new CustomEvent("chat-turn-stopped", { detail: { saved: !!data.saved } }));
+        if (data.saved) window.dispatchEvent(new Event("chat-turn-complete"));
+      } else {
+        // Final message (or a plain {"reply": ...} such as an error/notice).
+        // If we were streaming, `reply` is the authoritative saved text.
+        const reply = data.reply ?? "(empty response)";
+        if (streamHandle) {
+          streamHandle.finish(reply);
+          streamHandle = null;
+        } else {
+          addMessage(reply, "ai");
+        }
+
+        // Dispatch a custom event so main.js knows a turn finished
+        window.dispatchEvent(new Event("chat-turn-complete"));
+      }
     } catch (err) {
+      if (streamHandle) {
+        streamHandle.abort();
+        streamHandle = null;
+      }
       addMessage("Couldn't parse server response.", "system");
     }
     setSending(false);
   };
 
   socket.onclose = () => {
+    // Lets main.js flag a user message whose reply never arrived, so the
+    // edit/truncate index only counts turns the backend really stored.
+    window.dispatchEvent(new Event("chat-socket-closed"));
+    // Connection died mid-stream (closeSocket() already cleared this for
+    // intentional closes): the turn was never saved, so drop the partial.
+    if (streamHandle) {
+      streamHandle.abort();
+      streamHandle = null;
+      addMessage("Connection lost before the reply finished.", "system");
+    }
     setStatus("disconnected");
     setSending(false);
   };
@@ -198,5 +252,24 @@ export async function fetchAllSessions() {
   } catch (err) {
     console.error("Couldn't fetch sessions list:", err);
     return [];
+  }
+}
+
+// Renames a conversation. Resolves to the title now in effect (an empty
+// name clears the custom title and falls back to the first message), or
+// null if the rename failed.
+export async function renameSessionOnBackend(sessionKey, title) {
+  try {
+    const res = await fetch(`http://${BACKEND_HOST}/session/${sessionKey}/title`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title }),
+    });
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const data = await res.json();
+    return typeof data.title === "string" ? data.title : title;
+  } catch (err) {
+    console.error("Couldn't rename session:", err);
+    return null;
   }
 }

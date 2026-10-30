@@ -147,11 +147,11 @@ def get_transcriber() -> AsyncOpenAI:
     return AsyncOpenAI()
 
 
-def navigator_smart_llm(schema=None):
+def navigator_smart_llm(schema=None, reasoning_effort="high"):
     llm = ChatOpenAI(
         model="gpt-6-luna",
         use_responses_api=True,
-        reasoning_effort="high",
+        reasoning_effort=reasoning_effort,
     )
 
     if schema:

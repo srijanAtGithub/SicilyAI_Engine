@@ -23,18 +23,21 @@ Run:
   uv run uvicorn Navigator.navigator_bridge:app --reload --port 8765
 """
 
-from langchain_core.messages import AIMessage, HumanMessage, BaseMessage
+import asyncio
+
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, BaseMessage
 from shared_utils import content_to_text
 
 import configuration
 configuration.load_config()
 
 import structlog
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
 from Navigator.Task_Files.Chat_Section import build_navigator_graph
-from Navigator.Task_Files.ChatStore import ChatStore
+from Navigator.Task_Files.ChatStore import ChatStore, truncate_messages_at_user_turn
 
 from Navigator.Task_Files.Organise_Tabs import OrganiseTabsRequest, process_organise_tabs
 from Navigator.Task_Files.Edit_Selection import EditSelectionRequest, EditSelectionResponse, process_edit_selection
@@ -63,6 +66,17 @@ from Navigator.Task_Files.Reading_List_Groups import (
     process_set_read,
     process_delete_reading_list_group,
     process_delete_reading_list_item,
+)
+from Navigator.Task_Files.Site_Theme import (
+    GenerateThemeRequest,
+    RepairThemeRequest,
+    ThemeRecord,
+    ListThemesResponse,
+    process_generate_theme,
+    process_repair_theme,
+    process_get_theme,
+    process_list_themes,
+    process_delete_theme,
 )
 
 log = structlog.get_logger()
@@ -173,6 +187,67 @@ async def set_reading_list_item_read(item_id: int, req: SetReadRequest):
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail=str(e))
 
+# ── Site Themes ──────────────────────────────────────────────────────
+# AI-designed dark themes per website. The side panel posts a
+# locally-measured palette summary (no page content) to /theme/generate;
+# the result is stored per hostname in ThemeStore (SQLite) and mirrored
+# into chrome.storage.local by the extension so theme_engine.js can apply
+# it at document_start. See Site_Theme.py.
+
+@app.post("/theme/generate", response_model=ThemeRecord)
+async def generate_theme(req: GenerateThemeRequest):
+    try:
+        return await process_generate_theme(req)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/theme/repair", response_model=ThemeRecord)
+async def repair_theme(req: RepairThemeRequest):
+    """AI repair pass: small per-site fixes on top of the instant base theme."""
+    try:
+        return await process_repair_theme(req)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+@app.get("/themes", response_model=ListThemesResponse)
+async def list_themes():
+    return await process_list_themes()
+
+@app.get("/theme/{host}", response_model=ThemeRecord)
+async def get_theme(host: str):
+    record = await process_get_theme(host)
+    if record is None:
+        raise HTTPException(status_code=404, detail="No theme saved for this site")
+    return record
+
+@app.delete("/theme/{host}")
+async def delete_theme(host: str):
+    return await process_delete_theme(host)
+
+def _chunk_text(content) -> str:
+    """
+    Plain text of one streamed model chunk. Chat-completions models give a
+    str; Responses-API models (the "smart" capability) give a list of
+    content blocks — only the visible text blocks are kept, so reasoning /
+    other block types are never streamed to the panel.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif (
+                isinstance(block, dict)
+                and block.get("type") in ("text", "output_text")
+                and isinstance(block.get("text"), str)
+            ):
+                parts.append(block["text"])
+        return "".join(parts)
+    return ""
+
+
 # One compiled graph instance, reused for every turn on every tab.
 # It has no memory of its own — memory lives in the ChatStore below and
 # is handed to the graph fresh on each invocation as part of the state.
@@ -223,7 +298,7 @@ async def get_session(tab_id: str):
     it already treats the value as an opaque string key.
 
     Returns each row as {"role": "user"|"ai", "text": str,
-    "context_snippets": list[str]} — the same shape main.js already
+    "context_snippets": list[str], "stopped": bool} — the same shape main.js already
     expects from its startup history-replay loop (it calls
     addContextTrail(m.context_snippets) then addMessage(m.text, role)
     for each entry), so drag-dropped context, "Add to Chat" summaries,
@@ -242,7 +317,12 @@ async def get_session(tab_id: str):
                 snippets = msg.additional_kwargs.get("context_snippets", [])
                 formatted_messages.append({"role": "user", "text": str(msg.content), "context_snippets": snippets})
             elif isinstance(msg, AIMessage):
-                formatted_messages.append({"role": "ai", "text": content_to_text(msg.content), "context_snippets": []})
+                formatted_messages.append({
+                    "role": "ai",
+                    "text": content_to_text(msg.content),
+                    "context_snippets": [],
+                    "stopped": bool(msg.additional_kwargs.get("stopped")),
+                })
                 
         return {"messages": formatted_messages}
 
@@ -260,6 +340,23 @@ async def delete_session(tab_id: str):
     """
     existed = sessions.clear(tab_id)
     return {"status": "cleared", "existed": existed}
+
+
+class RenameSessionRequest(BaseModel):
+    title: str
+
+
+@app.patch("/session/{tab_id}/title")
+async def rename_session(tab_id: str, req: RenameSessionRequest):
+    """
+    User renames a conversation (Chats panel or the chat header). An empty
+    title clears the custom name. The stored name is protected from the
+    background auto-titler. Returns the title now in effect.
+    """
+    title = sessions.rename_session(tab_id, req.title)
+    if title is None:
+        raise HTTPException(status_code=404, detail="No such conversation")
+    return {"status": "renamed", "title": title}
 
 
 @app.delete("/temp_session/{tab_id}")
@@ -284,12 +381,27 @@ async def websocket_endpoint(websocket: WebSocket, tab_id: str):
         while True:
             payload = await websocket.receive_json()
 
+            # A stop that arrives when no reply is being generated (the turn
+            # already finished) has nothing to cancel.
+            if payload.get("type") == "stop":
+                continue
+
             user_text = (payload.get("text") or "").strip()
             page_url = payload.get("page_url") or ""
             page_title = payload.get("page_title") or ""
             capability = payload.get("capability") or "basic"
             
             context_snippets = payload.get("context_snippets") or []
+
+            # Edit-and-resend: the panel sends "truncate_from_turn": N, meaning
+            # "drop the Nth user message and everything after it, then treat
+            # this text as the next turn". See ChatStore.truncate_from_user_turn.
+            truncate_from = payload.get("truncate_from_turn")
+            is_edit = (
+                isinstance(truncate_from, int)
+                and not isinstance(truncate_from, bool)
+                and truncate_from >= 0
+            )
 
             log.info("Received message", tab_id=tab_id, text=user_text, page_url=page_url, snippets_count=len(context_snippets))
 
@@ -303,13 +415,77 @@ async def websocket_endpoint(websocket: WebSocket, tab_id: str):
             else:
                 history = sessions.get(tab_id)
 
-            result = await graph.ainvoke({
+            # For an edit, the model must only see the turns BEFORE the edited
+            # one. The stored history is trimmed later, only once the graph has
+            # succeeded, so a failed LLM call can't leave the chat truncated
+            # with nothing in its place.
+            if is_edit:
+                history = truncate_messages_at_user_turn(history, truncate_from)
+
+            graph_input = {
                 "messages": history + [HumanMessage(content=user_text)],
                 "page_url": page_url,
                 "page_title": page_title,
                 "context_snippets": context_snippets, # 2. Forward the snippets into LangGraph state!
                 "capability": capability,
-            })
+            }
+
+            # Stream the reply to the panel token-by-token. "messages" mode
+            # yields model chunks (we forward only the chat node's visible
+            # text); "values" mode yields the full graph state, and the last
+            # one is the same final state graph.ainvoke() used to return —
+            # so usage tracking, title generation and persistence below are
+            # unchanged. Nothing is saved until the stream completes (or is
+            # stopped, see below).
+            partial_chunks: list[str] = []
+
+            async def _stream_turn():
+                final = None
+                async for mode, data in graph.astream(graph_input, stream_mode=["messages", "values"]):
+                    if mode == "messages":
+                        chunk, meta = data
+                        if meta.get("langgraph_node") != "chat" or not isinstance(chunk, AIMessageChunk):
+                            continue
+                        delta = _chunk_text(chunk.content)
+                        if delta:
+                            await websocket.send_json({"type": "delta", "text": delta})
+                            partial_chunks.append(delta)  # only what the panel actually received
+                    elif mode == "values":
+                        final = data
+                return final
+
+            # Run the generation as a task so we can keep listening to the
+            # socket while it streams: a {"type": "stop"} message cancels it,
+            # and a client disconnect (WebSocketDisconnect) cancels it too
+            # instead of generating into the void.
+            stream_task = asyncio.ensure_future(_stream_turn())
+            stopped = False
+            try:
+                while not stream_task.done():
+                    recv_task = asyncio.ensure_future(websocket.receive_json())
+                    await asyncio.wait({stream_task, recv_task}, return_when=asyncio.FIRST_COMPLETED)
+                    if not recv_task.done():
+                        recv_task.cancel()
+                        await asyncio.gather(recv_task, return_exceptions=True)
+                        continue
+                    msg = recv_task.result()  # raises WebSocketDisconnect if the client left
+                    if isinstance(msg, dict) and msg.get("type") == "stop" and not stream_task.done():
+                        stopped = True
+                        break
+                    # anything else sent mid-turn is ignored
+            finally:
+                if not stream_task.done():
+                    stream_task.cancel()
+                    await asyncio.gather(stream_task, return_exceptions=True)
+
+            if stopped:
+                # Keep what was generated so far; usage for a cancelled call
+                # isn't reported, so the tracking loop below sees no messages.
+                result = {"messages": []}
+            else:
+                result = stream_task.result()  # re-raises graph errors -> "Server error" below
+                if result is None:
+                    raise RuntimeError("Graph finished without producing a result")
 
             # Track token usage from the returned message state
             try:
@@ -342,6 +518,23 @@ async def websocket_endpoint(websocket: WebSocket, tab_id: str):
                     reply_text = content_to_text(msg.content)
                     break
 
+            if stopped:
+                reply_text = "".join(partial_chunks).strip()
+
+            # Persist the truncation now that we have a good reply (or a stop).
+            if is_edit:
+                if is_temp:
+                    temp_sessions[tab_id] = list(history)
+                else:
+                    removed = sessions.truncate_from_user_turn(tab_id, truncate_from)
+                    log.info("Edit-and-resend truncated history", tab_id=tab_id,
+                             from_turn=truncate_from, rows_removed=removed)
+
+            if stopped and not reply_text:
+                # Stopped before any text was generated: nothing to save.
+                await websocket.send_json({"type": "stopped", "reply": "", "saved": False})
+                continue
+
             # Save to memory OR database depending on the session type
             if is_temp:
                 # We store context_snippets in additional_kwargs so the GET /session endpoint can restore them
@@ -349,26 +542,33 @@ async def websocket_endpoint(websocket: WebSocket, tab_id: str):
                     content=user_text, 
                     additional_kwargs={"context_snippets": context_snippets}
                 ))
-                temp_sessions[tab_id].append(AIMessage(content=reply_text))
+                temp_sessions[tab_id].append(AIMessage(
+                    content=reply_text,
+                    additional_kwargs={"stopped": True} if stopped else {},
+                ))
             else:
                 sessions.append_turn(
                     tab_id=tab_id,
                     user_text=user_text,
                     ai_text=reply_text,
                     context_snippets=context_snippets,
+                    stopped=stopped,
                 )
             
                 # Title generation is now safely nested inside the standard (non-temp) block
                 if not history:
-                    import asyncio
                     async def generate_and_save_title():
                         try:
                             llm = configuration.navigator_basic_llm()
+                            # The opening of each side is plenty to name a
+                            # chat — no need to pay for the full first reply.
+                            TITLE_CTX_CHARS = 300
                             prompt = (
                                 "Generate a chat title based on this first interaction. "
                                 "Keep the name very short and concise. Just a few words. "
                                 "Do not use quotes or prefixes. Just the title.\n\n"
-                                f"User: {user_text}\n\nAI: {reply_text}"
+                                f"User: {user_text[:TITLE_CTX_CHARS]}\n\n"
+                                f"AI: {reply_text[:TITLE_CTX_CHARS]}"
                             )
                             title_msg = await llm.ainvoke(prompt)
                             title = content_to_text(title_msg.content).strip(' "')
@@ -398,7 +598,11 @@ async def websocket_endpoint(websocket: WebSocket, tab_id: str):
                     
                     asyncio.create_task(generate_and_save_title())
 
-            await websocket.send_json({"reply": reply_text})
+            if stopped:
+                # The partial reply was saved as the turn's answer.
+                await websocket.send_json({"type": "stopped", "reply": reply_text, "saved": True})
+            else:
+                await websocket.send_json({"type": "done", "reply": reply_text})
 
     except WebSocketDisconnect:
         # The popup closing disconnects this socket, but the tab itself is
