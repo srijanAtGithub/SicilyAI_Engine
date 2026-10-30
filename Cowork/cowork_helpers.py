@@ -438,19 +438,28 @@ def _docx_table_text(table) -> str:
     return "[Table]\n" + "\n".join(rows)
 
 
-def _search_binary_units(path: Path, search_regex: re.Pattern) -> list[dict]:
+def _search_binary_units(
+    path: Path,
+    compiled: list[tuple[str, re.Pattern]],
+) -> list[dict]:
     """
-    Search a binary document's real internal structure for `search_regex`,
-    returning one dict per match:
+    Search a binary document's real internal structure for any of the
+    `compiled` patterns ((pattern_text, compiled_regex) pairs, as built by
+    search_file_contents), in a SINGLE parse of the file. Returns one dict
+    per matching line/cell/paragraph:
         {
           "unit": int,          # 1-indexed page/slide/sheet/paragraph —
                                  # the SAME number read_file's start_unit/
-                                 # end_unit expects, so a search hit here
-                                 # can be handed straight to read_file to
-                                 # pull that exact unit back.
+                                 # end_unit expects (both count every unit,
+                                 # blank ones included), so a hit here can
+                                 # be handed straight to read_file.
           "unit_label": str,    # "page" / "slide" / "sheet" / "paragraph"
           "location": str,      # extra format-specific locator (see below)
           "line_text": str,     # the matching line/cell/paragraph text
+          "matched_patterns": list[str],  # every pattern (caller order)
+                                          # that hit this text — lets the
+                                          # caller merge multi-pattern hits
+                                          # on the same line into one result
         }
 
     This is intentionally separate from _read_binary_units (which returns
@@ -467,8 +476,7 @@ def _search_binary_units(path: Path, search_regex: re.Pattern) -> list[dict]:
       .pptx -> "slide N, <part>" where <part> is "text", "table", or
                "notes" — which part of the slide the match is actually in
       .xlsx/.xls -> "sheet 'name', cell REF" (e.g. "sheet 'Q3', cell B7")
-      .docx -> "paragraph N" (no finer locator exists within one
-               paragraph's flat text)
+      .docx -> "paragraph N", or "table at unit N, row R, col C"
 
     Raises the same ImportError/ValueError as _read_binary_units for
     missing packages / unsupported extensions.
@@ -484,7 +492,19 @@ def _search_binary_units(path: Path, search_regex: re.Pattern) -> list[dict]:
             "in Word/PowerPoint) and try again."
         )
 
+    def _hits(text: str) -> list[str]:
+        return [p for p, rx in compiled if rx.search(text)]
+
     matches: list[dict] = []
+
+    def _add(unit: int, label: str, location: str, text: str, hit: list[str]) -> None:
+        matches.append({
+            "unit": unit,
+            "unit_label": label,
+            "location": location,
+            "line_text": text.strip(),
+            "matched_patterns": hit,
+        })
 
     if ext == ".pdf":
         if importlib.util.find_spec("pypdf") is None:
@@ -494,16 +514,10 @@ def _search_binary_units(path: Path, search_regex: re.Pattern) -> list[dict]:
         reader = PdfReader(path)
         for i, page in enumerate(reader.pages):
             page_text = page.extract_text() or ""
-            if not page_text.strip():
-                continue
             for j, line in enumerate(page_text.splitlines()):
-                if search_regex.search(line):
-                    matches.append({
-                        "unit": i + 1,
-                        "unit_label": "page",
-                        "location": f"page {i+1}, line {j+1}",
-                        "line_text": line.strip(),
-                    })
+                hit = _hits(line)
+                if hit:
+                    _add(i + 1, "page", f"page {i+1}, line {j+1}", line, hit)
         return matches
 
     if ext in {".xlsx", ".xls"}:
@@ -512,21 +526,20 @@ def _search_binary_units(path: Path, search_regex: re.Pattern) -> list[dict]:
         import openpyxl
 
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-        for sheet_idx, name in enumerate(wb.sheetnames):
-            ws = wb[name]
-            for row in ws.iter_rows():
-                for cell in row:
-                    if cell.value is None:
-                        continue
-                    value_str = str(cell.value)
-                    if search_regex.search(value_str):
-                        matches.append({
-                            "unit": sheet_idx + 1,
-                            "unit_label": "sheet",
-                            "location": f"sheet '{name}', cell {cell.coordinate}",
-                            "line_text": value_str.strip(),
-                        })
-        wb.close()
+        try:
+            for sheet_idx, name in enumerate(wb.sheetnames):
+                for row in wb[name].iter_rows():
+                    for cell in row:
+                        if cell.value is None:
+                            continue
+                        value_str = str(cell.value)
+                        hit = _hits(value_str)
+                        if hit:
+                            _add(sheet_idx + 1, "sheet",
+                                 f"sheet '{name}', cell {cell.coordinate}",
+                                 value_str, hit)
+        finally:
+            wb.close()
         return matches
 
     if ext == ".docx":
@@ -538,23 +551,21 @@ def _search_binary_units(path: Path, search_regex: re.Pattern) -> list[dict]:
         for i, (kind, unit_obj) in enumerate(_iter_docx_body_units(doc)):
             unit_num = i + 1
             if kind == "paragraph":
-                if unit_obj.text.strip() and search_regex.search(unit_obj.text):
-                    matches.append({
-                        "unit": unit_num,
-                        "unit_label": "paragraph",
-                        "location": f"paragraph {unit_num}",
-                        "line_text": unit_obj.text.strip(),
-                    })
+                if unit_obj.text.strip():
+                    hit = _hits(unit_obj.text)
+                    if hit:
+                        _add(unit_num, "paragraph", f"paragraph {unit_num}",
+                             unit_obj.text, hit)
             else:  # kind == "table"
                 for r_idx, row in enumerate(unit_obj.rows):
                     for c_idx, cell in enumerate(row.cells):
-                        if cell.text.strip() and search_regex.search(cell.text):
-                            matches.append({
-                                "unit": unit_num,
-                                "unit_label": "paragraph",
-                                "location": f"table at unit {unit_num}, row {r_idx+1}, col {c_idx+1}",
-                                "line_text": cell.text.strip(),
-                            })
+                        if not cell.text.strip():
+                            continue
+                        hit = _hits(cell.text)
+                        if hit:
+                            _add(unit_num, "paragraph",
+                                 f"table at unit {unit_num}, row {r_idx+1}, col {c_idx+1}",
+                                 cell.text, hit)
         return matches
 
     if ext == ".pptx":
@@ -564,42 +575,36 @@ def _search_binary_units(path: Path, search_regex: re.Pattern) -> list[dict]:
 
         prs = Presentation(path)
         for i, slide in enumerate(prs.slides):
+            unit_num = i + 1
             # Text frames — titles, body placeholders, free text boxes.
             for shape in slide.shapes:
                 if shape.has_text_frame:
                     for p in shape.text_frame.paragraphs:
-                        if p.text.strip() and search_regex.search(p.text):
-                            matches.append({
-                                "unit": i + 1,
-                                "unit_label": "slide",
-                                "location": f"slide {i+1}, text",
-                                "line_text": p.text.strip(),
-                            })
+                        if not p.text.strip():
+                            continue
+                        hit = _hits(p.text)
+                        if hit:
+                            _add(unit_num, "slide", f"slide {unit_num}, text", p.text, hit)
 
                 # Tables — cell by cell.
                 if shape.has_table:
                     for row in shape.table.rows:
                         for cell in row.cells:
-                            if cell.text.strip() and search_regex.search(cell.text):
-                                matches.append({
-                                    "unit": i + 1,
-                                    "unit_label": "slide",
-                                    "location": f"slide {i+1}, table",
-                                    "line_text": cell.text.strip(),
-                                })
+                            if not cell.text.strip():
+                                continue
+                            hit = _hits(cell.text)
+                            if hit:
+                                _add(unit_num, "slide", f"slide {unit_num}, table", cell.text, hit)
 
             # Speaker notes.
             if slide.has_notes_slide:
-                notes_text = (slide.notes_slide.notes_text_frame.text or "")
-                if notes_text.strip() and search_regex.search(notes_text):
-                    for line in notes_text.splitlines():
-                        if line.strip() and search_regex.search(line):
-                            matches.append({
-                                "unit": i + 1,
-                                "unit_label": "slide",
-                                "location": f"slide {i+1}, notes",
-                                "line_text": line.strip(),
-                            })
+                notes_text = slide.notes_slide.notes_text_frame.text or ""
+                for line in notes_text.splitlines():
+                    if not line.strip():
+                        continue
+                    hit = _hits(line)
+                    if hit:
+                        _add(unit_num, "slide", f"slide {unit_num}, notes", line, hit)
         return matches
 
     raise ValueError(
@@ -632,10 +637,14 @@ def _read_binary_units(path: Path) -> list[str]:
                paragraphs belong to which section — so paragraph index is
                the finest stable, addressable unit actually available.
 
-    Only pages/slides/sheets/paragraphs with non-empty text produce a
-    unit — this matches _read_binary's existing full-read behavior of
-    skipping blank pages/slides, so unit numbering (e.g. "[Page 3]") is
-    unaffected by this refactor.
+    EVERY page/slide/sheet/paragraph gets a slot in the returned list, in
+    order — blank ones are kept as "" rather than dropped. That makes
+    list position == real unit number (units[2] is always page/slide/
+    paragraph 3), which is exactly the numbering _search_binary_units
+    reports. Dropping blank units here would shift every later unit by
+    one, so a search hit on "page 3" would make read_file(start_unit=3)
+    return page 4. Callers that display content filter out "" themselves
+    (see _read_binary and read_file).
 
     Empty pdf form-field data is intentionally NOT its own unit (it's
     sandbox metadata, not page content) — _read_binary appends it once,
@@ -664,9 +673,8 @@ def _read_binary_units(path: Path) -> list[str]:
         reader = PdfReader(path)
         units = []
         for i, page in enumerate(reader.pages):
-            page_text = page.extract_text() or ""
-            if page_text.strip():
-                units.append(f"[Page {i+1}]\n{page_text.strip()}")
+            page_text = (page.extract_text() or "").strip()
+            units.append(f"[Page {i+1}]\n{page_text}" if page_text else "")
         return units
 
     if ext in {".xlsx", ".xls"}:
@@ -694,16 +702,15 @@ def _read_binary_units(path: Path) -> list[str]:
         for i, (kind, unit_obj) in enumerate(_iter_docx_body_units(doc)):
             unit_num = i + 1
             if kind == "paragraph":
-                if unit_obj.text.strip():
-                    units.append(f"[Paragraph {unit_num}]\n{unit_obj.text.strip()}")
+                text = unit_obj.text.strip()
+                units.append(f"[Paragraph {unit_num}]\n{text}" if text else "")
             else:  # kind == "table"
                 rows = [
                     "\t".join(cell.text.strip() for cell in row.cells)
                     for row in unit_obj.rows
                 ]
                 rows_text = "\n".join(rows).strip()
-                if rows_text:
-                    units.append(f"[Unit {unit_num} — Table]\n{rows_text}")
+                units.append(f"[Unit {unit_num} — Table]\n{rows_text}" if rows_text else "")
         return units
 
     if ext == ".pptx":
@@ -742,8 +749,7 @@ def _read_binary_units(path: Path) -> list[str]:
                 if notes_text:
                     parts.append(f"[Notes]\n{notes_text}")
 
-            if parts:
-                units.append(f"[Slide {i+1}]\n" + "\n\n".join(parts))
+            units.append(f"[Slide {i+1}]\n" + "\n\n".join(parts) if parts else "")
 
         return units
 
@@ -767,7 +773,9 @@ def _read_binary(path: Path) -> str:
     """
     ext = path.suffix.lower()
     units = _read_binary_units(path)
-    text_output = "\n\n".join(units)
+    # Blank units are kept as "" placeholders for numbering (see
+    # _read_binary_units) — drop them here so full-read output is unchanged.
+    text_output = "\n\n".join(u for u in units if u)
 
     if ext == ".pdf":
         from pypdf import PdfReader

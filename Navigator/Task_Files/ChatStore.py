@@ -39,6 +39,7 @@ Schema:
         role              TEXT NOT NULL,   -- 'user' | 'ai'
         text              TEXT NOT NULL,
         context_snippets  TEXT,            -- JSON array[str], NULL if none
+        stopped           INTEGER NOT NULL DEFAULT 0,  -- 1 on an 'ai' row the user stopped mid-reply
         created_at        TEXT NOT NULL    -- ISO-8601 UTC
     )
     INDEX (tab_id, id)                     -- fast ordered fetch per tab
@@ -74,19 +75,44 @@ CREATE TABLE IF NOT EXISTS messages (
     role              TEXT NOT NULL,
     text              TEXT NOT NULL,
     context_snippets  TEXT,
+    stopped           INTEGER NOT NULL DEFAULT 0,
     created_at        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_tab_id ON messages(tab_id, id);
 
 CREATE TABLE IF NOT EXISTS session_titles (
     tab_id TEXT PRIMARY KEY,
-    title TEXT NOT NULL
+    title TEXT NOT NULL,
+    custom INTEGER NOT NULL DEFAULT 0   -- 1 = named by the user; never overwritten by the auto-titler
 );
 """
 
 
+MAX_TITLE_LEN = 80
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def truncate_messages_at_user_turn(
+    messages: list[BaseMessage], turn_index: int
+) -> list[BaseMessage]:
+    """
+    Same "drop the Nth user message and everything after it" rule as
+    ChatStore.truncate_from_user_turn, but for a plain list of LangChain
+    messages — for stores that are not SQLite-backed (e.g. the in-memory
+    temporary/incognito sessions). Returns a new list.
+    """
+    if turn_index < 0:
+        return list(messages)
+    seen = 0
+    for i, m in enumerate(messages):
+        if isinstance(m, HumanMessage):
+            if seen == turn_index:
+                return list(messages[:i])
+            seen += 1
+    return list(messages)
 
 
 class ChatStore:
@@ -119,6 +145,21 @@ class ChatStore:
         self._conn.row_factory = sqlite3.Row
         with self._conn:
             self._conn.executescript(_SCHEMA)
+            # Databases created before the "stopped" flag existed: add the
+            # column in place. Existing rows get 0 (= not stopped), so every
+            # already-saved chat loads exactly as before.
+            cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(messages)")}
+            if "stopped" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE messages ADD COLUMN stopped INTEGER NOT NULL DEFAULT 0"
+                )
+            # Same for session_titles.custom (user-chosen names). Every
+            # title that already exists was auto-generated, so they get 0.
+            title_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(session_titles)")}
+            if "custom" not in title_cols:
+                self._conn.execute(
+                    "ALTER TABLE session_titles ADD COLUMN custom INTEGER NOT NULL DEFAULT 0"
+                )
 
     @contextmanager
     def _cursor(self):
@@ -138,7 +179,8 @@ class ChatStore:
     def get_full(self, tab_id: str) -> list[dict]:
         """
         Returns every row for this tab in order, as plain dicts:
-            {"role": "user"|"ai", "text": str, "context_snippets": list[str]}
+            {"role": "user"|"ai", "text": str, "context_snippets": list[str],
+             "stopped": bool}
 
         This is what the popup's history load (loadHistory in api.js ->
         GET /session/{tab_id} -> main.js's startup loop) actually needs:
@@ -147,7 +189,7 @@ class ChatStore:
         """
         with self._cursor() as cur:
             cur.execute(
-                "SELECT role, text, context_snippets FROM messages "
+                "SELECT role, text, context_snippets, stopped FROM messages "
                 "WHERE tab_id = ? ORDER BY id ASC",
                 (tab_id,),
             )
@@ -156,7 +198,12 @@ class ChatStore:
         out = []
         for row in rows:
             snippets = json.loads(row["context_snippets"]) if row["context_snippets"] else []
-            out.append({"role": row["role"], "text": row["text"], "context_snippets": snippets})
+            out.append({
+                "role": row["role"],
+                "text": row["text"],
+                "context_snippets": snippets,
+                "stopped": bool(row["stopped"]),
+            })
         return out
 
     def append_turn(
@@ -165,12 +212,16 @@ class ChatStore:
         user_text: str,
         ai_text: str,
         context_snippets: list[str] | None = None,
+        stopped: bool = False,
     ) -> None:
         """
         Persist exactly one turn: the human message (with whatever
         context_snippets rode alongside it — drag/drop text, an "Add to
         Chat" summary, an @-mentioned tab's content) and the AI reply
         that followed it.
+
+        `stopped` marks the AI reply as cut short by the user (the panel
+        shows a grey "Response stopped" note under it, including on reload).
 
         Called once per WebSocket turn in navigator_bridge.py, right
         after the graph returns — mirrors the old sessions.set(...) call
@@ -186,9 +237,9 @@ class ChatStore:
                 (tab_id, user_text, snippets_json, now),
             )
             cur.execute(
-                "INSERT INTO messages (tab_id, role, text, context_snippets, created_at) "
-                "VALUES (?, 'ai', ?, NULL, ?)",
-                (tab_id, ai_text, now),
+                "INSERT INTO messages (tab_id, role, text, context_snippets, stopped, created_at) "
+                "VALUES (?, 'ai', ?, NULL, ?, ?)",
+                (tab_id, ai_text, 1 if stopped else 0, now),
             )
 
     # ── LangGraph-shaped API (get/set/clear/__len__, matches old SessionStore) ──
@@ -249,7 +300,54 @@ class ChatStore:
             cur.execute("SELECT 1 FROM messages WHERE tab_id = ? LIMIT 1", (tab_id,))
             existed = cur.fetchone() is not None
             cur.execute("DELETE FROM messages WHERE tab_id = ?", (tab_id,))
+            cur.execute("DELETE FROM session_titles WHERE tab_id = ?", (tab_id,))
         return existed
+
+    def truncate_from_user_turn(self, tab_id: str, turn_index: int) -> int:
+        """
+        Edit-and-resend support: deletes the Nth *user* message of this
+        session (0-based) and every row after it (that turn's AI reply
+        and all later turns). Returns the number of rows deleted.
+
+        Turns are addressed by position rather than by a new id column,
+        so this works on every conversation saved before the feature
+        existed — no schema change, no migration. append_turn() always
+        writes 'user' then 'ai', so the Nth 'user' row is the start of
+        the Nth turn.
+
+        If turn_index is past the end (e.g. the UI had a message that
+        never got stored), nothing is deleted and 0 is returned.
+
+        If this empties the session, its *auto-generated* title is dropped
+        too, so the Chats list falls back to the first user message and the
+        title can be regenerated from the edited prompt. A title the user
+        chose (custom = 1) is kept.
+        """
+        if turn_index < 0:
+            return 0
+
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT id FROM messages "
+                "WHERE tab_id = ? AND role = 'user' "
+                "ORDER BY id ASC LIMIT 1 OFFSET ?",
+                (tab_id, turn_index),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return 0
+
+            cur.execute(
+                "DELETE FROM messages WHERE tab_id = ? AND id >= ?",
+                (tab_id, row["id"]),
+            )
+            deleted = cur.rowcount
+
+            cur.execute("SELECT 1 FROM messages WHERE tab_id = ? LIMIT 1", (tab_id,))
+            if cur.fetchone() is None:
+                cur.execute("DELETE FROM session_titles WHERE tab_id = ? AND custom = 0", (tab_id,))
+
+        return deleted
 
     def __len__(self) -> int:
         with self._cursor() as cur:
@@ -258,12 +356,57 @@ class ChatStore:
         return count
 
     def set_title(self, tab_id: str, title: str) -> None:
-        """Saves a short, relevant title for the session."""
+        """
+        Saves the auto-generated title for the session. If the user has
+        renamed the chat (custom = 1) this is a no-op, so the background
+        title generator can never overwrite a name the user chose.
+        """
         with self._cursor() as cur:
             cur.execute(
-                "INSERT OR REPLACE INTO session_titles (tab_id, title) VALUES (?, ?)",
-                (tab_id, title)
+                "INSERT INTO session_titles (tab_id, title, custom) VALUES (?, ?, 0) "
+                "ON CONFLICT(tab_id) DO UPDATE SET title = excluded.title "
+                "WHERE session_titles.custom = 0",
+                (tab_id, title),
             )
+
+    def get_title(self, tab_id: str) -> str:
+        """The title the Chats list shows: stored title, else first user message."""
+        with self._cursor() as cur:
+            cur.execute("SELECT title FROM session_titles WHERE tab_id = ?", (tab_id,))
+            row = cur.fetchone()
+            if row and row["title"]:
+                return row["title"]
+            cur.execute(
+                "SELECT text FROM messages WHERE tab_id = ? AND role = 'user' "
+                "ORDER BY id ASC LIMIT 1",
+                (tab_id,),
+            )
+            first = cur.fetchone()
+        return first["text"][:120] if first else ""
+
+    def rename_session(self, tab_id: str, title: str) -> str | None:
+        """
+        User-initiated rename. Returns the title now in effect, or None if
+        there is no such session (no messages under this key).
+
+        A non-empty name is stored as custom (protected from the
+        auto-titler and from edit-and-resend). An empty name clears the
+        custom title, falling back to the first user message.
+        """
+        clean = " ".join((title or "").split())[:MAX_TITLE_LEN]
+        with self._cursor() as cur:
+            cur.execute("SELECT 1 FROM messages WHERE tab_id = ? LIMIT 1", (tab_id,))
+            if cur.fetchone() is None:
+                return None
+            if clean:
+                cur.execute(
+                    "INSERT INTO session_titles (tab_id, title, custom) VALUES (?, ?, 1) "
+                    "ON CONFLICT(tab_id) DO UPDATE SET title = excluded.title, custom = 1",
+                    (tab_id, clean),
+                )
+            else:
+                cur.execute("DELETE FROM session_titles WHERE tab_id = ?", (tab_id,))
+        return self.get_title(tab_id)
 
     def list_sessions(self) -> list[dict]:
         """

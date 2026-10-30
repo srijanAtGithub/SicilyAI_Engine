@@ -46,33 +46,30 @@ body {
     transform: translateY(0) scale(1);
 }
 
-/* --- Neural Glow Edge (Matches content_script.js) --- */
-.neural-glow {
+/* --- Start screen backdrop: soft top light + graphite grain ---
+   Replaces the flat black while the empty state is showing, and fades
+   away once the conversation starts. Sits behind everything (z-index 0;
+   #messages is 2, header 10) and never takes clicks. To keep it on for
+   every screen, drop the :has(...) rule and set opacity: 1 above. */
+.wrap::before {
+    content: '';
     position: absolute;
     inset: 0;
-    border-radius: 0;
+    z-index: 0;
     pointer-events: none;
+    background:
+        /* fine grain, greyscale, baked at 7% so it stays a texture */
+        url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.07'/%3E%3C/svg%3E"),
+        /* graphite lift at the top, back to black by mid-panel */
+        linear-gradient(180deg, rgba(255, 255, 255, 0.035), transparent 55%);
     opacity: 0;
-    background: radial-gradient(circle at 20% 30%, rgba(94, 92, 230, 0.25), transparent 50%),
-        radial-gradient(circle at 80% 70%, rgba(249, 81, 165, 0.25), transparent 50%);
-    mix-blend-mode: screen;
-    transition: opacity 0.5s ease;
-    z-index: 1;
+    transition: opacity 0.6s ease;
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, transparent 56px, #000 160px);
+    mask-image: linear-gradient(to bottom, transparent 0, transparent 56px, #000 160px);
 }
 
-.wrap.busy .neural-glow {
+.wrap:has(#empty-state:not(.hidden))::before {
     opacity: 1;
-    animation: neuralPulse 3s ease-in-out infinite alternate;
-}
-
-@keyframes neuralPulse {
-    0% {
-        filter: hue-rotate(0deg);
-    }
-
-    100% {
-        filter: hue-rotate(90deg);
-    }
 }
 
 /* --- Header Layout --- */
@@ -259,28 +256,37 @@ body {
     animation: qaItemIn 0.36s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
 
-#quick-actions.open .qa-item:nth-child(1) {
+/* Staggered entrance, keyed by action so it never depends on menu position. */
+#quick-actions.open .qa-item[data-action="summarise-page"] {
     animation-delay: 0.03s;
 }
 
-#quick-actions.open .qa-item:nth-child(2) {
+#quick-actions.open .qa-item[data-action="organise-tabs"] {
     animation-delay: 0.07s;
 }
 
-#quick-actions.open .qa-item:nth-child(3) {
+#quick-actions.open .qa-item[data-action="find-more-like-this"] {
     animation-delay: 0.11s;
 }
 
-#quick-actions.open .qa-item:nth-child(5) {
+#quick-actions.open .qa-item[data-action="reading-list-groups"] {
     animation-delay: 0.15s;
 }
 
-#quick-actions.open .qa-item:nth-child(6) {
+#quick-actions.open .qa-item[data-action="saved-collections"] {
     animation-delay: 0.19s;
 }
 
-#quick-actions.open .qa-item:nth-child(8) {
+#quick-actions.open .qa-item[data-action="site-theme"] {
     animation-delay: 0.23s;
+}
+
+#quick-actions.open .qa-item[data-action="font-size"] {
+    animation-delay: 0.27s;
+}
+
+#quick-actions.open .qa-item[data-action="capability"] {
+    animation-delay: 0.31s;
 }
 
 @keyframes qaItemIn {
@@ -439,34 +445,6 @@ body {
 
 .qa-cap-pill:active {
     transform: scale(0.93);
-}
-
-/* Scanning scanline for busy state (Matches content_script.js) */
-.wrap::before {
-    content: '';
-    position: absolute;
-    inset: 0;
-    background: linear-gradient(to bottom, transparent, rgba(130, 240, 255, 0.15), transparent);
-    transform: translateY(-100%);
-    pointer-events: none;
-    z-index: 5;
-    opacity: 0;
-    transition: opacity 0.3s ease;
-}
-
-.wrap.busy::before {
-    opacity: 1;
-    animation: scanLine 2s cubic-bezier(0.4, 0, 0.2, 1) infinite;
-}
-
-@keyframes scanLine {
-    0% {
-        transform: translateY(-100%);
-    }
-
-    100% {
-        transform: translateY(100%);
-    }
 }
 
 /* Invisible overlay to prevent interactions while waiting for a response */

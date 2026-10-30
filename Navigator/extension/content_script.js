@@ -8,7 +8,9 @@
  *
  * Flow:
  *   1. User selects text and right-clicks (menu only shows when there IS
- *      a selection — see background.js's contexts: ["selection"]).
+ *      a selection — see background.js's contexts: ["selection"]), or
+ *      presses the keyboard shortcut (background.js's chrome.commands —
+ *      the reliable trigger on Google Docs, which hijacks right-click).
  *   2. background.js relays a "navigator-open-edit-box" message here.
  *      This script re-reads the live selection itself — background.js
  *      has no DOM access to inspect it.
@@ -47,6 +49,20 @@
  *      framework's own handler expects) — out of scope for this pass.
  *      So: read-only mode. We still call the backend and show the
  *      result, just as a copyable suggestion instead of an auto-apply.
+ *      [UPDATE: now applied with ONE execCommand("insertText") over the
+ *      re-selected range, so the framework sees a single native edit —
+ *      one undo step, no mid-stream re-render races.]
+ *
+ *   GOOGLE DOCS (checked before all of the above, async) — text is
+ *   painted on <canvas>, so there are no text nodes and
+ *   window.getSelection() is empty. Docs routes all keyboard/clipboard
+ *   input through a hidden same-origin iframe
+ *   (.docs-texteventtarget-iframe). We READ the selection by triggering
+ *   a copy in that iframe and capturing the text, and WRITE by
+ *   refocusing the iframe and dispatching a paste (with an
+ *   execCommand("insertText") fallback). Docs keeps its own selection
+ *   model, so refocusing restores the user's selection. Needs the
+ *   "clipboardRead" + "clipboardWrite" permissions.
  *
  *   Anything selected outside all of the above (plain read-only page
  *   text) gets the same copyable-suggestion treatment as tier 3, for
@@ -54,6 +70,9 @@
  */
 
 (() => {
+  // Only the top frame drives the edit box.
+  if (window !== window.top) return;
+
   const OPEN_BOX_MESSAGE = "navigator-open-edit-box";
   const EDIT_REQUEST_MESSAGE = "navigator-edit-selection-request";
 
@@ -62,7 +81,17 @@
     style.id = "navigator-highlight-style";
     // Using a nice transparent version of your #3a6df0 blue
     style.textContent = `::highlight(navigator-selection) { background-color: #6879a3ff !important; color: #ffffff !important; }`;
-    document.head.appendChild(style);
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  // @property only works at document level (it's ignored inside shadow
+  // roots), so the angle the iridescent ring rotates through is registered
+  // here. The name is namespaced so it can't collide with the page's own.
+  if (!document.getElementById("navigator-anim-props")) {
+    const style = document.createElement("style");
+    style.id = "navigator-anim-props";
+    style.textContent = `@property --nav-angle { syntax: "<angle>"; inherits: false; initial-value: 0deg; }`;
+    (document.head || document.documentElement).appendChild(style);
   }
 
   let activeBox = null; // only one edit box open at a time
@@ -81,6 +110,7 @@
     { name: "Draft.js", test: (root) => root.classList?.contains("DraftEditor-root") || !!root.closest?.(".DraftEditor-root") || !!root.querySelector?.('[data-contents="true"]') },
     { name: "Quill", test: (root) => root.classList?.contains("ql-editor") || !!root.closest?.(".ql-editor") },
     { name: "CKEditor", test: (root) => root.classList?.contains("ck-editor__editable") || !!root.closest?.(".ck-editor__editable") },
+    { name: "CodeMirror", test: (root) => root.classList?.contains("cm-content") || !!root.closest?.(".cm-editor") },
   ];
 
   function detectFramework(editableRoot) {
@@ -214,7 +244,11 @@
     }
     if (!block || block === document.body) block = containerEl;
 
-    const blockText = (block.innerText || block.textContent || "").trim();
+    // Form fields keep their text in .value — innerText/textContent of a
+    // <textarea> is only its initial markup, not what the user typed.
+    const blockText = (block.tagName === "TEXTAREA" || block.tagName === "INPUT")
+      ? (block.value || "").trim()
+      : (block.innerText || block.textContent || "").trim();
     if (!blockText) return "";
 
     // If the block itself is already short, just use the whole thing.
@@ -233,7 +267,149 @@
     return blockText.slice(start, end);
   }
 
-  function detectEditContext() {
+  // ── SITE ADAPTER: Google Docs (canvas-rendered) ─────────────────────
+
+  function isGoogleDocs() {
+    return location.hostname === "docs.google.com"
+      && location.pathname.startsWith("/document/")
+      && !!document.querySelector(".docs-texteventtarget-iframe");
+  }
+
+  function getDocsInputTarget() {
+    const iframe = document.querySelector(".docs-texteventtarget-iframe");
+    let idoc = null;
+    try { idoc = iframe?.contentDocument; } catch (e) { return null; }
+    if (!idoc) return null;
+    const target = idoc.querySelector('[contenteditable="true"]') || idoc.querySelector("[contenteditable]") || idoc.body;
+    return { idoc, iwin: idoc.defaultView, target };
+  }
+
+  function getDocsCaretRect() {
+    // Docs still draws the caret as a real DOM element over the canvas.
+    // Class names are internal and may change — verify in DevTools.
+    const caret = document.querySelector(".kix-cursor-caret") || document.querySelector(".kix-cursor");
+    const r = caret?.getBoundingClientRect();
+    if (r && (r.width || r.height)) return r;
+    // Fallback: top-centre of the viewport.
+    return { left: Math.max(8, window.innerWidth / 2 - 190), right: window.innerWidth / 2 + 190, top: 120, bottom: 140, width: 380, height: 20 };
+  }
+
+  // Clipboard helpers that go through a throwaway <textarea> and
+  // execCommand. With the "clipboardRead"/"clipboardWrite" permissions a
+  // content script can do this without a user gesture or a permission
+  // prompt (navigator.clipboard.readText() would prompt / need focus).
+  function readClipboardText() {
+    const ta = document.createElement("textarea");
+    ta.style.cssText = "position:fixed;top:-1000px;left:-1000px;opacity:0;";
+    document.body.appendChild(ta);
+    ta.focus();
+    let text = null;
+    try {
+      if (document.execCommand("paste")) text = ta.value;
+    } catch (e) { /* ignore */ }
+    ta.remove();
+    return text;
+  }
+
+  function writeClipboardText(text) {
+    const ta = document.createElement("textarea");
+    ta.style.cssText = "position:fixed;top:-1000px;left:-1000px;opacity:0;";
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand("copy"); } catch (e) { /* ignore */ }
+    ta.remove();
+  }
+
+  async function readGoogleDocsSelection() {
+    const io = getDocsInputTarget();
+    if (!io) return null;
+    const { idoc, iwin, target } = io;
+
+    // Copying overwrites the user's clipboard — remember it so we can
+    // put it back afterwards (plain text only).
+    const SENTINEL = `⁣sicily-${Date.now()}⁣`;
+    const previousClipboard = readClipboardText();
+    // Put a sentinel on the clipboard so we can tell whether Docs' copy
+    // actually happened (an empty Docs selection copies nothing).
+    writeClipboardText(SENTINEL);
+
+    // Path 1: catch the text Docs puts on the copy event. Bubble-phase
+    // listeners run after Docs' own handler has filled clipboardData.
+    let captured = "";
+    const onCopy = (e) => {
+      if (captured) return;
+      try { captured = e.clipboardData?.getData("text/plain") || ""; } catch (err) { /* ignore */ }
+    };
+    iwin.addEventListener("copy", onCopy);
+    idoc.addEventListener("copy", onCopy);
+    try {
+      target.focus(); // restores Docs' own selection
+      idoc.execCommand("copy");
+    } catch (e) { /* ignore */ }
+    iwin.removeEventListener("copy", onCopy);
+    idoc.removeEventListener("copy", onCopy);
+
+    // Path 2: Docs stopped propagation — read what landed on the clipboard.
+    if (!captured) {
+      await new Promise((r) => setTimeout(r, 50));
+      const fromClipboard = readClipboardText();
+      if (fromClipboard && fromClipboard !== SENTINEL) captured = fromClipboard;
+    }
+
+    // Put the user's clipboard back, then hand focus back to Docs.
+    writeClipboardText(previousClipboard ?? "");
+    try { target.focus(); } catch (e) { /* ignore */ }
+
+    // Docs sprinkles zero-width chars / trailing newlines into copies.
+    const text = (captured || "").replace(/[​‌‍﻿]/g, "").replace(/\s+$/, "");
+    if (!text.trim()) return null;
+
+    return {
+      tier: "gdocs",
+      text,
+      rect: getDocsCaretRect(),
+      getRect: getDocsCaretRect,
+      pageContext: "", // the rest of the doc isn't readable from the DOM
+    };
+  }
+
+  function writeGoogleDocsSelection(newText) {
+    const io = getDocsInputTarget();
+    if (!io) return false;
+    const { idoc, target } = io;
+
+    // Refocusing the input iframe restores Docs' own selection, so the
+    // paste/insert below replaces exactly what the user had selected.
+    target.focus();
+
+    let handled = false;
+    try {
+      const dt = new DataTransfer();
+      dt.setData("text/plain", newText);
+      const evt = new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true });
+      // Docs calls preventDefault() when it consumes the paste → returns false.
+      handled = !target.dispatchEvent(evt);
+    } catch (e) { /* ClipboardEvent init unsupported — fall through */ }
+
+    if (!handled) {
+      try { handled = idoc.execCommand("insertText", false, newText); } catch (e) { /* ignore */ }
+    }
+    return handled;
+  }
+
+  // Google Docs needs its own async path (clipboard round-trip); every
+  // other page goes through the synchronous tier detection below.
+  async function detectEditContext() {
+    if (isGoogleDocs()) {
+      const ctx = await readGoogleDocsSelection();
+      if (!ctx) console.log("[Sicily Navigator] couldn't read the Google Docs selection (clipboard permissions?).");
+      return ctx;
+    }
+    return detectGenericEditContext();
+  }
+
+  function detectGenericEditContext() {
     // Tier 1: an <input>/<textarea> with an active selection. Note that
     // window.getSelection() does NOT see into form controls in Chrome —
     // their selection only shows up via selectionStart/selectionEnd on
@@ -301,7 +477,7 @@
 
     const framework = detectFramework(editableRoot);
     if (framework) {
-      return { tier: "rich-text", frameworkName: framework, text, rect, range: range.cloneRange(), pageContext: extractSurroundingContext(text, editableRoot) };
+      return { tier: "rich-text", frameworkName: framework, root: editableRoot, text, rect, range: range.cloneRange(), pageContext: extractSurroundingContext(text, editableRoot) };
     }
 
     return {
@@ -316,7 +492,7 @@
 
   // Helper: Briefly flash a subtle highlight on an element to signal a change
   function pulseElement(el) {
-    if (!el) return;
+    if (!el || !el.style) return;
     const originalTransition = el.style.transition;
     const originalBg = el.style.backgroundColor;
 
@@ -334,30 +510,44 @@
     }, 200);
   }
 
+  // A saved Range is only safe to re-select if its nodes are still in the
+  // document — frameworks may have re-rendered them away since detection.
+  function rangeIsUsable(range) {
+    return !!range && range.startContainer?.isConnected && range.endContainer?.isConnected;
+  }
+
   // Smoothly apply edits with an adaptive typewriter animation
-  function applyEdit(context, newText) {
-    if (!newText) return;
+  // Returns true on success, false if it couldn't be applied safely (the
+  // Replace handler then falls back to copying the result).
+  async function applyEdit(context, newText) {
+    if (!newText) return false;
+
+    // ── Google Docs ─────────────────────────────────────────────────────
+    if (context.tier === "gdocs") {
+      return writeGoogleDocsSelection(newText);
+    }
 
     // ── TIER 1: Standard Form Fields (<input>, <textarea>) ─────────────────────
     if (context.tier === "form" && context.element) {
       const el = context.element;
-      const start = el.selectionStart || 0;
-      const end = el.selectionEnd || 0;
       const oldVal = el.value;
 
-      const prefix = oldVal.substring(0, start);
-      const suffix = oldVal.substring(end);
+      // Use the word-snapped offsets captured at detection time, not the
+      // live selectionStart/End (which are the un-snapped originals).
+      // Bail if the field changed underneath us.
+      if (oldVal.slice(context.start, context.end) !== context.text) return false;
 
+      const prefix = oldVal.substring(0, context.start);
+      const suffix = oldVal.substring(context.end);
+
+      el.focus();
       let charIndex = 0;
       const speed = Math.max(8, Math.floor(350 / newText.length));
 
       const timer = setInterval(() => {
         charIndex += Math.max(1, Math.floor(newText.length / 25));
-        if (charIndex >= newText.length) {
-          charIndex = newText.length;
-          clearInterval(timer);
-          pulseElement(el);
-        }
+        const done = charIndex >= newText.length;
+        if (done) charIndex = newText.length;
 
         const currentSlice = newText.substring(0, charIndex);
         el.value = prefix + currentSlice + suffix;
@@ -366,16 +556,45 @@
         el.setSelectionRange(newCursorPos, newCursorPos);
 
         el.dispatchEvent(new Event("input", { bubbles: true }));
+
+        if (done) {
+          clearInterval(timer);
+          // "change" only once the full text is in, not before typing starts
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          pulseElement(el);
+        }
       }, speed);
 
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-      return;
+      return true;
     }
 
-    // ── TIER 2 & 3: ContentEditable & Rich-Text Frameworks (Notion, Slack, etc.) ──
-    if ((context.tier === "contenteditable" || context.tier === "rich-text") && context.range) {
+    // ── TIER 3: Rich-Text Frameworks — ONE native insert, no typewriter ──
+    // Streaming chunks into ProseMirror/Lexical/etc. creates many undo
+    // steps and races the framework's re-render. A single insertText over
+    // the selection is seen as one ordinary user edit.
+    if (context.tier === "rich-text") {
+      if (!rangeIsUsable(context.range)) return false;
       const selection = window.getSelection();
-      if (!selection) return;
+      if (!selection) return false;
+
+      // 1. Force focus back to the target element if it slipped away
+      context.root?.focus?.();
+
+      // 2. Re-select the exact text block the user highlighted
+      selection.removeAllRanges();
+      selection.addRange(context.range);
+
+      // 3. Replace it in one go — insertText over a selection replaces it
+      const ok = document.execCommand("insertText", false, newText);
+      if (ok) pulseElement(context.root);
+      return ok;
+    }
+
+    // ── TIER 2: Plain ContentEditable ───────────────────────────────────
+    if (context.tier === "contenteditable" && context.range) {
+      if (!rangeIsUsable(context.range)) return false;
+      const selection = window.getSelection();
+      if (!selection) return false;
 
       // 1. Force focus back to the target element if it slipped away
       if (context.root && typeof context.root.focus === "function") {
@@ -415,8 +634,10 @@
         }
       }, speed);
 
-      return;
+      return true;
     }
+
+    return false;
   }
 
   // ── Floating box (Shadow DOM keeps page CSS from leaking in/out) ──────
@@ -479,7 +700,7 @@
           /* Glassmorphism Effect */
           backdrop-filter: blur(20px); 
           -webkit-backdrop-filter: blur(20px); /* Safari support */
-          background: rgba(25, 25, 26, 0.65); /* Premium Dark Mode Gray */
+          background: rgba(15, 15, 15, 0.65); /* Premium Dark Mode Gray */
           
           /* The "Shader" / Glowing Border Effect */
           box-shadow: 
@@ -532,92 +753,122 @@
           pointer-events: auto; /* Enable interaction */
         }
 
-        /* --- Full Window Scanning Scanline --- */
-        .wrap::before {
-          content: '';
-          position: absolute;
-          inset: 0;
-          background: linear-gradient(to bottom, transparent, rgba(130, 240, 255, 0.15), transparent);
-          transform: translateY(-100%);
-          pointer-events: none;
-          z-index: 5;
-          opacity: 0;
-          transition: opacity 0.3s ease;
+        /* --- Apple-style iridescent "thinking" state ---
+           --nav-angle is registered on the page itself (see the
+           navigator-anim-props style near the top): @property is ignored
+           inside shadow roots, and without registration the conic
+           gradient can't rotate smoothly. */
+        .iri {
+          background: conic-gradient(from var(--nav-angle, 0deg),
+            #ff8fb1, #c38bff, #7aa7ff, #6ee7f2, #ffc27a, #ff8fb1);
+          animation: navSpin 3s linear infinite;
         }
-        .wrap.busy::before {
-          opacity: 1;
-          animation: scanLine 2s cubic-bezier(0.4, 0, 0.2, 1) infinite;
-        }
+        @keyframes navSpin { to { --nav-angle: 360deg; } }
 
-        @keyframes scanLine {
-          0% { transform: translateY(-100%); }
-          100% { transform: translateY(100%); }
-        }
-
-        /* --- Neural Glow Edge (Rotating Inner Border) & full container color drift --- */
-        .neural-glow {
+        /* Thin rotating ring hugging the panel edge */
+        .ring {
           position: absolute;
           inset: 0;
           border-radius: 18px;
-          pointer-events: none;
+          padding: 1.5px; /* ring thickness */
+          -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+          -webkit-mask-composite: xor;
+          mask-composite: exclude;
           opacity: 0;
-          /* Animated color drift when busy */
-          background: radial-gradient(circle at 20% 30%, rgba(94, 92, 230, 0.25), transparent 50%),
-                      radial-gradient(circle at 80% 70%, rgba(249, 81, 165, 0.25), transparent 50%);
-          mix-blend-mode: screen;
           transition: opacity 0.5s ease;
-          z-index: 1;
+          pointer-events: none;
+          z-index: 6;
         }
-        .wrap.busy .neural-glow { 
-          opacity: 1; 
-          animation: neuralPulse 3s ease-in-out infinite alternate;
-        }
+        /*.wrap.busy .ring { opacity: 1; }*/
 
-        @keyframes neuralPulse {
-          0% { filter: hue-rotate(0deg); }
-          100% { filter: hue-rotate(90deg); }
-        }
-
-        /* --- Outer Radiant Glow Backdrop (Escapes overflow: hidden) --- */
+        /* Soft dark halo behind the panel while thinking */
         .glow-backdrop {
           position: absolute;
-          top: 0; left: 0; right: 0; bottom: 0;
+          inset: 6px;
           border-radius: 18px;
-          pointer-events: none; /* Let clicks pass straight through */
-          z-index: -1; /* Render behind the main panel */
+          background: rgba(15, 15, 15, 0.65);
+          filter: blur(22px);
           opacity: 0;
-          transition: opacity 0.4s ease;
+          transition: opacity 0.6s ease;
+          pointer-events: none;
+          z-index: -1;
+        }
+        .wrap.busy ~ .glow-backdrop { opacity: 1; }
+
+        /* --- Skeleton placeholder (shown in the result view while loading) --- */
+        .skeleton { display: none; margin-bottom: 16px; }
+        .result-view.loading .skeleton { display: block; }
+        .result-view.loading .result-text { display: none; }
+        .sk-line {
+          height: 10px;
+          border-radius: 6px;
+          margin-bottom: 12px;
+          background: linear-gradient(100deg,
+            rgba(255, 255, 255, 0.05) 35%,
+            rgba(255, 143, 177, 0.35) 45%,
+            rgba(195, 139, 255, 0.40) 50%,
+            rgba(122, 167, 255, 0.35) 55%,
+            rgba(255, 255, 255, 0.05) 65%) 0 0 / 300% 100%;
+          animation: navShimmer 1.8s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+        }
+        .sk-line:last-child { margin-bottom: 0; }
+        @keyframes navShimmer {
+          0% { background-position: 100% 0; }
+          100% { background-position: 0 0; }
         }
 
-        /* When the panel is busy, ignite the backdrop with synced rotation and breathing */
-        /*UNCOMMENT THE FOLLOWING TO HAVE THE BORDER GLOW AS WELL*/
-        /*
-        .wrap.busy ~ .glow-backdrop {
-          opacity: 1;
-          animation: 
-            glowRotate 2s linear infinite, 
-            radiantPulse 1.5s ease-in-out infinite alternate;
+        /* --- Result reveal ---
+           Two layers so the text never changes weight:
+           .rt-base  = the real text, drawn normally, wiped in L→R with a mask
+           .rt-sheen = a transparent copy on top that only shows the
+                       iridescent band, tinting just the letters under it.
+           (Gradient-filled text renders thinner in Chrome, so only the
+           band uses it; everything else is the real text from frame one.)
+           Same size + timing keeps the band riding the wipe's edge. */
+        .result-text { position: relative; }
+        .rt-base { display: block; }
+        .rt-sheen {
+          display: none;
+          position: absolute;
+          top: 0;
+          left: 0;
+          right: 8px; /* matches .result-text's padding-right, so lines wrap identically */
+          color: transparent;
+          pointer-events: none;
+          user-select: none;
+          background: linear-gradient(90deg,
+            transparent 0 40%, #ffb3cf 44%, #c9a4ff 50%, #8fb5ff 56%, transparent 60% 100%)
+            100% 0 / 250% 100% no-repeat;
+          -webkit-background-clip: text;
+          background-clip: text;
         }
-        */
-
-        @keyframes glowRotate { 
-          100% { filter: hue-rotate(360deg); } 
+        .result-text.revealing .rt-base {
+          -webkit-mask-image: linear-gradient(90deg, #000 40%, transparent 60%);
+          mask-image: linear-gradient(90deg, #000 40%, transparent 60%);
+          -webkit-mask-size: 250% 100%;
+          mask-size: 250% 100%;
+          -webkit-mask-repeat: no-repeat;
+          mask-repeat: no-repeat;
+          -webkit-mask-position: 100% 0;
+          mask-position: 100% 0;
+          animation: navWipe 1.1s cubic-bezier(0.3, 0.7, 0.3, 1) forwards;
+        }
+        .result-text.revealing .rt-sheen {
+          display: block;
+          animation: navReveal 1.1s cubic-bezier(0.3, 0.7, 0.3, 1) forwards;
+        }
+        @keyframes navWipe {
+          to { -webkit-mask-position: 0 0; mask-position: 0 0; }
+        }
+        @keyframes navReveal {
+          85% { opacity: 1; }
+          to { background-position: 0 0; opacity: 0; }
         }
 
-        /* Subtle, elegant, close-to-the-border glow */
-        @keyframes radiantPulse {
-          0% {
-            box-shadow: 
-              0 0 15px rgba(94, 92, 230, 0.4),      /* Tight inner purple */
-              0 0 30px rgba(130, 240, 255, 0.2),     /* Soft middle cyan */
-              0 0 50px rgba(94, 92, 230, 0.08);     /* Barely visible outer ambient */
-          }
-          100% {
-            box-shadow: 
-              0 0 25px rgba(94, 92, 230, 0.6),      /* Tight hot purple */
-              0 0 45px rgba(130, 240, 255, 0.35),    /* Medium cyan bloom */
-              0 0 75px rgba(94, 92, 230, 0.15);     /* Gentle outer glow */
-          }
+        @media (prefers-reduced-motion: reduce) {
+          .iri, .sk-line { animation: none; }
+          .result-text.revealing .rt-base,
+          .result-text.revealing .rt-sheen { animation-duration: 0.01s; }
         }
 
         /* Tier Notice (Blurred Golden Style) */
@@ -798,10 +1049,26 @@
         }
         .result-text::-webkit-scrollbar { display: none; } /* Chrome/Safari */
 
-        .actions {
+        /* --- Result action bar: Copy · Replace · Ask more ---
+           Only the buttons that apply are shown (Replace needs a new
+           version + an editable target). "Ask more" opens the follow-up
+           box underneath; it stays closed until asked for. */
+        .result-actions {
           display: flex;
           justify-content: flex-end;
-          gap: 10px;
+          gap: 8px;
+          padding-top: 12px;
+          border-top: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        .result-view.loading .result-actions { display: none; }
+        .btn-askmore {
+          background: rgba(255, 255, 255, 0.06);
+          color: #f2f2f7;
+        }
+        .btn-askmore:hover { background: rgba(255, 255, 255, 0.12); }
+        .btn-askmore.on {
+          background: rgba(255, 255, 255, 0.14);
+          border-color: rgba(255, 255, 255, 0.22);
         }
 
         /* The Copy & Cancel Buttons - Standard Translucent Gray */
@@ -815,18 +1082,55 @@
 
         /* Global Button Interactions */
         .submit-btn:active:not(:disabled), .btn:active { transform: scale(0.96); }
-        .submit-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .submit-btn:disabled, .btn:disabled { opacity: 0.4; cursor: not-allowed; }
         .btn-success { background: #34c759 !important; border-color: transparent !important; }
 
         /* --- Follow-up row (result view) --- */
+        /* Follow-up box: folded away until "Ask more". It unfolds with a
+           height (grid 0fr -> 1fr), fade and slight slide; the box grows
+           with it since its own height is auto. visibility keeps the
+           folded input out of the Tab order. */
+        .followup-wrap {
+          display: grid;
+          grid-template-rows: 0fr;
+          margin-top: 0;
+          opacity: 0;
+          visibility: hidden;
+          transition:
+            grid-template-rows 0.34s cubic-bezier(0.16, 1, 0.3, 1),
+            margin-top 0.34s cubic-bezier(0.16, 1, 0.3, 1),
+            opacity 0.22s ease,
+            visibility 0s linear 0.34s;
+        }
+        .followup-inner {
+          min-height: 0;
+          overflow: clip;
+          overflow-clip-margin: 16px; /* let the input's focus glow show */
+        }
         .followup-row {
           display: flex;
           gap: 8px;
           align-items: flex-end;
-          margin-top: 12px;
-          padding-top: 12px;
-          border-top: 1px solid rgba(255, 255, 255, 0.08);
+          transform: translateY(-6px);
+          transition: transform 0.34s cubic-bezier(0.16, 1, 0.3, 1);
         }
+        .result-view.asking .followup-wrap {
+          grid-template-rows: 1fr;
+          margin-top: 10px;
+          opacity: 1;
+          visibility: visible;
+          transition:
+            grid-template-rows 0.34s cubic-bezier(0.16, 1, 0.3, 1),
+            margin-top 0.34s cubic-bezier(0.16, 1, 0.3, 1),
+            opacity 0.25s ease 0.05s,
+            visibility 0s;
+        }
+        .result-view.asking .followup-row { transform: none; }
+        /* While a follow-up loads, the box shows only skeleton + this row. */
+        .result-view.asking.loading .followup-wrap { margin-top: 0; }
+        /* Instant fold, used when an answer arrives (the box's own height
+           animation takes care of the motion then). */
+        .followup-wrap.snap, .followup-wrap.snap .followup-row { transition: none !important; }
         .followup-input {
           flex: 1;
           height: 36px;
@@ -864,7 +1168,7 @@
       </style>
 
       <div class="wrap">
-        <div class="neural-glow"></div>
+        <div class="ring iri"></div>
         <div class="notice" style="display: none;"></div>
         <div class="content">
           <div class="view input-view active">
@@ -886,14 +1190,20 @@
           <div class="status"></div>
           
           <div class="view result-view">
+            <div class="skeleton"></div>
             <div class="result-text"></div>
-            <div class="actions">
+            <div class="result-actions">
               <button class="btn btn-copy">Copy</button>
               <button class="btn btn-replace">Replace</button>
+              <button class="btn btn-askmore">Ask more</button>
             </div>
-            <div class="followup-row">
-              <textarea class="followup-input" placeholder="Ask a follow-up..." rows="1"></textarea>
-              <button class="submit-btn btn-followup">Send</button>
+            <div class="followup-wrap">
+              <div class="followup-inner">
+                <div class="followup-row">
+                  <textarea class="followup-input" placeholder="Ask a follow-up..." rows="1"></textarea>
+                  <button class="submit-btn btn-followup">Send</button>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -916,6 +1226,15 @@
     const status = shadow.querySelector(".status");
     const noticeEl = shadow.querySelector(".notice");
     const resultText = shadow.querySelector(".result-text");
+    const skeletonEl = shadow.querySelector(".skeleton");
+    const askMoreBtn = shadow.querySelector(".btn-askmore");
+    const followupWrap = shadow.querySelector(".followup-wrap");
+
+    // The reveal class is one-shot: drop it when the band finishes (the
+    // event bubbles up from .rt-sheen) so only the plain text remains.
+    resultText.addEventListener("animationend", (e) => {
+      if (e.animationName === "navReveal") resultText.classList.remove("revealing");
+    });
 
     // Fade the top/bottom edges only when there is more content in that direction
     function updateResultFade() {
@@ -929,6 +1248,8 @@
     const followupInput = shadow.querySelector(".followup-input");
     const followupBtn = shadow.querySelector(".btn-followup");
 
+    // What's currently shown in the result pane. Copy and Replace always
+    // use exactly this — what you see is what you get.
     let pendingAiText = "";
 
     // Turn history for THIS open box only. Lives entirely in this
@@ -951,7 +1272,10 @@
     function getFreshRect() {
       if (context.tier === "form" && context.element) {
         return context.element.getBoundingClientRect();
-      } else if (context.range) {
+      } else if (typeof context.getRect === "function") {
+        // Google Docs: no Range — re-measure the caret element instead
+        return context.getRect();
+      } else if (rangeIsUsable(context.range)) {
         return context.range.getBoundingClientRect();
       }
       return context.rect;
@@ -1006,19 +1330,69 @@
       // 6. Set the height to the end point to trigger the CSS transition
       wrapEl.style.height = `${endHeight}px`;
 
-      // 7. Cleanup after the animation finishes
-      function cleanupTransition() {
+      // 7. Cleanup after the animation finishes. Only the box's own height
+      //    transition counts (children's transitionend events bubble up
+      //    here too), and a timer covers the case where the height didn't
+      //    change at all, so no transition fires — otherwise a fixed
+      //    height could be left behind and stop the box from growing.
+      let cleaned = false;
+      function cleanupTransition(e) {
+        if (e && (e.target !== wrapEl || e.propertyName !== "height")) return;
+        if (cleaned) return;
+        cleaned = true;
+        clearTimeout(fallback);
         wrapEl.style.height = ""; // Restore to 'auto' so it can resize with text
         wrapEl.removeEventListener("transitionend", cleanupTransition);
         reposition(); // Perform collision check after new layout is stable
       }
+      const fallback = setTimeout(() => cleanupTransition(), 600);
       wrapEl.addEventListener("transitionend", cleanupTransition);
     }
 
+    // Placeholder bars while the answer loads — always 5 lines.
+    const SKELETON_LINES = 5;
+    function buildSkeleton() {
+      const count = SKELETON_LINES;
+      const widths = [100, 94, 97, 91, 96];
+      let html = "";
+      for (let i = 0; i < count; i++) {
+        const w = i === count - 1 ? 58 : widths[i];
+        html += `<div class="sk-line" style="width:${w}%;animation-delay:${(i * 0.1).toFixed(1)}s"></div>`;
+      }
+      skeletonEl.innerHTML = html;
+    }
+
+    // Switch to the result layout immediately, with skeleton bars standing
+    // in for the answer. Works both from the input view (first submit) and
+    // from an existing result (follow-ups replace the old answer in place).
+    function showLoading(actionType) {
+      buildSkeleton();
+      animateHeightChange(() => {
+        inputView.classList.remove("active");
+        status.style.display = "none";
+        noticeEl.style.display = "none";
+        resultView.classList.remove("just-revealed");
+        resultView.classList.add("active", "loading");
+      });
+    }
+
+    // Undo showLoading after a failed request: back to the previous answer
+    // if there is one, otherwise back to the input view so the user can retry.
+    function leaveLoading() {
+      if (!resultView.classList.contains("loading")) return;
+      resultView.classList.remove("loading");
+      if (!pendingAiText) {
+        resultView.classList.remove("active");
+        inputView.classList.add("active");
+      }
+    }
+
     function showError(msg) {
-      status.textContent = msg;
-      status.style.display = "block";
-      animateHeightChange(() => { }); // Re-calc height with error text visible
+      animateHeightChange(() => {
+        leaveLoading();
+        status.textContent = msg;
+        status.style.display = "block";
+      });
     }
 
     // Follow-up send is only enabled when there's text and we're not busy
@@ -1033,7 +1407,7 @@
       followupInput.disabled = isBusy;
       updateFollowupState();
 
-      // Toggle neural glow/border shaders
+      // Toggle the iridescent ring + backdrop bloom
       if (isBusy) {
         wrapEl.classList.add("busy");
       } else {
@@ -1042,7 +1416,17 @@
     }
 
     // Morph the window from Input to Preview mode with animation
-    function showPreviewMode(text, actionType) {
+    // Fold the follow-up box away instantly (inside a height animation).
+    function foldFollowup() {
+      if (!resultView.classList.contains("asking")) return;
+      followupWrap.classList.add("snap");
+      resultView.classList.remove("asking");
+      askMoreBtn.classList.remove("on");
+      void followupWrap.offsetHeight;
+      followupWrap.classList.remove("snap");
+    }
+
+    function showPreviewMode(text, actionType, kind) {
       pendingAiText = text;
 
       // Use the smooth lerp engine
@@ -1051,11 +1435,34 @@
         inputView.classList.remove("active");
         status.style.display = "none";
 
-        resultText.textContent = text;
+        resultView.classList.remove("loading");
+        // A follow-up was answered: tuck the box away again ("Ask more"
+        // brings it back).
+        foldFollowup();
+        // Real text + an aria-hidden copy that carries the colour band
+        const base = document.createElement("span");
+        base.className = "rt-base";
+        base.textContent = text;
+        const sheen = document.createElement("span");
+        sheen.className = "rt-sheen";
+        sheen.setAttribute("aria-hidden", "true");
+        sheen.textContent = text;
+        resultText.replaceChildren(base, sheen);
         resultView.classList.add("active");
         resultText.scrollTop = 0;
+
+        // Restart the one-shot reveal wipe (reflow so it replays on follow-ups)
+        resultText.classList.remove("revealing");
+        void resultText.offsetWidth;
+        resultText.classList.add("revealing");
+        resultView.classList.add("just-revealed");
         updateResultFade();
         updateFollowupState();
+
+        // Replace only when the pane shows a new version of the selection
+        // (not a chat reply) and there's somewhere to write it back to.
+        const canReplace =
+          context.tier !== "readonly" && actionType !== "ask" && kind === "edit";
 
         // Show the warning ONLY if the user tried to execute an 'edit' on static text
         if (actionType === "edit" && context.tier === "readonly") {
@@ -1065,17 +1472,10 @@
           noticeEl.style.display = "none";
         }
 
-        // Hide the replace button if the field is read-only OR if the action is an 'ask'
-        if (context.tier === "readonly" || actionType === "ask") {
-          replaceBtn.style.display = "none";
-        } else {
-          replaceBtn.style.display = ""; // Restores the default button layout for regular edits
-        }
+        replaceBtn.style.display = canReplace ? "" : "none";
       });
 
-      // Let the user immediately keep the conversation going without an
-      // extra click — this is the whole point of not dead-ending here.
-      followupInput.focus();
+
     }
 
     function submit(actionType, instructionOverride) {
@@ -1096,11 +1496,11 @@
       }
 
       setBusy(true);
-      status.style.display = "none";
+      showLoading(actionType);
 
       chrome.runtime.sendMessage(
         {
-          type: "navigator-edit-selection-request",
+          type: EDIT_REQUEST_MESSAGE,
           selected_text: context.text,
           instruction,
           action_type: actionType,
@@ -1127,6 +1527,9 @@
           conversationHistory.push({ role: "user", text: instruction });
           conversationHistory.push({ role: "ai", text: response.edited_text });
 
+          // Older backends don't send `kind`; fall back to the old behaviour.
+          const kind = response.kind || (actionType === "ask" ? "reply" : "edit");
+
           if (instructionOverride !== undefined) {
             followupInput.value = "";
             followupInput.style.height = "auto";
@@ -1137,7 +1540,7 @@
             actionBtns.classList.remove("has-text");
           }
 
-          showPreviewMode(response.edited_text, actionType);
+          showPreviewMode(response.edited_text, actionType, kind);
         }
       );
     }
@@ -1156,6 +1559,16 @@
     }
 
     followupBtn.addEventListener("click", submitFollowup);
+
+    // "Ask more" opens (or closes) the follow-up box under the action bar.
+    // The CSS animates it; the box's auto height follows along.
+    askMoreBtn.addEventListener("click", () => {
+      wrapEl.style.height = ""; // never let a leftover fixed height clip it
+      const open = resultView.classList.toggle("asking");
+      askMoreBtn.classList.toggle("on", open);
+      if (open) followupInput.focus();
+      else askMoreBtn.focus();
+    });
 
     followupInput.addEventListener("input", () => {
       updateFollowupState();
@@ -1214,10 +1627,29 @@
     input.addEventListener("keyup", (e) => e.stopPropagation());
     input.addEventListener("keypress", (e) => e.stopPropagation());
 
-    replaceBtn.addEventListener("click", () => {
-      if (pendingAiText) {
-        applyEdit(context, pendingAiText);
+    replaceBtn.addEventListener("click", async () => {
+      if (!pendingAiText) {
+        closeActiveBox();
+        return;
       }
+
+      replaceBtn.disabled = true;
+      let ok = false;
+      try {
+        ok = await applyEdit(context, pendingAiText);
+      } catch (e) {
+        console.warn("[Sicily Navigator] applyEdit failed:", e);
+      }
+
+      if (!ok) {
+        // Couldn't write safely (text changed, editor re-rendered, Docs
+        // rejected the paste…) — never silently lose the result.
+        navigator.clipboard?.writeText(pendingAiText).catch(() => { });
+        showError("Couldn't apply it here — copied the edit to your clipboard instead.");
+        replaceBtn.disabled = false;
+        return;
+      }
+
       closeActiveBox();
     });
 
@@ -1248,15 +1680,22 @@
   chrome.runtime.onMessage.addListener((message) => {
     if (message.type !== OPEN_BOX_MESSAGE) return;
 
-    const context = detectEditContext();
-    if (!context) {
-      // Menu is gated on contexts: ["selection"], so this shouldn't
-      // normally happen — but selection can vanish between the
-      // right-click and this message arriving. Log for visibility while
-      // testing rather than failing completely silently.
-      console.log("[Sicily Navigator] no selection found when edit box was requested.");
-      return;
-    }
-    openEditBox(context);
+    // detectEditContext is async now (the Google Docs path does a
+    // clipboard round-trip), so wait for it before opening the box.
+    detectEditContext()
+      .then((context) => {
+        if (!context) {
+          // Menu is gated on contexts: ["selection"], so this shouldn't
+          // normally happen — but selection can vanish between the
+          // right-click and this message arriving. Log for visibility while
+          // testing rather than failing completely silently.
+          console.log("[Sicily Navigator] no selection found when edit box was requested.");
+          return;
+        }
+        openEditBox(context);
+      })
+      .catch((err) => {
+        console.warn("[Sicily Navigator] selection detection failed:", err);
+      });
   });
 })();

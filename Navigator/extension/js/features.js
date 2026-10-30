@@ -1,7 +1,8 @@
 import { NotificationService } from "./notifications.js";
-import { appWrap } from "./ui.js";
+import { startActionStatus, endActionStatus } from "./ui.js";
 import { BACKEND_HOST } from "./api.js";
 import { isScriptableTab } from "./mentions.js";
+import { openThemeOverlay } from "./theme.js";
 
 const quickActionsWrap = document.getElementById("quick-actions");
 const quickActionsBtn = document.getElementById("quick-actions-btn");
@@ -172,6 +173,10 @@ function handleQuickAction(action) {
   }
   if (action === "reading-list-groups") {
     openReadingListGroupsView();
+    return;
+  }
+  if (action === "site-theme") {
+    openThemeOverlay();
     return;
   }
 
@@ -454,19 +459,27 @@ organiseTabsOverlay.addEventListener("click", (e) => {
 
 async function startOrganiseTabs(includeGrouped) {
   hideOrganiseTabsOverlay();
-  NotificationService.show("Organising your tabs...");
-  appWrap.classList.add("busy");
+  startActionStatus("Organising tabs…");
 
   try {
     const tabs = await chrome.tabs.query({ currentWindow: true });
-    let filteredTabs = tabs;
+    const NO_GROUP = chrome.tabGroups ? chrome.tabGroups.TAB_GROUP_ID_NONE : -1;
+
+    // Pinned tabs are never grouped — chrome.tabs.group() would silently unpin them.
+    let filteredTabs = tabs.filter(tab => !tab.pinned);
+    const pinnedCount = tabs.length - filteredTabs.length;
+
     if (!includeGrouped) {
-      filteredTabs = tabs.filter(tab => tab.groupId === -1 || tab.groupId === (chrome.tabGroups ? chrome.tabGroups.TAB_GROUP_ID_NONE : -1));
+      filteredTabs = filteredTabs.filter(tab => tab.groupId === NO_GROUP);
     }
 
     if (filteredTabs.length === 0) {
-      appWrap.classList.remove("busy");
-      NotificationService.show("No tabs found that need organising.");
+      endActionStatus();
+      NotificationService.show(
+        pinnedCount > 0
+          ? "No unpinned tabs found that need organising."
+          : "No tabs found that need organising."
+      );
       return;
     }
 
@@ -474,7 +487,8 @@ async function startOrganiseTabs(includeGrouped) {
       id: tab.id,
       title: tab.title || "",
       url: tab.url || "",
-      groupId: tab.groupId
+      groupId: tab.groupId,
+      pinned: !!tab.pinned
     }));
 
     const response = await fetch(`http://${BACKEND_HOST}/organise-tabs`, {
@@ -487,29 +501,39 @@ async function startOrganiseTabs(includeGrouped) {
 
     const data = await response.json();
 
+    // Defensive: only ever group IDs we actually sent (i.e. unpinned tabs).
+    const allowedIds = new Set(filteredTabs.map(t => t.id));
+
     if (data.groups && data.groups.length > 0) {
+      let createdCount = 0;
       for (const groupPlan of data.groups) {
-        const { title, color, tab_ids } = groupPlan;
-        if (tab_ids && tab_ids.length > 0) {
+        const { title, color } = groupPlan;
+        const tab_ids = (groupPlan.tab_ids || []).filter(id => allowedIds.has(id));
+        if (tab_ids.length > 0) {
           try {
             const groupId = await chrome.tabs.group({ tabIds: tab_ids });
             await chrome.tabGroups.update(groupId, {
               title: title,
               color: color
             });
+            createdCount++;
           } catch (groupError) {
             console.warn("Failed to complete an individual tab group structure", groupError);
           }
         }
       }
-      appWrap.classList.remove("busy");
-      NotificationService.show(`Successfully organised tabs into ${data.groups.length} groups!`);
+      endActionStatus();
+      NotificationService.show(
+        createdCount > 0
+          ? `Successfully organised tabs into ${createdCount} groups!`
+          : "No valid groupings could be applied."
+      );
     } else {
-      appWrap.classList.remove("busy");
+      endActionStatus();
       NotificationService.show("FastAPI LLM suggested no groupings.");
     }
   } catch (err) {
-    appWrap.classList.remove("busy");
+    endActionStatus();
     console.error("Error organizing tabs:", err);
     NotificationService.show("Could not contact the Sicily Bridge. Is uvicorn active?");
   }
@@ -524,9 +548,8 @@ export function clearAttachedContexts() {
 }
 
 async function startSummarisePage() {
-  // 1. Show notification and trigger neural glow
-  NotificationService.show("Summarising page...");
-  appWrap.classList.add("busy");
+  // 1. Show the status pill (blurs the panel behind it)
+  startActionStatus("Summarising page…");
 
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -539,7 +562,7 @@ async function startSummarisePage() {
     // error that wrongly implies the backend is down.
     if (!isScriptableTab(tab)) {
       NotificationService.show("This page can't be summarised — browser security blocks reading it.");
-      appWrap.classList.remove("busy");
+      endActionStatus();
       return;
     }
 
@@ -589,8 +612,8 @@ async function startSummarisePage() {
     console.error("Summarise error:", err);
     NotificationService.show("Failed to summarise page. Is the backend running?");
   } finally {
-    // Stop the neural glow
-    appWrap.classList.remove("busy");
+    // Hide the status pill
+    endActionStatus();
   }
 }
 
@@ -680,8 +703,7 @@ function renderFindMoreResults(results, { append = false } = {}) {
 }
 
 async function startFindMoreLikeThis({ append = false } = {}) {
-  NotificationService.show(append ? "Finding more..." : "Finding related pages...");
-  appWrap.classList.add("busy");
+  startActionStatus(append ? "Finding more…" : "Finding related pages…");
 
   // Fresh open (not a "Find More" click) starts a clean session — clear
   // whatever was tracked from a previous page/overlay open.
@@ -698,7 +720,7 @@ async function startFindMoreLikeThis({ append = false } = {}) {
     // and having that read as a backend/network failure.
     if (!isScriptableTab(tab)) {
       NotificationService.show("This page can't be analysed — browser security blocks reading it.");
-      appWrap.classList.remove("busy");
+      endActionStatus();
       return;
     }
 
@@ -761,7 +783,7 @@ async function startFindMoreLikeThis({ append = false } = {}) {
     console.error("Find more like this error:", err);
     NotificationService.show("Failed to find related pages. Is the backend running?");
   } finally {
-    appWrap.classList.remove("busy");
+    endActionStatus();
   }
 }
 

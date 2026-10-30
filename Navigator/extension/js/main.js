@@ -1,6 +1,6 @@
 import { NotificationService } from "./notifications.js";
-import { addMessage, clearMessagesUI, addContextTrail, setSending, sendBtn, appWrap, showEmptyState } from "./ui.js";
-import { socket, getActiveTabInfo, loadHistory, deleteSessionOnBackend, connectSocket, closeSocket, resolveSessionKey, carrySessionToUrl, startNewSessionForUrl, pinSessionKeyToUrl, fetchAllSessions, BACKEND_HOST } from "./api.js";
+import { addMessage, clearMessagesUI, addContextTrail, setSending, sendBtn, appWrap, showEmptyState, messagesEl, setEditHandler, cancelActiveEdit, syncSendBtn, showThinking } from "./ui.js";
+import { socket, getActiveTabInfo, loadHistory, deleteSessionOnBackend, connectSocket, closeSocket, resolveSessionKey, carrySessionToUrl, startNewSessionForUrl, pinSessionKeyToUrl, fetchAllSessions, renameSessionOnBackend, BACKEND_HOST } from "./api.js";
 import { attachedContexts, clearAttachedContexts, currentCapability } from "./features.js";
 import {
   getMentionedTabSnippets, hasMentionedTab, clearMentionedTab, isMentionDropdownOpen,
@@ -33,6 +33,9 @@ async function updateActiveChatTitle() {
     return;
   }
 
+  // Don't clobber the inline rename editor if it's open.
+  if (titleEl.dataset.renaming) return;
+
   try {
     const sessions = await fetchAllSessions();
     const current = sessions.find(s => s.session_key === currentSessionKey);
@@ -47,6 +50,96 @@ async function updateActiveChatTitle() {
   }
 }
 
+// ── Rename chat ───────────────────────────────────────────────────────
+// One inline editor shared by the Chats list rows and the header title.
+// Enter or clicking away saves, Esc cancels. onSave(name) resolves to the
+// title now in effect (shown immediately) or null if it failed (the old
+// text is kept).
+const RENAME_ICON = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" width="12" height="12">
+  <path d="M12 20h9" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`;
+
+function startInlineRename(host, currentText, onSave) {
+  if (host.dataset.renaming) return;
+  host.dataset.renaming = "1";
+  host.classList.add("renaming");
+
+  const original = (currentText || "").trim();
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "rename-input";
+  input.maxLength = 80;
+  input.value = original;
+  input.placeholder = "Name this chat";
+
+  host.textContent = "";
+  host.appendChild(input);
+  input.focus();
+  input.select();
+
+  // Don't let clicks/typing inside the editor reach the row (which would
+  // switch to that conversation) or other panel handlers.
+  for (const type of ["click", "dblclick", "mousedown"]) {
+    input.addEventListener(type, (e) => e.stopPropagation());
+  }
+
+  let finished = false;
+  const finish = async (save) => {
+    if (finished) return;
+    finished = true;
+
+    const next = input.value.trim();
+    host.classList.remove("renaming");
+    delete host.dataset.renaming;
+    host.textContent = original;
+
+    if (!save || next === original) return;
+
+    const result = await onSave(next);
+    if (result !== null && result !== undefined) host.textContent = result;
+  };
+
+  input.addEventListener("keydown", (e) => {
+    e.stopPropagation();
+    if (e.key === "Enter") {
+      e.preventDefault();
+      finish(true);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      finish(false);
+    }
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+
+async function renameSession(sessionKey, name) {
+  const result = await renameSessionOnBackend(sessionKey, name);
+  if (result === null) {
+    NotificationService.show("Couldn't rename this conversation.");
+    return null;
+  }
+  if (sessionKey === currentSessionKey) updateActiveChatTitle();
+  return result || "New Conversation";
+}
+
+// Double-click the title at the top of the chat to rename it.
+const headerTitleEl = document.getElementById("active-chat-title");
+if (headerTitleEl) {
+  headerTitleEl.title = "Double-click to rename";
+  headerTitleEl.addEventListener("dblclick", () => {
+    if (typeof isTempMode !== "undefined" && isTempMode) return;
+    if (!messagesEl.querySelector(".msg.user, .msg.ai")) {
+      NotificationService.show("Send a message first, then you can name this chat.");
+      return;
+    }
+    window.getSelection()?.removeAllRanges();
+    startInlineRename(headerTitleEl, headerTitleEl.textContent, (name) =>
+      renameSession(currentSessionKey, name)
+    );
+  });
+}
+
 window.addEventListener("chat-turn-complete", () => {
   // Give the backend a second to finish generating and saving the title to SQLite
   setTimeout(updateActiveChatTitle, 1500); 
@@ -55,6 +148,10 @@ window.addEventListener("chat-turn-complete", () => {
 async function sendMessage() {
   const text = inputEl.value.trim();
   if (!text) return;
+
+  // While a reply is streaming the input stays usable (so the transcript
+  // can be scrolled/selected), but a second turn must not be sent.
+  if (appWrap.classList.contains("busy")) return;
 
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     addMessage("Not connected to backend yet.", "system");
@@ -104,13 +201,20 @@ async function sendMessage() {
   // Render the UI with only the short labels
   addContextTrail(displaySnippets);
 
-  addMessage(text, "user");
+  const userEl = addMessage(text, "user", {
+    contextSnippets: payloadSnippets,
+    trailSnippets: displaySnippets,
+  });
+  pendingUserEl = userEl;
   inputEl.value = "";
+  inputEl.blur(); // sending takes focus out of the box
+  syncSendBtn();
 
   inputEl.style.height = 'auto';
   inputEl.style.overflowY = 'hidden';
 
   setSending(true);
+  showThinking();
 
   // Send the FULL content to the backend
   const fresh = await getActiveTabInfo();
@@ -127,6 +231,93 @@ async function sendMessage() {
   if (hasMentionedTab()) clearMentionedTab();
   if (hasMentionedCollection()) clearMentionedCollection();
 }
+
+// ── Edit & resend ─────────────────────────────────────────────────────
+// Backend rows have no ids on the wire, so a turn is addressed by its
+// position among the user messages ("truncate_from_turn": N means: drop
+// the Nth user message and everything after it, then treat the new text
+// as the next turn). This works unchanged on every chat saved before this
+// feature existed.
+let pendingUserEl = null;
+
+window.addEventListener("chat-turn-complete", () => { pendingUserEl = null; });
+
+// Stopped before the model produced anything: the backend didn't save the
+// turn, so don't count this user message when computing edit indices.
+window.addEventListener("chat-turn-stopped", (e) => {
+  if (pendingUserEl && !e.detail?.saved) pendingUserEl.dataset.unsaved = "1";
+  pendingUserEl = null;
+});
+
+// Ask the backend to stop generating the reply that's in flight.
+function stopGeneration() {
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: "stop" }));
+  }
+}
+
+// A send whose socket died before any reply never reached ChatStore;
+// flag it so it isn't counted when computing the turn index.
+window.addEventListener("chat-socket-closed", () => {
+  if (pendingUserEl) {
+    pendingUserEl.dataset.unsaved = "1";
+    pendingUserEl = null;
+  }
+});
+
+function renderHistory(history) {
+  for (const m of history) {
+    const isUser = m.role === "user";
+    const snippets = isUser && Array.isArray(m.context_snippets) ? m.context_snippets : [];
+    if (snippets.length) addContextTrail(snippets);
+    addMessage(m.text, isUser ? "user" : "ai",
+      isUser ? { contextSnippets: snippets, trailSnippets: snippets } : { stopped: !!m.stopped });
+  }
+}
+
+async function editAndResend(userEl, newText) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    NotificationService.show("Not connected to backend yet.");
+    return false;
+  }
+
+  const userEls = Array.from(messagesEl.querySelectorAll(".msg.user"));
+  const pos = userEls.indexOf(userEl);
+  if (pos === -1) return false;
+
+  // Only turns the backend actually stored count toward the index.
+  const turnIndex = userEls.slice(0, pos).filter((el) => el.dataset.unsaved !== "1").length;
+
+  // Re-send exactly what was attached to the original turn.
+  const meta = userEl._meta || {};
+  const snippets = meta.contextSnippets || [];
+  const trail = meta.trailSnippets || snippets;
+
+  // Remove the edited message, its context trail, and everything after it.
+  const prev = userEl.previousElementSibling;
+  if (prev && prev.classList.contains("msg-context-trail")) prev.remove();
+  while (userEl.nextSibling) userEl.nextSibling.remove();
+  userEl.remove();
+
+  if (trail.length) addContextTrail(trail);
+  pendingUserEl = addMessage(newText, "user", { contextSnippets: snippets, trailSnippets: trail });
+
+  setSending(true);
+  showThinking();
+
+  const fresh = await getActiveTabInfo();
+  socket.send(JSON.stringify({
+    text: newText,
+    page_url: fresh.url,
+    page_title: fresh.title,
+    context_snippets: snippets,
+    capability: currentCapability,
+    truncate_from_turn: turnIndex
+  }));
+  return true;
+}
+
+setEditHandler(editAndResend);
 
 // "New Chat" starts a distinct backend session rather than wiping the
 // current one: it mints a fresh session key and points this URL at it
@@ -148,6 +339,7 @@ async function handleClear(showNotification = true) {
     }
   }
 
+  cancelActiveEdit();
   closeSocket();
   clearMessagesUI();
   showEmptyState();
@@ -227,6 +419,20 @@ async function populateChatsPanel() {
     timeSpan.textContent = formatTimeAgo(s.last_active);
 
     meta.appendChild(timeSpan);
+
+    // Hover-reveal rename pencil: turns this row's title into an editor.
+    const renameBtn = document.createElement("button");
+    renameBtn.className = "chats-item-rename-btn";
+    renameBtn.type = "button";
+    renameBtn.title = "Rename conversation";
+    renameBtn.innerHTML = RENAME_ICON;
+    renameBtn.addEventListener("click", (e) => {
+      e.stopPropagation(); // don't switch to this conversation
+      startInlineRename(preview, preview.textContent, (name) =>
+        renameSession(s.session_key, name)
+      );
+    });
+    meta.appendChild(renameBtn);
 
     item.appendChild(preview);
     item.appendChild(meta);
@@ -318,6 +524,7 @@ async function switchToSession(sessionKey) {
   }
 
   // Tear down old session
+  cancelActiveEdit();
   closeSocket();
   clearMessagesUI();
 
@@ -334,12 +541,7 @@ async function switchToSession(sessionKey) {
     showEmptyState();
   }
 
-  for (const m of history) {
-    if (m.role === "user" && Array.isArray(m.context_snippets) && m.context_snippets.length) {
-      addContextTrail(m.context_snippets);
-    }
-    addMessage(m.text, m.role === "user" ? "user" : "ai");
-  }
+  renderHistory(history);
 
   // Reconnect socket to the new session
   connectSocket(sessionKey);
@@ -358,7 +560,11 @@ chatsOverlay.addEventListener("click", (e) => {
   if (e.target === chatsOverlay) closeChatsPanel();
 });
 
-sendBtn.addEventListener("click", sendMessage);
+// The same button sends, or stops the reply that's currently generating.
+sendBtn.addEventListener("click", () => {
+  if (appWrap.classList.contains("busy")) stopGeneration();
+  else sendMessage();
+});
 clearBtn.addEventListener("click", handleClear);
 
 // Empty-state suggestion chips: these are generic conversation starters
@@ -419,12 +625,7 @@ async function loadSessionForUrl(url) {
     autoMentionActiveTab(currentTab);
   }
 
-  for (const m of history) {
-    if (m.role === "user" && Array.isArray(m.context_snippets) && m.context_snippets.length) {
-      addContextTrail(m.context_snippets);
-    }
-    addMessage(m.text, m.role === "user" ? "user" : "ai");
-  }
+  renderHistory(history);
 
   updateActiveChatTitle()
 
@@ -493,12 +694,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       autoMentionActiveTab(currentTab);
     }
 
-    for (const m of history) {
-      if (m.role === "user" && Array.isArray(m.context_snippets) && m.context_snippets.length) {
-        addContextTrail(m.context_snippets);
-      }
-      addMessage(m.text, m.role === "user" ? "user" : "ai");
-    }
+    renderHistory(history);
 
     connectSocket(currentSessionKey);
   } else {

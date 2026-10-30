@@ -25,7 +25,7 @@ async def process_summarise_page(req: SummarisePageRequest) -> SummarisePageResp
     system_msg = SystemMessage(
         content=(
             "You are a helpful browser assistant. Your sole task is to summarize the web page content provided by the user. "
-            "Extract the core thesis and main points efficiently. "
+            "Extract the core thesis and main points efficiently, in under 300 words. "
             "CRITICAL: Output standard, plain text ONLY. Do NOT use markdown, bolding, lists, headers, or conversational filler."
         )
     )

@@ -19,6 +19,7 @@ _load_settings()
 
 
 import re
+import time
 import uuid
 import random
 import asyncio
@@ -35,9 +36,17 @@ from langgraph.graph import StateGraph, END
 from langgraph.errors import GraphRecursionError
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+from prompt_toolkit import PromptSession
+from prompt_toolkit.application import get_app_or_none
+from prompt_toolkit.formatted_text import FormattedText
+
+from rich.live import Live
+from rich.text import Text
 from rich.panel import Panel
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.errors import MarkupError
+from rich.markup import escape
 
 import configuration
 
@@ -63,6 +72,145 @@ BANNER = """
 ║                                          ║                                                    ║
 ╚══════════════════════════════════════════╩════════════════════════════════════════════════════╝
 """
+
+# Input prompt: a heavy angle (U+276F) that we blink ourselves, so it works on
+# every terminal, including ones that ignore the ANSI blink code (legacy
+# Windows conhost, VS Code). prompt_toolkit redraws the prompt every
+# refresh_interval and _blinking_prompt decides, from the clock, whether the
+# glyph is visible on this frame.
+PROMPT_GLYPH = "❯"
+PROMPT_STYLE = "fg:#ff8700 bold"   # same as rich's dark_orange
+BLINK_PERIOD = 0.5                 # seconds visible, then seconds hidden
+
+prompt_session = PromptSession()
+
+
+def _blinking_prompt():
+    app = get_app_or_none()
+    # Once Enter is pressed the prompt is drawn one last time and stays in
+    # the scrollback. Force the glyph on so history never shows a gap.
+    visible = (app is not None and app.is_done) or int(time.monotonic() / BLINK_PERIOD) % 2 == 0
+    glyph = PROMPT_GLYPH if visible else " " * len(PROMPT_GLYPH)
+    return FormattedText([(PROMPT_STYLE, glyph), ("", " ")])
+
+
+# ── Animated status line ──────────────────────────────────────────────────────
+def _fit_middle(text: Text, limit: int) -> Text:
+    """
+    Shorten text to `limit` cells by cutting out the middle. Status lines
+    look like "Reading src/deep/path/file.py...", so the start (the verb)
+    and the end (the file name) are the parts worth keeping.
+    """
+    if text.cell_len <= limit:
+        return text
+    if limit <= 1:
+        return Text("…")
+    head = (limit - 1) // 2
+    tail = limit - 1 - head
+    out = text[:head]
+    out.append("…")
+    if tail:
+        out.append_text(text[len(text) - tail:])
+    return out
+
+
+class AnimatedStatus:
+    """
+    Drop-in replacement for `console.status(...)`:
+
+        ❯❯❯ Reading src/app/config.py...▌                      3.4s
+
+    - Three chevrons march left to right in Sicily orange.
+    - Each new message types itself out quickly, with a blinking cursor.
+    - Messages too long for the terminal are shortened in the middle,
+      recomputed every frame, so resizing the window just works.
+    - A timer on the right counts up from when the status started; it is
+      not reset by update(), so it shows the whole turn's elapsed time.
+
+    Pure colour changes redrawn by rich.Live, so it animates on every
+    terminal, including ones that ignore ANSI blink.
+    """
+
+    CHEVRONS = 3
+    FPS = 20
+    MARCH_SPEED = 6        # chevron steps per second
+    TYPE_SPEED = 90        # characters per second
+    CURSOR_BLINK = 2.5     # cursor toggles per second
+
+    LEAD_STYLE = "bold #ff8700"
+    TRAIL_STYLE = "#c46a10"
+    IDLE_STYLE = "grey35"
+    TIMER_STYLE = "grey50"
+
+    def __init__(self, status: str, console: Console = console):
+        self._t0 = time.monotonic()
+        self._text = Text()
+        self._typed_at = self._t0
+        self._live = Live(self, console=console, refresh_per_second=self.FPS, transient=True)
+        self.update(status)
+
+    def update(self, status: str) -> None:
+        # Collapse newlines so a multi-line error stays on one line.
+        status = " ".join(str(status).split())
+        try:
+            text = Text.from_markup(status)
+        except MarkupError:
+            # Tool errors can contain stray [brackets]; show them literally.
+            text = Text(status)
+        if text.plain != self._text.plain:
+            self._typed_at = time.monotonic()
+        self._text = text
+
+    def __enter__(self):
+        self._live.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._live.stop()
+        return False
+
+    def _timer(self, now: float) -> str:
+        s = now - self._t0
+        if s < 60:
+            return f"{s:.1f}s"
+        return f"{int(s // 60)}m {int(s % 60):02d}s"
+
+    def __rich_console__(self, _console, options):
+        now = time.monotonic()
+        width = options.max_width
+        timer = self._timer(now)
+
+        line = Text(no_wrap=True, overflow="crop")
+
+        # Chevron march; one extra step per cycle with nothing lit.
+        lit = int((now - self._t0) * self.MARCH_SPEED) % (self.CHEVRONS + 1)
+        for i in range(self.CHEVRONS):
+            if i == lit:
+                style = self.LEAD_STYLE
+            elif i == lit - 1:
+                style = self.TRAIL_STYLE
+            else:
+                style = self.IDLE_STYLE
+            line.append("❯", style)
+        line.append(" ")
+
+        # Room left for the message: chevrons + space, cursor, 2-space gap, timer.
+        room = width - (self.CHEVRONS + 1) - 1 - 2 - len(timer)
+        body = _fit_middle(self._text, max(room, 1))
+
+        typed = min(len(body), int((now - self._typed_at) * self.TYPE_SPEED))
+        line.append_text(body[:typed])
+
+        # Solid while typing, blinking once the line is complete.
+        typing = typed < len(body)
+        cursor_on = typing or int(now * self.CURSOR_BLINK) % 2 == 0
+        line.append("▌" if cursor_on else " ", self.LEAD_STYLE)
+
+        gap = width - line.cell_len - len(timer)
+        if gap >= 2:
+            line.append(" " * gap)
+            line.append(timer, self.TIMER_STYLE)
+        yield line
 
 LOCAL_TOKEN_THRESHOLD = 7_000
 
@@ -283,7 +431,7 @@ async def run_local_session():
 
     # 1. Show something immediately, and find out up front whether there's
     #    actually anything to index — this decides which UI we show below.
-    with console.status("[grey50]Preparing index...[/grey50]", spinner="dots", spinner_style="dim"):
+    with AnimatedStatus("[grey50]Preparing index...[/grey50]"):
         rag = SicilyRAG(cwd)
         pending = rag.count_pending()
 
@@ -293,7 +441,7 @@ async def run_local_session():
         # Nothing new or changed. index_session() still has to run — it
         # handles deleted-file cleanup and TF-IDF resync — but none of
         # that is worth a progress bar, so keep it to one quiet spinner.
-        with console.status("[grey50]Checking index...[/grey50]", spinner="dots", spinner_style="dim"):
+        with AnimatedStatus("[grey50]Checking index...[/grey50]"):
             summary = await loop.run_in_executor(None, rag.index_session)
     else:
         # 2. Real work ahead — determinate bar + single updating
@@ -353,7 +501,13 @@ async def run_local_session():
     # 3. Chat loop
     while True:
         try:
-            user_input = console.input("[white]>>>:[/white] ").strip()
+            user_input = (
+                await prompt_session.prompt_async(
+                    _blinking_prompt,
+                    # Redraw twice per blink phase so the toggle lands on time.
+                    refresh_interval=BLINK_PERIOD / 2,
+                )
+            ).strip()
         except (EOFError, KeyboardInterrupt):
             print("\n\nGoodbye!")
             break
@@ -365,16 +519,10 @@ async def run_local_session():
             print("\nGoodbye!")
             break
 
-        # A fresh human message just arrived — this is the only point in
-        # the loop that represents a genuinely new turn (as opposed to a
-        # model tool call within the same turn), so it's the only place
-        # a pending run_script change is allowed to become apply-able.
-        # See the STATUS note at the bottom of cowork_tool_sandbox_exec.py.
-        from Cowork.cowork_sandbox_exec import _CHANGES
-        for cs in _CHANGES.values():
-            if not cs.applied and not cs.confirmed:
-                cs.confirmed = True
-
+        # No pending-change approval step here: run_script writes through
+        # immediately (see cowork_tool_sandbox_exec.py STATUS note), and
+        # ChangeSet has no `confirmed` field — reading it would raise
+        # AttributeError and crash the chat loop.
         messages.append(HumanMessage(content=user_input))
 
         # Summarize exactly once per user turn, here — this is the only
@@ -404,9 +552,16 @@ async def run_local_session():
         turn_input_tokens = 0
         turn_output_tokens = 0
 
+        # Running copy of this turn's conversation, updated after every
+        # graph node finishes. The root graph's final output (step 4 below)
+        # never arrives if the run dies on GraphRecursionError, so without
+        # this the fallback would only see the pre-turn history and none of
+        # the tool results gathered this turn.
+        turn_messages = list(messages)
+
         try:
             # 1. Start the rich status spinner
-            with console.status("[grey50]Thinking...[/grey50]", spinner="dots", spinner_style="dim") as status:
+            with AnimatedStatus("[grey50]Thinking...[/grey50]") as status:
                 
                 root_run_id = None
                 
@@ -455,6 +610,9 @@ async def run_local_session():
                         
                         # Format the payload for your helper function
                         tool_call = {"name": tool_name, "args": tool_args}
+                        # TOOL_STATUS_MAP returns rich markup on purpose
+                        # ([white]...[/white] highlights), so pass it through
+                        # as-is. Any escaping of raw args belongs in the map.
                         msg = get_friendly_tool_message(tool_call)
                         
                         # Update the terminal spinner with the new message,
@@ -471,10 +629,24 @@ async def run_local_session():
                         error = event.get("data", {}).get("error", "unknown error")
                         log_error(f"Tool {tool_name} error", error)
                         if DEBUG:
-                            status.update(f"[yellow]{tool_name} hit an error: {error}[/yellow]")
+                            status.update(f"[yellow]{escape(str(tool_name))} hit an error: {escape(str(error))}[/yellow]")
                     
+                    # Each completed graph node ("main" or "tools") returns
+                    # only its NEW messages — append them as they arrive so
+                    # turn_messages always reflects everything done so far.
+                    # Matching name == langgraph_node skips inner runnables
+                    # that execute inside a node.
+                    elif (
+                        event["event"] == "on_chain_end"
+                        and event.get("name") in ("main", "tools")
+                        and event.get("metadata", {}).get("langgraph_node") == event.get("name")
+                    ):
+                        output = event.get("data", {}).get("output")
+                        if isinstance(output, dict) and output.get("messages"):
+                            turn_messages.extend(output["messages"])
+
                     # 4. Capture the final state when the main graph finishes
-                    elif event["event"] == "on_chain_end" and event.get("run_id") == root_run_id:
+                    if event["event"] == "on_chain_end" and event.get("run_id") == root_run_id:
                         output = event.get("data", {}).get("output")
                         if output and "messages" in output:
                             messages = output["messages"]
@@ -497,8 +669,9 @@ async def run_local_session():
         except GraphRecursionError:
             log.warning("Recursion limit hit", tool_calls=tool_call_count)
             # Don't just error out — ask the model to summarize whatever it
-            # already found, using the same message history (tool results
+            # already found, using this turn's history (tool results
             # included), but this time forbid further tool calls.
+            messages = _close_dangling_tool_calls(turn_messages)
             messages.append(
                 HumanMessage(
                     content=(
@@ -564,6 +737,32 @@ async def run_local_session():
                 print_ai(f"Something went wrong: {e}")
             else:
                 print_ai("An unexpected error occurred. Please try again later")
+
+
+# ── Recursion-limit fallback helper ───────────────────────────────────────────
+def _close_dangling_tool_calls(msgs: list) -> list:
+    """
+    If the run was cut off between the model asking for tools and those
+    tools running, the last AIMessage has tool_calls with no matching
+    ToolMessages. Providers reject that history outright, which would make
+    the "give your best answer" fallback fail. Add a stub ToolMessage for
+    each unanswered call so the history is valid and the model can see
+    those calls never ran.
+    """
+    from langchain_core.messages import ToolMessage
+
+    msgs = list(msgs)
+    answered = {m.tool_call_id for m in msgs if isinstance(m, ToolMessage)}
+    for m in reversed(msgs):
+        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+            for call in m.tool_calls:
+                if call.get("id") and call["id"] not in answered:
+                    msgs.append(ToolMessage(
+                        content="Not run: the tool-call budget for this turn was reached.",
+                        tool_call_id=call["id"],
+                    ))
+            break
+    return msgs
 
 
 # ── Terminal I/O helpers ──────────────────────────────────────────────────────

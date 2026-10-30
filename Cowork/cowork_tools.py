@@ -218,16 +218,21 @@ def read_file(
         except Exception as e:
             return f"Could not extract text from '{path}': {e}"
 
+        # units keeps a "" placeholder for every blank page/slide/paragraph,
+        # so list position == real unit number == what search_file_contents
+        # reports. total therefore counts blank units too.
         total = len(units)
-        if total == 0:
+        if not any(units):
             return f"'{path}' has no extractable {unit_label}s (it may be empty or unparseable)."
         if start_unit > total:
             return f"'{path}' only has {total} {unit_label}(s). start_unit={start_unit} is out of range."
 
         actual_end = min(end_unit, total)
-        selected = units[start_unit - 1 : actual_end]
+        selected = [u for u in units[start_unit - 1 : actual_end] if u]
 
         header = f"[{path} | {unit_label}s {start_unit}–{actual_end} of {total}]\n"
+        if not selected:
+            return header + f"(no extractable text in {unit_label}s {start_unit}–{actual_end})"
         return header + "\n\n".join(selected)
 
     # ── Unranged ("full read") path — the one a model falls into by
@@ -245,12 +250,15 @@ def read_file(
         except Exception as e:
             return f"Could not extract text from '{path}': {e}"
 
-        total = len(units)
-        if total == 0:
+        total = len(units)  # includes blank units (kept as "" placeholders)
+        if not any(units):
             return f"'{path}' has no extractable {unit_label}s (it may be empty or unparseable)."
 
         if total > _FULL_READ_MAX_UNITS:
             preview = units[:_FULL_READ_PREVIEW_UNITS]
+            preview = [u for u in preview if u] or [
+                f"(no extractable text in {unit_label}s 1–{_FULL_READ_PREVIEW_UNITS})"
+            ]
             header = (
                 f"[{path} | {unit_label}s 1–{_FULL_READ_PREVIEW_UNITS} of {total} "
                 f"— PREVIEW, full document too large for one read. Use "
@@ -755,7 +763,7 @@ def run_file_command(command: str) -> str:
     Args:
         command: A single cp/mv/mkdir/ls/info invocation, e.g.
                 "cp reports/draft.md reports/draft-backup.md",
-                "mv -r old_project new_project",
+                "mv old_project new_project",
                 "mkdir reports/q3 reports/q4",
                 "ls reports/q3 reports/q4",
                 "info report.pdf notes.md archive/2026".
@@ -1323,8 +1331,13 @@ def search_file_contents(
             # and re-extracting the same PDF/workbook/deck 8 times.
             try:
                 unit_matches = _search_binary_units(file_path, compiled)
-            except Exception:
-                files_skipped.append(rel_str)
+            except Exception as e:
+                # Keep the real reason — a bare "could not be read" hid a
+                # signature bug here that skipped every binary file.
+                files_skipped.append(f"{rel_str} ({type(e).__name__}: {e})")
+                log_tool_call("search_file_contents._binary_skip", {
+                    "path": rel_str, "error": f"{type(e).__name__}: {e}",
+                })
                 continue
 
             files_scanned += 1
@@ -1348,8 +1361,8 @@ def search_file_contents(
         # ── Text files: unchanged line-based search.
         try:
             text = file_path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            files_skipped.append(rel_str)
+        except Exception as e:
+            files_skipped.append(f"{rel_str} ({type(e).__name__}: {e})")
             continue
 
         files_scanned += 1
@@ -1384,11 +1397,16 @@ def search_file_contents(
         "to search the rest)" if scan_capped else ""
     )
 
+    skipped_note = ""
+    if files_skipped:
+        shown = "\n".join(f"  - {s}" for s in files_skipped[:5])
+        more = f"\n  ... and {len(files_skipped) - 5} more" if len(files_skipped) > 5 else ""
+        skipped_note = f"\n\nCould not read {len(files_skipped)} file(s):\n{shown}{more}"
+
     if not matches:
-        note = f" ({len(files_skipped)} file(s) could not be read)" if files_skipped else ""
         return (
             f"{search_desc}\n"
-            f"No matches across {files_scanned} readable file(s){note}{cap_note}."
+            f"No matches across {files_scanned} readable file(s){cap_note}.{skipped_note}"
         )
 
     header = f"{search_desc}\nFound {len(matches)} match(es) across {len(matching_files)} file(s) ({files_scanned} scanned{cap_note})"
@@ -1399,7 +1417,7 @@ def search_file_contents(
     if len(body) > _MAX_OUTPUT_CHARS:
         body = body[:_MAX_OUTPUT_CHARS] + f"\n... [truncated at {_MAX_OUTPUT_CHARS} chars — narrow `path`/`includes`/`pattern` for full results]"
 
-    return header + ":\n\n" + body
+    return header + ":\n\n" + body + skipped_note
 
 
 # EXPORTED TOOL LIST
@@ -1423,7 +1441,7 @@ LOCAL_TOOLS = [
     # Copy / move / rename / mkdir / list / inspect — one validated command tool (no-clobber by default).
     run_file_command,
 
-    # Delete (soft — trash, dry_run by default)
+    # Delete (PERMANENT, not trash — dry_run preview by default)
     delete_path,
 
     # Tier 1 escape hatch — arbitrary scripts, staged + diffed + human-gated. 
@@ -1480,7 +1498,7 @@ TOOL_STATUS_MAP = {
     "delete_path": lambda args: (
         f"Previewing delete of {_fmt_delete_path_arg(args.get('path'))}"
         if args.get("dry_run", True)
-        else f"Deleting {_fmt_delete_path_arg(args.get('path'))} (-> trash)"
+        else f"Permanently deleting {_fmt_delete_path_arg(args.get('path'))}"
     ),
     "run_script": lambda args: (
          f"Running a {args.get('interpreter', 'python3')} script against "
